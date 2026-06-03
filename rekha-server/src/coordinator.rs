@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rekha_core::{
-    ClusterTopology, Coordinator as CoordinatorTrait, NodeInfo, NodeStatus, Payload,
-    RekhaError, ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
+    ClusterTopology, Coordinator as CoordinatorTrait, NodeInfo, NodeStatus, Payload, RekhaError,
+    ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
 };
 use rekha_index::RekhaIndex;
 use rekha_partition::PartitionManager;
@@ -151,7 +151,7 @@ impl CoordinatorTrait for Coordinator {
                                 .get_payload(*id)
                                 .ok()
                                 .flatten()
-                                .map(|data| Payload::from_bytes(data))
+                                .map(Payload::from_bytes)
                         } else {
                             None
                         };
@@ -164,9 +164,9 @@ impl CoordinatorTrait for Coordinator {
                     }
                 }
                 Err(e) => {
-                    stats.warnings.push(format!(
-                        "dim_group {group} search failed: {e}"
-                    ));
+                    stats
+                        .warnings
+                        .push(format!("dim_group {group} search failed: {e}"));
                 }
             }
         }
@@ -226,9 +226,11 @@ mod tests {
     fn test_coordinator() -> Coordinator {
         let config = ServerConfig::dev_default("test-node", "/tmp/rekha_coord_test");
         let store = temp_store();
-        let pm = Arc::new(RwLock::new(
-            rekha_partition::PartitionManager::new(HashMap::new(), 4, 768)
-        ));
+        let pm = Arc::new(RwLock::new(rekha_partition::PartitionManager::new(
+            HashMap::new(),
+            4,
+            768,
+        )));
         Coordinator::new(config, store, pm)
     }
 
@@ -243,8 +245,14 @@ mod tests {
         let coord = test_coordinator();
         let store = temp_store();
         let mut index = rekha_index::RekhaIndex::new(
-            8, 4, 16, 4, (*store).clone(), rekha_core::DistanceMetric::L2
-        ).unwrap();
+            8,
+            4,
+            16,
+            4,
+            (*store).clone(),
+            rekha_core::DistanceMetric::L2,
+        )
+        .unwrap();
         for i in 0..10 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             index.add_vector_for_test(i, v);
@@ -257,9 +265,7 @@ mod tests {
     #[tokio::test]
     async fn test_coordinator_search_before_init() {
         let coord = test_coordinator();
-        let result = coord.search(
-            vec![0.0; 8], 5, SearchParams::default()
-        ).await;
+        let result = coord.search(vec![0.0; 8], 5, SearchParams::default()).await;
         assert!(result.is_err());
     }
 

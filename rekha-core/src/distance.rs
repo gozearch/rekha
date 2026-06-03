@@ -29,7 +29,10 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 /// Used for early-stop pruning in dimension-based partitioning.
 #[inline]
 pub fn l2_squared_partial(a: &[f32], b: &[f32], start: usize, end: usize) -> f32 {
-    debug_assert!(a.len() >= end && b.len() >= end, "dimension range out of bounds");
+    debug_assert!(
+        a.len() >= end && b.len() >= end,
+        "dimension range out of bounds"
+    );
     let mut sum = 0.0f32;
     for i in start..end {
         let diff = a[i] - b[i];
@@ -100,7 +103,7 @@ pub fn can_early_stop(partial_dist: f32, current_kth_dist: f32, metric: Distance
 
 /// Verify that all vectors in a batch have the same expected dimension.
 pub fn validate_dimensions(vectors: &[&[f32]], expected: usize) -> Result<(), crate::RekhaError> {
-    for (_i, v) in vectors.iter().enumerate() {
+    for v in vectors.iter() {
         if v.len() != expected {
             return Err(crate::RekhaError::InvalidDimension {
                 expected,

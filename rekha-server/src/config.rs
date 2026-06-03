@@ -69,10 +69,11 @@ impl ServerConfig {
 ///
 /// Supports server-side TLS (encryption) and optional mutual TLS (mTLS)
 /// for node identity verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TlsConfig {
     /// Set to `true` to enable TLS on the gRPC server and client.
     /// When disabled, all communication is plaintext HTTP/2.
+    #[serde(default)]
     pub enabled: bool,
     /// Path to the server TLS certificate (PEM format).
     /// Required when `enabled` is true.
@@ -83,17 +84,6 @@ pub struct TlsConfig {
     /// Optional CA certificate for verifying client certificates (mTLS).
     /// When set, the server will request and verify client certificates.
     pub ca_cert_path: Option<String>,
-}
-
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cert_path: None,
-            key_path: None,
-            ca_cert_path: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,8 +162,14 @@ mod tests {
         let yaml = serde_yaml::to_string(&config).unwrap();
         let config2: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(config.cluster.node_id, config2.cluster.node_id);
-        assert_eq!(config.partition.num_vector_shards, config2.partition.num_vector_shards);
-        assert_eq!(config.index.pq_num_sub_vectors, config2.index.pq_num_sub_vectors);
+        assert_eq!(
+            config.partition.num_vector_shards,
+            config2.partition.num_vector_shards
+        );
+        assert_eq!(
+            config.index.pq_num_sub_vectors,
+            config2.index.pq_num_sub_vectors
+        );
     }
 
     #[test]

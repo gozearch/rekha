@@ -3,7 +3,11 @@ use rekha_client::RekhaClient;
 
 /// Rekha CLI — admin tool for the distributed vector database.
 #[derive(Parser)]
-#[command(name = "rekha", about = "Rekha distributed vector database CLI", version)]
+#[command(
+    name = "rekha",
+    about = "Rekha distributed vector database CLI",
+    version
+)]
 struct Cli {
     /// Address of a seed node in the cluster.
     #[arg(short, long, default_value = "localhost:50051")]
@@ -27,9 +31,7 @@ enum Commands {
         top_k: usize,
     },
     /// Delete vectors by ID
-    Delete {
-        ids: Vec<u64>,
-    },
+    Delete { ids: Vec<u64> },
     /// Show cluster info
     Info,
     /// Check cluster health
@@ -51,7 +53,6 @@ async fn main() -> anyhow::Result<()> {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             let vector: Vec<f32> = input
-                .trim()
                 .split_whitespace()
                 .filter_map(|s| s.parse().ok())
                 .collect();
@@ -70,7 +71,6 @@ async fn main() -> anyhow::Result<()> {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             let query: Vec<f32> = input
-                .trim()
                 .split_whitespace()
                 .filter_map(|s| s.parse().ok())
                 .collect();

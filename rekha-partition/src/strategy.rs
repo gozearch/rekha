@@ -40,19 +40,22 @@ impl MultiGranularityStrategy {
         if num_vector_shards == 0 {
             return Err(PartitionError::InvalidTopology {
                 detail: "num_vector_shards must be > 0".into(),
-            }.into());
+            }
+            .into());
         }
         if num_dim_groups == 0 {
             return Err(PartitionError::InvalidTopology {
                 detail: "num_dim_groups must be > 0".into(),
-            }.into());
+            }
+            .into());
         }
-        if total_dim % num_dim_groups as usize != 0 {
+        if !total_dim.is_multiple_of(num_dim_groups as usize) {
             return Err(PartitionError::InvalidTopology {
                 detail: format!(
                     "total_dim {total_dim} not divisible by num_dim_groups {num_dim_groups}"
                 ),
-            }.into());
+            }
+            .into());
         }
 
         Ok(Self {
@@ -74,7 +77,8 @@ impl MultiGranularityStrategy {
 
     /// Enumerate all (vector_shard, dim_group) pairs in the grid.
     pub fn all_partitions(&self) -> Vec<(u64, u32)> {
-        let mut partitions = Vec::with_capacity((self.num_vector_shards * self.num_dim_groups as u64) as usize);
+        let mut partitions =
+            Vec::with_capacity((self.num_vector_shards * self.num_dim_groups as u64) as usize);
         for s in 0..self.num_vector_shards {
             for g in 0..self.num_dim_groups {
                 partitions.push((s, g));

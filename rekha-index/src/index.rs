@@ -78,7 +78,9 @@ impl RekhaIndex {
         log::info!("PQ trained: M={}, K={}", self.pq.m, self.pq.k);
 
         // 2. Build Vamana graph.
-        let graph_vecs: Vec<(u64, &[f32])> = self.vectors.iter()
+        let graph_vecs: Vec<(u64, &[f32])> = self
+            .vectors
+            .iter()
             .map(|(id, v)| (*id, v.as_slice()))
             .collect();
         self.graph.build(&graph_vecs)?;
@@ -109,13 +111,15 @@ impl VectorIndex for RekhaIndex {
         // Production: use dynamic insertion into the graph.
         Err(IndexError::GraphBuild {
             detail: "use insert_batch for index construction".into(),
-        }.into())
+        }
+        .into())
     }
 
     fn insert_batch(&self, _vectors: &[(u64, &[f32])]) -> Result<(), RekhaError> {
         Err(IndexError::GraphBuild {
             detail: "use build() after adding vectors to the builder".into(),
-        }.into())
+        }
+        .into())
     }
 
     fn delete(&self, ids: &[u64]) -> Result<(), RekhaError> {
@@ -143,7 +147,8 @@ impl VectorIndex for RekhaIndex {
         let _ef_search = params.ef_search.max(k);
 
         // Compute full-precision distances (simplified; production uses PQ + graph).
-        let mut distances: Vec<(f32, u64)> = self.vectors
+        let mut distances: Vec<(f32, u64)> = self
+            .vectors
             .iter()
             .map(|(id, v)| (l2_squared(query, v), *id))
             .collect();
@@ -173,7 +178,8 @@ impl VectorIndex for RekhaIndex {
         let _ef_search = params.ef_search.max(k);
 
         // Partial distance search (only over the given dimension range).
-        let mut distances: Vec<(f32, u64)> = self.vectors
+        let mut distances: Vec<(f32, u64)> = self
+            .vectors
             .iter()
             .map(|(id, v)| {
                 let partial = l2_squared_partial(query, v, dim_start, dim_end);
@@ -190,7 +196,7 @@ impl VectorIndex for RekhaIndex {
             .iter()
             .take(_ef_search * 2) // Take more for re-ranking safety
             .map(|(_, id)| {
-                let full_dist = l2_squared(query, &self.vector_by_id(*id));
+                let full_dist = l2_squared(query, self.vector_by_id(*id));
                 (full_dist, *id)
             })
             .collect();

@@ -1,5 +1,5 @@
-use rekha_core::{RaftError, RekhaError};
 use crate::state::{RaftCommand, ReplicatedState};
+use rekha_core::{RaftError, RekhaError};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -76,8 +76,8 @@ impl RaftNode {
                 last_applied: 0,
                 role: RaftRole::Follower,
                 leader_id: None,
-            _election_timeout_ms: 300,
-            _heartbeat_ms: 100,
+                _election_timeout_ms: 300,
+                _heartbeat_ms: 100,
             })),
         }
     }
@@ -99,7 +99,11 @@ impl RaftNode {
         if is_leader {
             let mut log = self.log.lock().await;
             let index = log.len() as u64 + 1;
-            let entry = RaftLogEntry { term, index, command };
+            let entry = RaftLogEntry {
+                term,
+                index,
+                command,
+            };
             let cmd = entry.command.clone();
             log.push(entry);
             let mut state = self.state.write().await;
@@ -195,10 +199,8 @@ impl RaftNode {
         // Append new entries.
         for entry in entries {
             let idx = entry.index as usize;
-            if idx <= log.len() {
-                if idx > 0 && log[idx - 1].term != entry.term {
-                    log.truncate(idx - 1);
-                }
+            if idx <= log.len() && idx > 0 && log[idx - 1].term != entry.term {
+                log.truncate(idx - 1);
             }
             if idx > log.len() {
                 log.push(entry);
@@ -241,8 +243,8 @@ impl RaftNode {
         }
 
         // Vote if not already voted or voted for this candidate.
-        let can_vote = raft_state.voted_for.is_none()
-            || raft_state.voted_for.as_deref() == Some(candidate_id);
+        let can_vote =
+            raft_state.voted_for.is_none() || raft_state.voted_for.as_deref() == Some(candidate_id);
 
         if can_vote {
             let log = self.log.lock().await;
@@ -391,17 +393,15 @@ mod tests {
     #[tokio::test]
     async fn test_raft_handle_append_entries_with_data() {
         let node = test_node();
-        let entries = vec![
-            RaftLogEntry {
-                term: 1,
-                index: 1,
-                command: RaftCommand::Insert {
-                    id: 10,
-                    vector: vec![1.0],
-                    payload: None,
-                },
+        let entries = vec![RaftLogEntry {
+            term: 1,
+            index: 1,
+            command: RaftCommand::Insert {
+                id: 10,
+                vector: vec![1.0],
+                payload: None,
             },
-        ];
+        }];
         let (success, _) = node
             .handle_append_entries(1, "leader-1", 0, 0, entries, 1)
             .await
@@ -495,13 +495,23 @@ mod tests {
         node.start_election().await.unwrap();
 
         node.propose(RaftCommand::Insert {
-            id: 1, vector: vec![1.0], payload: None,
-        }).await.unwrap();
+            id: 1,
+            vector: vec![1.0],
+            payload: None,
+        })
+        .await
+        .unwrap();
         node.propose(RaftCommand::Insert {
-            id: 2, vector: vec![2.0], payload: None,
-        }).await.unwrap();
+            id: 2,
+            vector: vec![2.0],
+            payload: None,
+        })
+        .await
+        .unwrap();
 
-        node.propose(RaftCommand::Delete { ids: vec![1] }).await.unwrap();
+        node.propose(RaftCommand::Delete { ids: vec![1] })
+            .await
+            .unwrap();
 
         let state = node.read_state().await;
         assert_eq!(state.len(), 1);

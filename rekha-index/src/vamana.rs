@@ -1,8 +1,8 @@
 use fnv::FnvHashSet;
 use rand::Rng;
 use rekha_core::{distance::l2_squared, IndexError, RekhaError};
-use std::collections::BinaryHeap;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// DiskANN-style Vamana graph for approximate nearest neighbor search.
 ///
@@ -75,7 +75,8 @@ impl VamanaGraph {
             self.edges[i] = pruned;
 
             // Add reverse edges (with pruning).
-            let current_neighbors: Vec<usize> = self.edges[i].iter()
+            let current_neighbors: Vec<usize> = self.edges[i]
+                .iter()
                 .map(|nid| self.id_to_pos[nid])
                 .filter(|p| *p != i)
                 .collect();
@@ -194,9 +195,9 @@ impl VamanaGraph {
         let mut all: Vec<(f32, u64)> = visited
             .iter()
             .filter_map(|&vid| {
-                self.id_to_pos.get(&vid).map(|&p| {
-                    (l2_squared(query, &vectors[p].1), vid)
-                })
+                self.id_to_pos
+                    .get(&vid)
+                    .map(|&p| (l2_squared(query, &vectors[p].1), vid))
             })
             .collect();
         all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -210,6 +211,10 @@ impl VamanaGraph {
 
     pub fn len(&self) -> usize {
         self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
     }
 
     pub fn is_built(&self) -> bool {
@@ -227,9 +232,7 @@ impl VamanaGraph {
 
         let sample_size = n.min(100);
         let mut rng = rand::thread_rng();
-        let sample: Vec<usize> = (0..sample_size)
-            .map(|_| rng.gen_range(0..n))
-            .collect();
+        let sample: Vec<usize> = (0..sample_size).map(|_| rng.gen_range(0..n)).collect();
 
         let mut best_idx = 0;
         let mut best_sum = f32::MAX;

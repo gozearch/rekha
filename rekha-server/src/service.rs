@@ -1,4 +1,6 @@
-use rekha_core::{Coordinator as CoordinatorTrait, Payload, RekhaError, SearchParams, VectorStoreBackend};
+use rekha_core::{
+    Coordinator as CoordinatorTrait, Payload, RekhaError, SearchParams, VectorStoreBackend,
+};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -8,7 +10,7 @@ use crate::proto::{
     self, rekha_server::Rekha, DeleteRequest, DeleteResponse, FetchRequest, FetchResponse,
     HandshakeRequest, HandshakeResponse, HeartbeatRequest, HeartbeatResponse, InsertBatchResponse,
     InsertRequest, InsertResponse, RaftAck, RaftEntry, RaftSnapshotChunk, RaftVoteRequest,
-    RaftVoteResponse, SearchRequest, SearchResponse, ScoredPoint, TransferRequest,
+    RaftVoteResponse, ScoredPoint, SearchRequest, SearchResponse, TransferRequest,
     TransferResponse,
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -32,12 +34,10 @@ impl RekhaService {
             RekhaError::InvalidDimension { .. } => Status::invalid_argument(e.to_string()),
             RekhaError::Timeout { .. } => Status::deadline_exceeded(e.to_string()),
             RekhaError::Unavailable { .. } => Status::unavailable(e.to_string()),
-            RekhaError::Consensus(ref raft_err) => match raft_err {
-                rekha_core::RaftError::NotLeader { .. } => {
-                    Status::failed_precondition(e.to_string())
-                }
-                _ => Status::internal(e.to_string()),
-            },
+            RekhaError::Consensus(rekha_core::RaftError::NotLeader { .. }) => {
+                Status::failed_precondition(e.to_string())
+            }
+            RekhaError::Consensus(_) => Status::internal(e.to_string()),
             _ => Status::internal(e.to_string()),
         }
     }
@@ -46,7 +46,10 @@ impl RekhaService {
 #[tonic::async_trait]
 impl Rekha for RekhaService {
     // ── Insert ────────────────────────────────────────────────
-    async fn insert(&self, request: Request<InsertRequest>) -> Result<Response<InsertResponse>, Status> {
+    async fn insert(
+        &self,
+        request: Request<InsertRequest>,
+    ) -> Result<Response<InsertResponse>, Status> {
         let req = request.into_inner();
         let payload = req.payload.map(|p| Payload {
             content_type: match p.content_type.as_str() {
@@ -100,9 +103,16 @@ impl Rekha for RekhaService {
     }
 
     // ── Delete ────────────────────────────────────────────────
-    async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+    async fn delete(
+        &self,
+        request: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
         let req = request.into_inner();
-        let deleted = self.coordinator.store().delete(&req.ids).map_err(Self::map_error)?;
+        let deleted = self
+            .coordinator
+            .store()
+            .delete(&req.ids)
+            .map_err(Self::map_error)?;
 
         Ok(Response::new(DeleteResponse {
             deleted_count: deleted,
@@ -111,7 +121,10 @@ impl Rekha for RekhaService {
     }
 
     // ── Fetch ─────────────────────────────────────────────────
-    async fn fetch(&self, request: Request<FetchRequest>) -> Result<Response<FetchResponse>, Status> {
+    async fn fetch(
+        &self,
+        request: Request<FetchRequest>,
+    ) -> Result<Response<FetchResponse>, Status> {
         let req = request.into_inner();
         let mut vectors = Vec::new();
         let mut points = Vec::new();
@@ -119,10 +132,7 @@ impl Rekha for RekhaService {
         for id in &req.ids {
             match self.coordinator.store().get_vector(*id) {
                 Ok(Some(data)) => {
-                    vectors.push(proto::Vector {
-                        id: *id,
-                        data,
-                    });
+                    vectors.push(proto::Vector { id: *id, data });
                     if req.include_payloads {
                         let payload = self.coordinator.store().get_payload(*id).ok().flatten();
                         points.push(ScoredPoint {
@@ -150,7 +160,10 @@ impl Rekha for RekhaService {
     }
 
     // ── Search ────────────────────────────────────────────────
-    async fn search(&self, request: Request<SearchRequest>) -> Result<Response<SearchResponse>, Status> {
+    async fn search(
+        &self,
+        request: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
         let params = req.params.unwrap_or_default();
 
@@ -161,7 +174,11 @@ impl Rekha for RekhaService {
             partition_hint: params.partition_hint,
         };
 
-        match self.coordinator.search(req.query_vector, req.top_k as usize, search_params).await {
+        match self
+            .coordinator
+            .search(req.query_vector, req.top_k as usize, search_params)
+            .await
+        {
             Ok((results, stats)) => {
                 let points: Vec<ScoredPoint> = results
                     .into_iter()
@@ -210,7 +227,10 @@ impl Rekha for RekhaService {
         let coordinator = self.coordinator.clone();
 
         tokio::spawn(async move {
-            match coordinator.search(req.query_vector, req.top_k as usize, search_params).await {
+            match coordinator
+                .search(req.query_vector, req.top_k as usize, search_params)
+                .await
+            {
                 Ok((results, _stats)) => {
                     for r in results {
                         let point = ScoredPoint {
@@ -236,7 +256,10 @@ impl Rekha for RekhaService {
     }
 
     // ── Cluster Management ────────────────────────────────────
-    async fn handshake(&self, request: Request<HandshakeRequest>) -> Result<Response<HandshakeResponse>, Status> {
+    async fn handshake(
+        &self,
+        request: Request<HandshakeRequest>,
+    ) -> Result<Response<HandshakeResponse>, Status> {
         let req = request.into_inner();
         info!("Handshake from node {} at {}", req.node_id, req.address);
 
@@ -247,7 +270,10 @@ impl Rekha for RekhaService {
         }))
     }
 
-    async fn heartbeat(&self, request: Request<HeartbeatRequest>) -> Result<Response<HeartbeatResponse>, Status> {
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
         let _req = request.into_inner();
         Ok(Response::new(HeartbeatResponse {
             success: true,
@@ -323,49 +349,66 @@ mod tests {
 
     #[test]
     fn test_map_error_index_full() {
-        let err = RekhaError::IndexFull { capacity: 100, attempted: 101 };
+        let err = RekhaError::IndexFull {
+            capacity: 100,
+            attempted: 101,
+        };
         let status = RekhaService::map_error(err);
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     #[test]
     fn test_map_error_invalid_dimension() {
-        let err = RekhaError::InvalidDimension { expected: 768, actual: 64 };
+        let err = RekhaError::InvalidDimension {
+            expected: 768,
+            actual: 64,
+        };
         let status = RekhaService::map_error(err);
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
     fn test_map_error_timeout() {
-        let err = RekhaError::Timeout { operation: "search", elapsed_ms: 5000 };
+        let err = RekhaError::Timeout {
+            operation: "search",
+            elapsed_ms: 5000,
+        };
         let status = RekhaService::map_error(err);
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
     }
 
     #[test]
     fn test_map_error_unavailable() {
-        let err = RekhaError::Unavailable { detail: "down".into() };
+        let err = RekhaError::Unavailable {
+            detail: "down".into(),
+        };
         let status = RekhaService::map_error(err);
         assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     #[test]
     fn test_map_error_not_leader() {
-        let err = RekhaError::Consensus(rekha_core::RaftError::NotLeader { leader_hint: Some("n2".into()) });
+        let err = RekhaError::Consensus(rekha_core::RaftError::NotLeader {
+            leader_hint: Some("n2".into()),
+        });
         let status = RekhaService::map_error(err);
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
     #[test]
     fn test_map_error_internal() {
-        let err = RekhaError::Internal { detail: "oops".into() };
+        let err = RekhaError::Internal {
+            detail: "oops".into(),
+        };
         let status = RekhaService::map_error(err);
         assert_eq!(status.code(), tonic::Code::Internal);
     }
 
     #[test]
     fn test_map_error_storage() {
-        let err = RekhaError::Storage(rekha_core::StorageError::Corruption { detail: "bad".into() });
+        let err = RekhaError::Storage(rekha_core::StorageError::Corruption {
+            detail: "bad".into(),
+        });
         let status = RekhaService::map_error(err);
         assert_eq!(status.code(), tonic::Code::Internal);
     }

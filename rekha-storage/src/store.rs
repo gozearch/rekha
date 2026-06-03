@@ -1,7 +1,5 @@
 use rekha_core::{RekhaError, StorageError, VectorStoreBackend};
-use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded, Options,
-};
+use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded, Options};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,25 +29,22 @@ impl RocksVectorStore {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = vec![
-            CF_VECTORS,
-            CF_PAYLOADS,
-            CF_METADATA,
-            CF_RAFT_LOG,
-        ]
-        .iter()
-        .map(|name| {
-            let mut cf_opts = Options::default();
-            cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-            ColumnFamilyDescriptor::new(*name, cf_opts)
-        })
-        .collect();
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> =
+            [CF_VECTORS, CF_PAYLOADS, CF_METADATA, CF_RAFT_LOG]
+                .iter()
+                .map(|name| {
+                    let mut cf_opts = Options::default();
+                    cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                    ColumnFamilyDescriptor::new(*name, cf_opts)
+                })
+                .collect();
 
-        let db = DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&opts, path, cf_descriptors)
-            .map_err(|e| StorageError::DbOpen {
-                path: path.display().to_string(),
-                source: e.to_string(),
-            })?;
+        let db =
+            DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&opts, path, cf_descriptors)
+                .map_err(|e| StorageError::DbOpen {
+                    path: path.display().to_string(),
+                    source: e.to_string(),
+                })?;
 
         Ok(Self {
             db: Arc::new(db),
@@ -87,25 +82,30 @@ impl VectorStoreBackend for RocksVectorStore {
     fn put_vector(&self, id: u64, data: &[f32]) -> Result<(), RekhaError> {
         let key = Self::encode_key(id);
         let value = vector_to_bytes(data);
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_VECTORS)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_VECTORS.into(),
                 source: "handle not found".into(),
+            })?;
+        self.db.put_cf(&cf, key, value).map_err(|e| {
+            StorageError::Write {
+                source: e.to_string(),
             }
-        })?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| StorageError::Write { source: e.to_string() }.into())
+            .into()
+        })
     }
 
     fn get_vector(&self, id: u64) -> Result<Option<Vec<f32>>, RekhaError> {
         let key = Self::encode_key(id);
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_VECTORS)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_VECTORS.into(),
                 source: "handle not found".into(),
-            }
-        })?;
+            })?;
         match self.db.get_cf(&cf, key) {
             Ok(Some(bytes)) => Ok(Some(bytes_to_vector(&bytes))),
             Ok(None) => Ok(None),
@@ -126,25 +126,30 @@ impl VectorStoreBackend for RocksVectorStore {
             .into());
         }
         let key = Self::encode_key(id);
-        let cf = self.db.cf_handle(CF_PAYLOADS).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_PAYLOADS)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_PAYLOADS.into(),
                 source: "handle not found".into(),
+            })?;
+        self.db.put_cf(&cf, key, payload).map_err(|e| {
+            StorageError::Write {
+                source: e.to_string(),
             }
-        })?;
-        self.db
-            .put_cf(&cf, key, payload)
-            .map_err(|e| StorageError::Write { source: e.to_string() }.into())
+            .into()
+        })
     }
 
     fn get_payload(&self, id: u64) -> Result<Option<Vec<u8>>, RekhaError> {
         let key = Self::encode_key(id);
-        let cf = self.db.cf_handle(CF_PAYLOADS).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_PAYLOADS)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_PAYLOADS.into(),
                 source: "handle not found".into(),
-            }
-        })?;
+            })?;
         match self.db.get_cf(&cf, key) {
             Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
             Ok(None) => Ok(None),
@@ -157,47 +162,52 @@ impl VectorStoreBackend for RocksVectorStore {
     }
 
     fn delete(&self, ids: &[u64]) -> Result<u64, RekhaError> {
-        let cf_vec = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf_vec = self
+            .db
+            .cf_handle(CF_VECTORS)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_VECTORS.into(),
                 source: "handle not found".into(),
-            }
-        })?;
-        let cf_pay = self.db.cf_handle(CF_PAYLOADS).ok_or_else(|| {
-            StorageError::ColumnFamily {
+            })?;
+        let cf_pay = self
+            .db
+            .cf_handle(CF_PAYLOADS)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_PAYLOADS.into(),
                 source: "handle not found".into(),
-            }
-        })?;
+            })?;
 
         let mut deleted = 0u64;
         for id in ids {
             let key = Self::encode_key(*id);
             self.db
                 .delete_cf(&cf_vec, &key)
-                .map_err(|e| StorageError::Write { source: e.to_string() })?;
+                .map_err(|e| StorageError::Write {
+                    source: e.to_string(),
+                })?;
             self.db
                 .delete_cf(&cf_pay, &key)
-                .map_err(|e| StorageError::Write { source: e.to_string() })?;
+                .map_err(|e| StorageError::Write {
+                    source: e.to_string(),
+                })?;
             deleted += 1;
         }
         Ok(deleted)
     }
 
     fn iter_ids(&self) -> Result<Vec<u64>, RekhaError> {
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_VECTORS)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_VECTORS.into(),
                 source: "handle not found".into(),
-            }
-        })?;
+            })?;
         let mut ids = Vec::new();
         let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
         for result in iter {
-            let (key, _) = result.map_err(|e| {
-                RekhaError::Internal {
-                    detail: format!("db iteration error: {e}"),
-                }
+            let (key, _) = result.map_err(|e| RekhaError::Internal {
+                detail: format!("db iteration error: {e}"),
             })?;
             if let Some(id) = Self::decode_key(&key) {
                 ids.push(id);
@@ -320,7 +330,9 @@ mod tests {
     fn payload_too_large() {
         let dir = std::env::temp_dir().join("rekha_test_payload_large");
         let _ = std::fs::remove_dir_all(&dir);
-        let store = RocksVectorStore::open(&dir).unwrap().with_max_payload_size(10);
+        let store = RocksVectorStore::open(&dir)
+            .unwrap()
+            .with_max_payload_size(10);
 
         let large = vec![0u8; 100];
         let result = store.put_payload(42, &large);

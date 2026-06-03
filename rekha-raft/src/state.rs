@@ -44,10 +44,7 @@ impl ReplicatedState {
 
     /// Apply an insert command to the state.
     pub fn apply_insert(&mut self, id: u64, vector: Vec<f32>, payload: Option<Vec<u8>>) {
-        let vec_bytes = vector
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let vec_bytes = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.vectors.insert(id, vec_bytes);
         if let Some(p) = payload {
             self.payloads.insert(id, p);
@@ -114,7 +111,11 @@ impl RaftCommand {
     /// Apply this command to the replicated state.
     pub fn apply(&self, state: &mut ReplicatedState) {
         match self {
-            Self::Insert { id, vector, payload } => {
+            Self::Insert {
+                id,
+                vector,
+                payload,
+            } => {
                 state.apply_insert(*id, vector.clone(), payload.clone());
             }
             Self::Delete { ids } => {

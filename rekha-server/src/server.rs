@@ -5,8 +5,8 @@ use rekha_storage::RocksVectorStore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tonic::transport::{Identity, Server};
 use tonic::transport::server::ServerTlsConfig;
+use tonic::transport::{Identity, Server};
 use tracing::info;
 
 use crate::config::ServerConfig;
@@ -37,9 +37,7 @@ impl ServerInstance {
     /// Create and initialize a new Rekha server from a config struct.
     pub async fn from_config(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
         // Initialize tracing/logging (ignore errors if already initialized).
-        let _ = tracing_subscriber::fmt()
-            .with_target(false)
-            .try_init();
+        let _ = tracing_subscriber::fmt().with_target(false).try_init();
 
         info!(
             "Starting Rekha server: node={}, bind={}",
@@ -61,13 +59,12 @@ impl ServerInstance {
         )));
 
         // Create coordinator.
-        let coordinator = Arc::new(Coordinator::new(
-            config.clone(),
-            store,
-            partition_manager,
-        ));
+        let coordinator = Arc::new(Coordinator::new(config.clone(), store, partition_manager));
 
-        Ok(Self { config, coordinator })
+        Ok(Self {
+            config,
+            coordinator,
+        })
     }
 
     /// Set the index on the coordinator.
@@ -82,26 +79,29 @@ impl ServerInstance {
         let service = RekhaService::new(self.coordinator.clone());
 
         if self.config.tls.enabled {
-            let cert_path = self.config.tls.cert_path.as_ref().ok_or_else(|| {
-                "TLS enabled but cert_path not configured".to_string()
-            })?;
-            let key_path = self.config.tls.key_path.as_ref().ok_or_else(|| {
-                "TLS enabled but key_path not configured".to_string()
-            })?;
+            let cert_path = self
+                .config
+                .tls
+                .cert_path
+                .as_ref()
+                .ok_or_else(|| "TLS enabled but cert_path not configured".to_string())?;
+            let key_path = self
+                .config
+                .tls
+                .key_path
+                .as_ref()
+                .ok_or_else(|| "TLS enabled but key_path not configured".to_string())?;
 
-            let cert = std::fs::read(cert_path)
-                .map_err(|e| format!("failed to read cert: {e}"))?;
-            let key = std::fs::read(key_path)
-                .map_err(|e| format!("failed to read key: {e}"))?;
+            let cert = std::fs::read(cert_path).map_err(|e| format!("failed to read cert: {e}"))?;
+            let key = std::fs::read(key_path).map_err(|e| format!("failed to read key: {e}"))?;
             let identity = Identity::from_pem(cert, key);
 
             let mut tls_config = ServerTlsConfig::new().identity(identity);
             if let Some(ca_path) = &self.config.tls.ca_cert_path {
-                let ca_cert = std::fs::read(ca_path)
-                    .map_err(|e| format!("failed to read CA cert: {e}"))?;
-                tls_config = tls_config.client_ca_root(
-                    tonic::transport::Certificate::from_pem(ca_cert),
-                );
+                let ca_cert =
+                    std::fs::read(ca_path).map_err(|e| format!("failed to read CA cert: {e}"))?;
+                tls_config =
+                    tls_config.client_ca_root(tonic::transport::Certificate::from_pem(ca_cert));
             }
 
             info!("gRPC server listening on {addr} with TLS");

@@ -60,8 +60,7 @@ impl Payload {
         }
     }
 
-    pub fn as_json<T: serde::de::DeserializeOwned>(&self) -> Option<T>
-    {
+    pub fn as_json<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
         if matches!(self.content_type, PayloadType::Json) {
             serde_json::from_slice(&self.data).ok()
         } else {
@@ -266,10 +265,22 @@ mod tests {
     #[test]
     fn test_distance_metric_from_str() {
         assert_eq!("l2".parse::<DistanceMetric>().unwrap(), DistanceMetric::L2);
-        assert_eq!("euclidean".parse::<DistanceMetric>().unwrap(), DistanceMetric::L2);
-        assert_eq!("cosine".parse::<DistanceMetric>().unwrap(), DistanceMetric::Cosine);
-        assert_eq!("cos".parse::<DistanceMetric>().unwrap(), DistanceMetric::Cosine);
-        assert_eq!("ip".parse::<DistanceMetric>().unwrap(), DistanceMetric::InnerProduct);
+        assert_eq!(
+            "euclidean".parse::<DistanceMetric>().unwrap(),
+            DistanceMetric::L2
+        );
+        assert_eq!(
+            "cosine".parse::<DistanceMetric>().unwrap(),
+            DistanceMetric::Cosine
+        );
+        assert_eq!(
+            "cos".parse::<DistanceMetric>().unwrap(),
+            DistanceMetric::Cosine
+        );
+        assert_eq!(
+            "ip".parse::<DistanceMetric>().unwrap(),
+            DistanceMetric::InnerProduct
+        );
         assert!("unknown".parse::<DistanceMetric>().is_err());
     }
 
@@ -279,7 +290,10 @@ mod tests {
         assert_eq!(pk.vector_shard(4), 2);
         let pk = PartitionKey::DimensionRange(0, 128);
         assert_eq!(pk.vector_shard(4), 0);
-        let pk = PartitionKey::Hybrid { vector_shard: 10, dim_group: 1 };
+        let pk = PartitionKey::Hybrid {
+            vector_shard: 10,
+            dim_group: 1,
+        };
         assert_eq!(pk.vector_shard(4), 2);
     }
 
@@ -294,9 +308,17 @@ mod tests {
 
     #[test]
     fn test_owned_range_dim_count() {
-        let r = OwnedRange { vector_shard: 0, dim_start: 0, dim_end: 128 };
+        let r = OwnedRange {
+            vector_shard: 0,
+            dim_start: 0,
+            dim_end: 128,
+        };
         assert_eq!(r.dim_count(), 128);
-        let r = OwnedRange { vector_shard: 1, dim_start: 128, dim_end: 64 };
+        let r = OwnedRange {
+            vector_shard: 1,
+            dim_start: 128,
+            dim_end: 64,
+        };
         assert_eq!(r.dim_count(), 0);
     }
 
@@ -334,7 +356,10 @@ mod tests {
 
     #[test]
     fn test_vector_serde() {
-        let v = Vector { id: 1, data: vec![0.5, 0.25] };
+        let v = Vector {
+            id: 1,
+            data: vec![0.5, 0.25],
+        };
         let json = serde_json::to_string(&v).unwrap();
         let v2: Vector = serde_json::from_str(&json).unwrap();
         assert_eq!(v.id, v2.id);
@@ -357,17 +382,20 @@ mod tests {
     #[test]
     fn test_cluster_topology() {
         let mut nodes = HashMap::new();
-        nodes.insert("n1".into(), NodeInfo {
-            node_id: "n1".into(),
-            address: "10.0.0.1:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![0, 1],
-            is_leader: true,
-            raft_term: 1,
-            commit_index: 10,
-            storage_bytes: 1024,
-            status: NodeStatus::Healthy,
-        });
+        nodes.insert(
+            "n1".into(),
+            NodeInfo {
+                node_id: "n1".into(),
+                address: "10.0.0.1:50051".into(),
+                partition_id: 0,
+                dim_groups: vec![0, 1],
+                is_leader: true,
+                raft_term: 1,
+                commit_index: 10,
+                storage_bytes: 1024,
+                status: NodeStatus::Healthy,
+            },
+        );
         let topo = ClusterTopology {
             cluster_id: "test-cluster".into(),
             nodes,
@@ -385,7 +413,10 @@ mod tests {
 
     #[test]
     fn test_compressed_vector_serde() {
-        let cv = CompressedVector { id: 7, pq_code: vec![0xAB; 64] };
+        let cv = CompressedVector {
+            id: 7,
+            pq_code: vec![0xAB; 64],
+        };
         let json = serde_json::to_string(&cv).unwrap();
         let cv2: CompressedVector = serde_json::from_str(&json).unwrap();
         assert_eq!(cv.id, cv2.id);

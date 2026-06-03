@@ -22,11 +22,7 @@ pub struct PartitionManager {
 
 impl PartitionManager {
     /// Create a new partition manager.
-    pub fn new(
-        nodes: HashMap<String, NodeInfo>,
-        num_dim_groups: u32,
-        total_dim: usize,
-    ) -> Self {
+    pub fn new(nodes: HashMap<String, NodeInfo>, num_dim_groups: u32, total_dim: usize) -> Self {
         let dims_per_group = if num_dim_groups > 0 {
             total_dim / num_dim_groups as usize
         } else {
@@ -53,8 +49,10 @@ impl PartitionManager {
         for (node_id, info) in &self.nodes {
             let range = OwnedRange {
                 vector_shard: info.partition_id,
-                dim_start: info.dim_groups.first().copied().unwrap_or(0) as usize * self.dims_per_group,
-                dim_end: (info.dim_groups.last().copied().unwrap_or(0) as usize + 1) * self.dims_per_group,
+                dim_start: info.dim_groups.first().copied().unwrap_or(0) as usize
+                    * self.dims_per_group,
+                dim_end: (info.dim_groups.last().copied().unwrap_or(0) as usize + 1)
+                    * self.dims_per_group,
             };
 
             self.owned_ranges
@@ -84,14 +82,19 @@ impl PartitionManager {
     }
 
     /// Get all nodes that can serve a given (vector_shard, dim_group) partition.
-    pub fn nodes_for_partition(&self, vector_shard: u64, dim_group: u32) -> Result<&[String], RekhaError> {
+    pub fn nodes_for_partition(
+        &self,
+        vector_shard: u64,
+        dim_group: u32,
+    ) -> Result<&[String], RekhaError> {
         self.topology
             .get(&(vector_shard, dim_group))
             .map(|v| v.as_slice())
             .ok_or_else(|| {
                 PartitionError::NoNodesAvailable {
                     partition_id: vector_shard,
-                }.into()
+                }
+                .into()
             })
     }
 

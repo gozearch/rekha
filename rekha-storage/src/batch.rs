@@ -1,6 +1,6 @@
+use crate::store::RocksVectorStore;
 use rekha_core::{RekhaError, StorageError};
 use rocksdb::WriteBatch as RocksWriteBatch;
-use crate::store::RocksVectorStore;
 
 const CF_VECTORS: &str = "vectors";
 const CF_PAYLOADS: &str = "payloads";
@@ -46,8 +46,8 @@ impl<'a> WriteBatch<'a> {
         let key = id.to_be_bytes();
         let cf_v = self.store.db().cf_handle(CF_VECTORS).unwrap();
         let cf_p = self.store.db().cf_handle(CF_PAYLOADS).unwrap();
-        self.batch.delete_cf(&cf_v, &key);
-        self.batch.delete_cf(&cf_p, &key);
+        self.batch.delete_cf(&cf_v, key);
+        self.batch.delete_cf(&cf_p, key);
         self.pending += 2;
         self
     }
@@ -64,17 +64,14 @@ impl<'a> WriteBatch<'a> {
         if self.pending == 0 {
             return Ok(());
         }
-        self.store
-            .db()
-            .write(self.batch)
-            .map_err(|e| {
-                StorageError::BatchWrite {
-                    committed: 0,
-                    failed: self.pending,
-                    source: e.to_string(),
-                }
-                .into()
-            })
+        self.store.db().write(self.batch).map_err(|e| {
+            StorageError::BatchWrite {
+                committed: 0,
+                failed: self.pending,
+                source: e.to_string(),
+            }
+            .into()
+        })
     }
 }
 
@@ -125,8 +122,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = RocksVectorStore::open(&dir).unwrap();
 
-        let batch = WriteBatch::new(&store)
-            .put_metadata(b"cluster_config", br#"{"key": "value"}"#);
+        let batch = WriteBatch::new(&store).put_metadata(b"cluster_config", br#"{"key": "value"}"#);
         batch.commit().unwrap();
 
         let cf = store.db().cf_handle("metadata").unwrap();

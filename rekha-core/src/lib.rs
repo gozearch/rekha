@@ -1,9 +1,9 @@
-pub mod error;
-pub mod types;
 pub mod distance;
+pub mod error;
 pub mod traits;
+pub mod types;
 
-pub use error::{RekhaError, StorageError, IndexError, PartitionError, RaftError};
-pub use types::*;
 pub use distance::*;
+pub use error::{IndexError, PartitionError, RaftError, RekhaError, StorageError};
 pub use traits::*;
+pub use types::*;

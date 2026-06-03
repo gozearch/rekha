@@ -1,5 +1,5 @@
-pub mod store;
 pub mod batch;
+pub mod store;
 
-pub use store::RocksVectorStore;
 pub use batch::WriteBatch;
+pub use store::RocksVectorStore;

@@ -1,6 +1,4 @@
-use rekha_core::{
-    ClusterTopology, Payload, RekhaError, ScoredPoint, SearchParams, SearchStats,
-};
+use rekha_core::{ClusterTopology, Payload, RekhaError, ScoredPoint, SearchParams, SearchStats};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -85,7 +83,10 @@ impl RekhaClient {
     }
 
     /// Connect with custom configuration.
-    pub async fn connect_with_config(seeds: &[String], config: ClientConfig) -> Result<Self, RekhaError> {
+    pub async fn connect_with_config(
+        seeds: &[String],
+        config: ClientConfig,
+    ) -> Result<Self, RekhaError> {
         if seeds.is_empty() {
             return Err(RekhaError::InvalidArgument(
                 "at least one seed node required".into(),
@@ -102,9 +103,9 @@ impl RekhaClient {
         if let Some(ca_cert) = &config.ca_cert {
             let tls = ClientTlsConfig::new()
                 .ca_certificate(tonic::transport::Certificate::from_pem(ca_cert));
-            endpoint = endpoint.tls_config(tls).map_err(|e| {
-                RekhaError::InvalidArgument(format!("invalid TLS config: {e}"))
-            })?;
+            endpoint = endpoint
+                .tls_config(tls)
+                .map_err(|e| RekhaError::InvalidArgument(format!("invalid TLS config: {e}")))?;
         }
 
         let channel = endpoint
@@ -166,9 +167,7 @@ impl RekhaClient {
                     if resp.success {
                         return Ok(());
                     } else {
-                        return Err(RekhaError::Internal {
-                            detail: resp.error,
-                        });
+                        return Err(RekhaError::Internal { detail: resp.error });
                     }
                 }
                 Err(status) => {
@@ -198,7 +197,11 @@ impl RekhaClient {
     /// # Arguments
     /// * `query` - Query vector
     /// * `top_k` - Number of results to return
-    pub async fn search(&self, query: Vec<f32>, top_k: usize) -> Result<Vec<ScoredPoint>, RekhaError> {
+    pub async fn search(
+        &self,
+        query: Vec<f32>,
+        top_k: usize,
+    ) -> Result<Vec<ScoredPoint>, RekhaError> {
         let params = SearchParams::default();
         let result = self.search_with_params(query, top_k, params).await?;
         Ok(result.0)
@@ -255,12 +258,15 @@ impl RekhaClient {
             })
             .collect();
 
-        let stats = resp.stats.map(|s| SearchStats {
-            total_ms: s.total_ms,
-            nodes_contacted: s.nodes_contacted,
-            vectors_scanned: s.vectors_scanned,
-            warnings: s.warnings,
-        }).unwrap_or_default();
+        let stats = resp
+            .stats
+            .map(|s| SearchStats {
+                total_ms: s.total_ms,
+                nodes_contacted: s.nodes_contacted,
+                vectors_scanned: s.vectors_scanned,
+                warnings: s.warnings,
+            })
+            .unwrap_or_default();
 
         Ok((results, stats))
     }
@@ -269,9 +275,7 @@ impl RekhaClient {
     pub async fn delete(&self, ids: &[u64]) -> Result<u64, RekhaError> {
         let mut client = GrpcClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(proto::DeleteRequest {
-            ids: ids.to_vec(),
-        });
+        let request = tonic::Request::new(proto::DeleteRequest { ids: ids.to_vec() });
 
         let response = client
             .delete(request)
@@ -284,7 +288,11 @@ impl RekhaClient {
     }
 
     /// Fetch vectors and their payloads by ID.
-    pub async fn fetch(&self, ids: &[u64], include_payloads: bool) -> Result<Vec<ScoredPoint>, RekhaError> {
+    pub async fn fetch(
+        &self,
+        ids: &[u64],
+        include_payloads: bool,
+    ) -> Result<Vec<ScoredPoint>, RekhaError> {
         let mut client = GrpcClient::new(self.channel.clone());
 
         let request = tonic::Request::new(FetchRequest {

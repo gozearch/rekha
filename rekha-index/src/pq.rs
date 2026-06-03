@@ -30,7 +30,7 @@ pub struct ProductQuantizer {
 impl ProductQuantizer {
     /// Create a new PQ with M sub-quantizers, each with K centroids.
     pub fn new(m: usize, k: usize, dim: usize) -> Result<Self, RekhaError> {
-        if dim % m != 0 {
+        if !dim.is_multiple_of(m) {
             return Err(RekhaError::InvalidArgument(format!(
                 "PQ: dimension {dim} not divisible by M={m}"
             )));
@@ -65,10 +65,7 @@ impl ProductQuantizer {
             let end = start + self.d;
 
             // Collect sub-vectors for this sub-quantizer.
-            let sub_vectors: Vec<&[f32]> = vectors
-                .iter()
-                .map(|v| &v[start..end])
-                .collect();
+            let sub_vectors: Vec<&[f32]> = vectors.iter().map(|v| &v[start..end]).collect();
 
             // Train k-means on these sub-vectors.
             let centroids = kmeans(&sub_vectors, self.k, 20);
@@ -232,9 +229,7 @@ mod tests {
         assert_eq!(pq.d, 2);
 
         let vectors: Vec<Vec<f32>> = (0..100)
-            .map(|_| {
-                (0..8).map(|_| rand::thread_rng().gen::<f32>()).collect()
-            })
+            .map(|_| (0..8).map(|_| rand::thread_rng().gen::<f32>()).collect())
             .collect();
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
 
@@ -271,7 +266,9 @@ mod tests {
     #[test]
     fn test_pq_encode_wrong_dims() {
         let mut pq = ProductQuantizer::new(2, 8, 4).unwrap();
-        let vectors: Vec<Vec<f32>> = (0..10).map(|_| vec![rand::thread_rng().gen::<f32>(); 4]).collect();
+        let vectors: Vec<Vec<f32>> = (0..10)
+            .map(|_| vec![rand::thread_rng().gen::<f32>(); 4])
+            .collect();
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
         pq.train(&refs).unwrap();
 
@@ -289,7 +286,9 @@ mod tests {
     #[test]
     fn test_pq_encode_batch() {
         let mut pq = ProductQuantizer::new(2, 8, 4).unwrap();
-        let vectors: Vec<Vec<f32>> = (0..20).map(|_| vec![rand::thread_rng().gen::<f32>(); 4]).collect();
+        let vectors: Vec<Vec<f32>> = (0..20)
+            .map(|_| vec![rand::thread_rng().gen::<f32>(); 4])
+            .collect();
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
         pq.train(&refs).unwrap();
 
@@ -303,7 +302,9 @@ mod tests {
     #[test]
     fn test_pq_distance_table_shape() {
         let mut pq = ProductQuantizer::new(4, 32, 8).unwrap();
-        let vectors: Vec<Vec<f32>> = (0..50).map(|_| vec![rand::thread_rng().gen::<f32>(); 8]).collect();
+        let vectors: Vec<Vec<f32>> = (0..50)
+            .map(|_| vec![rand::thread_rng().gen::<f32>(); 8])
+            .collect();
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
         pq.train(&refs).unwrap();
 
@@ -316,7 +317,9 @@ mod tests {
     #[test]
     fn test_pq_adc_distance_zero_for_identical() {
         let mut pq = ProductQuantizer::new(2, 8, 4).unwrap();
-        let vectors: Vec<Vec<f32>> = (0..30).map(|_| vec![rand::thread_rng().gen::<f32>(); 4]).collect();
+        let vectors: Vec<Vec<f32>> = (0..30)
+            .map(|_| vec![rand::thread_rng().gen::<f32>(); 4])
+            .collect();
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
         pq.train(&refs).unwrap();
 

@@ -1,0 +1,41 @@
+cluster:
+  node_id: "node-1"
+  seed_nodes:
+    - "127.0.0.1:50051"
+  bind_addr: "0.0.0.0:50051"
+  data_dir: "/tmp/rekha-data"
+
+partition:
+  num_vector_shards: 1
+  replication_factor: 1
+  num_dim_groups: 4
+  dim_group_size: 64
+
+index:
+  type: "vamana"
+  graph_degree: 64
+  search_list_size: 128
+  pq_num_sub_vectors: 64
+  pq_num_centroids: 256
+  re_rank_k: 256
+
+raft:
+  heartbeat_interval_ms: 100
+  election_timeout_min_ms: 300
+  election_timeout_max_ms: 500
+  snapshot_interval: 10000
+
+storage:
+  max_payload_size: 1048576
+  max_inline_size: 1048576
+
+tls:
+  enabled: false
+  cert_path: ~
+  key_path: ~
+  ca_cert_path: ~
+
+observability:
+  metrics: "prometheus"
+  tracing: "none"
+  logging: "structured"

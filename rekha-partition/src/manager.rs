@@ -1,0 +1,224 @@
+use rekha_core::{NodeInfo, NodeStatus, OwnedRange, PartitionError, RekhaError};
+use std::collections::HashMap;
+
+/// Manages partition-to-node assignments and cluster topology.
+///
+/// Tracks:
+/// - Which nodes own which (vector_shard, dim_group) pairs
+/// - Node health and leadership status
+/// - Dimension ranges assigned to each dimension group
+pub struct PartitionManager {
+    /// Node ID -> NodeInfo mapping.
+    nodes: HashMap<String, NodeInfo>,
+    /// (vector_shard, dim_group) -> list of node IDs that own this partition.
+    topology: HashMap<(u64, u32), Vec<String>>,
+    /// Node ID -> list of owned ranges.
+    owned_ranges: HashMap<String, Vec<OwnedRange>>,
+    /// Number of dimension groups.
+    num_dim_groups: u32,
+    /// Dimensions per group.
+    dims_per_group: usize,
+}
+
+impl PartitionManager {
+    /// Create a new partition manager.
+    pub fn new(
+        nodes: HashMap<String, NodeInfo>,
+        num_dim_groups: u32,
+        total_dim: usize,
+    ) -> Self {
+        let dims_per_group = if num_dim_groups > 0 {
+            total_dim / num_dim_groups as usize
+        } else {
+            total_dim
+        };
+
+        let mut manager = Self {
+            nodes,
+            topology: HashMap::new(),
+            owned_ranges: HashMap::new(),
+            num_dim_groups,
+            dims_per_group,
+        };
+
+        manager.rebuild_topology();
+        manager
+    }
+
+    /// Rebuild topology from current node assignments.
+    fn rebuild_topology(&mut self) {
+        self.topology.clear();
+        self.owned_ranges.clear();
+
+        for (node_id, info) in &self.nodes {
+            let range = OwnedRange {
+                vector_shard: info.partition_id,
+                dim_start: info.dim_groups.first().copied().unwrap_or(0) as usize * self.dims_per_group,
+                dim_end: (info.dim_groups.last().copied().unwrap_or(0) as usize + 1) * self.dims_per_group,
+            };
+
+            self.owned_ranges
+                .entry(node_id.clone())
+                .or_default()
+                .push(range.clone());
+
+            for &dim_group in &info.dim_groups {
+                self.topology
+                    .entry((info.partition_id, dim_group))
+                    .or_default()
+                    .push(node_id.clone());
+            }
+        }
+    }
+
+    /// Register a node and its partition ownership.
+    pub fn register_node(&mut self, info: NodeInfo) {
+        self.nodes.insert(info.node_id.clone(), info);
+        self.rebuild_topology();
+    }
+
+    /// Remove a node from the cluster.
+    pub fn remove_node(&mut self, node_id: &str) {
+        self.nodes.remove(node_id);
+        self.rebuild_topology();
+    }
+
+    /// Get all nodes that can serve a given (vector_shard, dim_group) partition.
+    pub fn nodes_for_partition(&self, vector_shard: u64, dim_group: u32) -> Result<&[String], RekhaError> {
+        self.topology
+            .get(&(vector_shard, dim_group))
+            .map(|v| v.as_slice())
+            .ok_or_else(|| {
+                PartitionError::NoNodesAvailable {
+                    partition_id: vector_shard,
+                }.into()
+            })
+    }
+
+    /// Get the owned ranges for a specific node.
+    pub fn node_ranges(&self, node_id: &str) -> Option<&[OwnedRange]> {
+        self.owned_ranges.get(node_id).map(|v| v.as_slice())
+    }
+
+    /// Get dimension range for a dimension group.
+    pub fn dim_group_range(&self, group: u32) -> Option<(usize, usize)> {
+        if group >= self.num_dim_groups {
+            return None;
+        }
+        let start = (group as usize) * self.dims_per_group;
+        let end = start + self.dims_per_group;
+        Some((start, end))
+    }
+
+    /// Get all healthy nodes.
+    pub fn healthy_nodes(&self) -> Vec<&NodeInfo> {
+        self.nodes
+            .values()
+            .filter(|n| matches!(n.status, NodeStatus::Healthy | NodeStatus::Degraded))
+            .collect()
+    }
+
+    /// Number of registered nodes.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// All registered nodes.
+    pub fn all_nodes(&self) -> &HashMap<String, NodeInfo> {
+        &self.nodes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_partition_manager() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "node-1".into(),
+            NodeInfo {
+                node_id: "node-1".into(),
+                address: "10.0.0.1:50051".into(),
+                partition_id: 0,
+                dim_groups: vec![0, 1],
+                is_leader: true,
+                raft_term: 1,
+                commit_index: 100,
+                storage_bytes: 1024,
+                status: NodeStatus::Healthy,
+            },
+        );
+
+        let manager = PartitionManager::new(nodes, 4, 768);
+        assert_eq!(manager.node_count(), 1);
+        assert_eq!(manager.dims_per_group, 192);
+
+        let nodes = manager.nodes_for_partition(0, 0).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0], "node-1");
+    }
+
+    #[test]
+    fn test_manager_empty() {
+        let manager = PartitionManager::new(HashMap::new(), 4, 768);
+        assert_eq!(manager.node_count(), 0);
+        assert!(manager.nodes_for_partition(0, 0).is_err());
+    }
+
+    #[test]
+    fn test_manager_node_for_shard() {
+        let mut nodes = HashMap::new();
+        for i in 0..4 {
+            let dims: Vec<u32> = (0..2).collect();
+            nodes.insert(
+                format!("node-{}", i),
+                NodeInfo {
+                    node_id: format!("node-{}", i),
+                    address: format!("10.0.0.{}:50051", i + 1),
+                    partition_id: i as u64,
+                    dim_groups: dims,
+                    is_leader: i == 0,
+                    raft_term: 1,
+                    commit_index: 50,
+                    storage_bytes: 512,
+                    status: NodeStatus::Healthy,
+                },
+            );
+        }
+
+        let manager = PartitionManager::new(nodes, 4, 768);
+        let nodes_for_p0 = manager.nodes_for_partition(0, 0).unwrap();
+        assert!(!nodes_for_p0.is_empty());
+    }
+
+    #[test]
+    fn test_manager_dims_per_group_calculation() {
+        let manager = PartitionManager::new(HashMap::new(), 4, 1024);
+        assert_eq!(manager.dims_per_group, 256);
+    }
+
+    #[test]
+    fn test_manager_all_nodes() {
+        let mut nodes = HashMap::new();
+        for i in 0..3 {
+            nodes.insert(
+                format!("n{}", i),
+                NodeInfo {
+                    node_id: format!("n{}", i),
+                    address: format!("addr{}", i),
+                    partition_id: i as u64,
+                    dim_groups: vec![0],
+                    is_leader: false,
+                    raft_term: 0,
+                    commit_index: 0,
+                    storage_bytes: 0,
+                    status: NodeStatus::Healthy,
+                },
+            );
+        }
+        let manager = PartitionManager::new(nodes, 4, 768);
+        assert_eq!(manager.node_count(), 3);
+    }
+}

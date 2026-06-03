@@ -1,0 +1,18 @@
+[package]
+name = "rekha-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-storage = { path = "../rekha-storage" }
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+thiserror = "2"
+log = "0.4"
+fnv = "1"
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3"
+proptest = "1"

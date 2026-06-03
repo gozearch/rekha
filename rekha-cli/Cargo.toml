@@ -1,0 +1,13 @@
+[package]
+name = "rekha-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-client = { path = "../rekha-client" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"

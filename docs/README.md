@@ -1,0 +1,598 @@
+# Rekha — Distributed Vector Database
+
+Rekha is a distributed vector database built in Rust, designed for billion-scale Approximate Nearest Neighbor Search (ANNS) with HDD-friendly access patterns. It uses DiskANN-style Vamana + PQ indexing, multi-granularity partitioning, and Raft consensus per shard.
+
+> **Architecture details**: See [DESIGN.md](../DESIGN.md) for the full design document.
+
+---
+
+## Table of Contents
+
+1. [Quick Start (Local Dev)](#1-quick-start-local-dev)
+2. [Production Deployment](#2-production-deployment)
+3. [Configuration Reference](#3-configuration-reference)
+4. [CLI Reference](#4-cli-reference)
+5. [Client SDKs](#5-client-sdks)
+6. [Development Guide](#6-development-guide)
+
+---
+
+## 1. Quick Start (Local Dev)
+
+### Prerequisites
+
+- Rust 1.75+ (`rustup default stable`)
+- `cargo install just` (optional — for the `justfile`)
+
+### Build
+
+```bash
+git clone <repo> && cd rekha
+cargo build --release
+```
+
+> `rekha-py` (Python SDK via PyO3) is excluded from the workspace. To build it: `cd rekha-py && cargo build`.
+
+### Run a Single-Node Server
+
+The server is currently a library crate. You can run it by adding a thin binary or using the CLI with a `server` subcommand once wired. For now, create a run script:
+
+```bash
+# examples/run_dev.rs — or add to rekha-cli as `rekha server --config`
+cargo run --bin rekha -- server --config config.yaml
+```
+
+The included `config.yaml` is pre-configured for single-node dev:
+
+```yaml
+cluster:
+  node_id: "node-1"
+  seed_nodes: ["127.0.0.1:50051"]
+  bind_addr: "0.0.0.0:50051"
+  data_dir: "/tmp/rekha-data"
+
+tls:
+  enabled: false               # Plaintext for local dev
+```
+
+Start the server:
+
+```bash
+REKHA_CONFIG=config.yaml cargo run --bin rekha -- server
+```
+
+### Insert & Search via CLI
+
+```bash
+# Insert — reads vector from stdin
+echo "0.1 0.2 0.3 0.4" | cargo run --bin rekha -- insert 42
+
+# With payload
+echo "0.1 0.2 0.3 0.4" | cargo run --bin rekha -- insert 42 --payload '{"title":"hello"}'
+
+# Search — reads query from stdin
+echo "0.1 0.2 0.3 0.4" | cargo run --bin rekha -- search -k 10
+
+# Delete
+cargo run --bin rekha -- delete 42 43 44
+```
+
+### Generate Self-Signed Certificates (for TLS testing)
+
+```bash
+# CA key + cert
+openssl genrsa -out ca.key 4096
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 365 -out ca.crt \
+  -subj "/CN=Rekha Test CA"
+
+# Server key + CSR + cert (signed by CA)
+openssl genrsa -out server.key 4096
+openssl req -new -key server.key -out server.csr \
+  -subj "/CN=localhost"
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out server.crt -days 365 -sha256
+
+# Client key + CSR + cert (for mTLS)
+openssl genrsa -out client.key 4096
+openssl req -new -key client.key -out client.csr \
+  -subj "/CN=client"
+openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out client.crt -days 365 -sha256
+```
+
+Then set in `config.yaml`:
+
+```yaml
+tls:
+  enabled: true
+  cert_path: "/path/to/server.crt"
+  key_path: "/path/to/server.key"
+  ca_cert_path: "/path/to/ca.crt"   # Optional — for mTLS
+```
+
+### Run Tests
+
+```bash
+just test                # All unit tests (workspace)
+just test-name raft      # Tests matching "raft" (regex)
+cargo test --workspace   # Same as above, without `just`
+```
+
+> Integration tests that need a real gRPC server are marked `#[ignore]` and excluded by default.
+
+---
+
+## 2. Production Deployment
+
+### Topology Design
+
+A Rekha cluster is a grid of **vector shards** × **dimension groups**:
+
+| Parameter | Example | Meaning |
+|---|---|---|
+| `num_vector_shards` | 16 | Horizontal Raft replication groups |
+| `replication_factor` | 3 | Replicas per shard (Raft majority = 2) |
+| `num_dim_groups` | 4 | Vertical dimension partitions per shard |
+
+**Minimum nodes**: `replication_factor` (e.g., 3). For balanced load, `num_vector_shards` should be a multiple of the node count.
+
+**Dimension constraint**: `dim_group_size * num_dim_groups = vector dimension`. For 768-dim vectors: `192 * 4 = 768` or `64 * 12 = 768`.
+
+### 3-Node Cluster Example
+
+Node 1 config (`/etc/rekha/node-1.yaml`):
+
+```yaml
+cluster:
+  node_id: "node-1"
+  seed_nodes:
+    - "node-1:50051"
+    - "node-2:50051"
+    - "node-3:50051"
+  bind_addr: "0.0.0.0:50051"
+  data_dir: "/data/rekha"
+
+tls:
+  enabled: true
+  cert_path: "/etc/rekha/certs/node-1.crt"
+  key_path: "/etc/rekha/certs/node-1.key"
+  ca_cert_path: "/etc/rekha/certs/ca.crt"
+
+partition:
+  num_vector_shards: 12
+  replication_factor: 3
+  num_dim_groups: 4
+  dim_group_size: 192
+```
+
+Node 2 — same config, but `node_id: "node-2"`, `bind_addr: "0.0.0.0:50052"`, and its own cert/key.
+
+Node 3 — same, `node_id: "node-3"`, `bind_addr: "0.0.0.0:50053"`.
+
+All nodes share the same `seed_nodes` list for cluster discovery.
+
+### TLS Certificates for Production
+
+Use a real CA or internal PKI:
+
+```bash
+# 1. Generate CA (offline, secure)
+openssl req -x509 -newkey rsa:4096 -keyout ca.key -out ca.crt \
+  -days 3650 -nodes -subj "/CN=Rekha Cluster CA"
+
+# 2. Per-node certificates
+for node in node-1 node-2 node-3; do
+  openssl genrsa -out ${node}.key 4096
+  openssl req -new -key ${node}.key -out ${node}.csr \
+    -subj "/CN=${node}"
+  openssl x509 -req -in ${node}.csr -CA ca.crt -CAkey ca.key \
+    -CAcreateserial -out ${node}.crt -days 365 -sha256
+done
+```
+
+Distribute:
+- Each node: its own `{node}.crt`, `{node}.key`, plus `ca.crt`
+- Clients: `ca.crt` (and optionally their own cert for mTLS)
+
+### Cluster Startup
+
+1. Start all nodes in any order (they discover each other via seed nodes)
+2. Raft elections converge within 300–500ms per shard
+3. Cluster is ready when `rekha health` returns OK for all nodes
+4. Each shard's Raft leader handles writes; followers serve reads
+
+### Rolling Upgrade
+
+```bash
+# 1. Stop node (SIGTERM — graceful shutdown)
+kill -TERM <pid>
+
+# 2. Upgrade binary
+cp rekha /usr/local/bin/rekha
+
+# 3. Restart
+/usr/local/bin/rekha server --config /etc/rekha/node-1.yaml
+
+# 4. Wait for Raft leader re-election to stabilize
+# 5. Repeat for remaining nodes
+```
+
+During upgrade of a 3-replica shard:
+- 1 node down: quorum intact (2/3), cluster healthy
+- 2 nodes down: quorum lost for that shard → writes pause until majority restored
+
+### Backup & Restore
+
+```bash
+# Backup (stop node first for consistent snapshot)
+cp -r /data/rekha /backup/rekha-$(date +%Y%m%d)
+
+# Restore
+rsync -a /backup/rekha-20260603/ /data/rekha/
+```
+
+For live backup, use RocksDB's `Checkpoint` API (see `RocksVectorStore::create_checkpoint`).
+
+---
+
+## 3. Configuration Reference
+
+All config is YAML. The schema is defined by `ServerConfig` in `rekha-server/src/config.rs`.
+
+### `cluster`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `node_id` | string | – | Unique node identifier (e.g., `"node-1"`) |
+| `seed_nodes` | string[] | – | Initial seed nodes for cluster discovery |
+| `bind_addr` | string | – | gRPC listen address (e.g., `"0.0.0.0:50051"`) |
+| `data_dir` | string | – | Data directory (RocksDB + configuration files) |
+
+### `tls`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Enable TLS (rustls — pure Rust, no OpenSSL) |
+| `cert_path` | string | `null` | Path to server TLS certificate (PEM) — required when `enabled: true` |
+| `key_path` | string | `null` | Path to server TLS private key (PEM) — required when `enabled: true` |
+| `ca_cert_path` | string | `null` | Optional CA cert for mTLS client verification |
+
+### `partition`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `num_vector_shards` | u64 | `1` | Number of Raft replication groups (horizontal shards) |
+| `replication_factor` | usize | `1` | Replicas per shard (1 = no replication) |
+| `num_dim_groups` | u32 | `4` | Dimension-based vertical partitions per shard |
+| `dim_group_size` | usize | `64` | Dimensions per group (`dim_group_size * num_dim_groups` = vector dimension) |
+
+### `index`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | `"vamana"` | Index type (currently only `vamana`) |
+| `graph_degree` | usize | `64` | Vamana graph out-degree (R) — higher = more accurate, more memory |
+| `search_list_size` | usize | `128` | Beam width during search (ef_search) — higher = more accurate, slower |
+| `pq_num_sub_vectors` | usize | `64` | PQ: number of sub-vectors (M) — determines compression ratio |
+| `pq_num_centroids` | usize | `256` | PQ: centroids per sub-vector (K) — 256 = 1 byte per sub-vector |
+| `re_rank_k` | usize | `256` | Candidates to re-rank with full-precision vectors after PQ search |
+
+### `raft`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `heartbeat_interval_ms` | u64 | `100` | Leader heartbeat interval (ms) |
+| `election_timeout_min_ms` | u64 | `300` | Minimum election timeout (ms) — randomized per node |
+| `election_timeout_max_ms` | u64 | `500` | Maximum election timeout (ms) |
+| `snapshot_interval` | u64 | `10000` | Raft log compaction interval (entries between snapshots) |
+
+### `storage`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `max_payload_size` | usize | `1048576` | Maximum payload size in bytes (1 MB) |
+| `max_inline_size` | usize | `1048576` | Maximum inline value size in bytes |
+
+### `observability`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `metrics` | string | `"prometheus"` | Metrics backend (`"prometheus"` or `"none"`) |
+| `tracing` | string | `"none"` | Distributed tracing backend (`"jaeger"` or `"none"`) |
+| `logging` | string | `"structured"` | Log format (`"structured"` or `"plain"`) |
+
+### Full Example
+
+```yaml
+cluster:
+  node_id: "node-1"
+  seed_nodes:
+    - "node-1:50051"
+    - "node-2:50051"
+    - "node-3:50051"
+  bind_addr: "0.0.0.0:50051"
+  data_dir: "/data/rekha"
+
+tls:
+  enabled: true
+  cert_path: "/etc/rekha/certs/server.crt"
+  key_path: "/etc/rekha/certs/server.key"
+  ca_cert_path: "/etc/rekha/certs/ca.crt"
+
+partition:
+  num_vector_shards: 16
+  replication_factor: 3
+  num_dim_groups: 4
+  dim_group_size: 192
+
+index:
+  type: "vamana"
+  graph_degree: 64
+  search_list_size: 128
+  pq_num_sub_vectors: 64
+  pq_num_centroids: 256
+  re_rank_k: 256
+
+raft:
+  heartbeat_interval_ms: 100
+  election_timeout_min_ms: 300
+  election_timeout_max_ms: 500
+  snapshot_interval: 10000
+
+storage:
+  max_payload_size: 1048576
+  max_inline_size: 1048576
+
+observability:
+  metrics: "prometheus"
+  tracing: "jaeger"
+  logging: "structured"
+```
+
+---
+
+## 4. CLI Reference
+
+The `rekha` binary provides admin commands for interacting with the cluster.
+
+### Global Flags
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
+| `--address <ADDR>` | – | `localhost:50051` | Address of a seed node |
+| `--config <PATH>` | `REKHA_CONFIG` | – | Server config file path |
+| `--tls` | – | `false` | Enable TLS for client connections |
+| `--ca-cert <PATH>` | – | – | Path to CA certificate (PEM) for TLS |
+
+### Commands
+
+#### `rekha server`
+
+Start a Rekha server node.
+
+```bash
+rekha server --config /etc/rekha/node-1.yaml
+```
+
+#### `rekha insert`
+
+Insert a vector with optional payload. The vector is read from stdin as space-separated floats on a single line.
+
+```bash
+# ID only (vector from stdin)
+rekha insert 42
+echo "0.1 0.2 0.3 0.4" | rekha insert 42
+
+# With payload
+rekha insert 42 --payload '{"title":"hello"}'
+echo "0.1 0.2 0.3 0.4" | rekha insert 42 --payload '{"title":"hello"}'
+```
+
+| Arg | Description |
+|---|---|
+| `id` | Vector ID (u64) |
+| `--payload` | Optional payload string |
+
+#### `rekha search`
+
+Search for nearest neighbors. The query vector is read from stdin.
+
+```bash
+rekha search -k 10
+echo "0.1 0.2 0.3 0.4" | rekha search -k 10
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-k` | `10` | Number of results (top-k) |
+
+#### `rekha delete`
+
+Delete vectors by ID.
+
+```bash
+rekha delete 42
+rekha delete 42 43 44 45
+```
+
+| Arg | Description |
+|---|---|
+| `ids` | One or more vector IDs (u64) |
+
+#### `rekha info`
+
+Show cluster topology and node health.
+
+```bash
+rekha info
+```
+
+#### `rekha health`
+
+Cluster health check.
+
+```bash
+rekha health
+```
+
+### TLS Usage
+
+```bash
+# Insert with TLS
+rekha --tls --ca-cert /etc/rekha/certs/ca.crt insert 42
+echo "0.1 0.2 0.3" | rekha --tls --ca-cert /etc/rekha/certs/ca.crt insert 42
+
+# Search with TLS
+echo "0.1 0.2 0.3" | rekha --tls --ca-cert /etc/rekha/certs/ca.crt search -k 10
+```
+
+---
+
+## 5. Client SDKs
+
+### Rust SDK
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+rekha-client = { git = "..." }
+rekha-core = { git = "..." }
+```
+
+#### Connect
+
+```rust
+use rekha_client::{RekhaClient, ClientConfig};
+
+// Plaintext (default)
+let client = RekhaClient::connect(&["localhost:50051".to_string()]).await?;
+
+// TLS with custom CA
+let client = RekhaClient::connect_with_config(
+    &["node-1:50051".to_string()],
+    ClientConfig {
+        use_tls: true,
+        ca_cert: Some(std::fs::read("/etc/rekha/certs/ca.crt")?),
+        ..Default::default()
+    },
+).await?;
+```
+
+#### CRUD
+
+```rust
+// Insert
+client.insert(42, vec![0.1, 0.2, 0.3], Some(b"hello world".to_vec())).await?;
+
+// Search (default params)
+let results = client.search(vec![0.1, 0.2, 0.3], 10).await?;
+
+// Search with custom params
+use rekha_core::SearchParams;
+let (results, stats) = client.search_with_params(
+    vec![0.1, 0.2, 0.3],
+    10,
+    SearchParams {
+        ef_search: 200,
+        include_payloads: true,
+        ..Default::default()
+    },
+).await?;
+
+// Delete
+let deleted = client.delete(&[42, 43]).await?;
+
+// Fetch
+let points = client.fetch(&[42], true).await?;
+```
+
+#### ClientConfig
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `connect_timeout` | Duration | 10s | Timeout for initial connection |
+| `request_timeout` | Duration | 60s | Timeout for individual RPCs |
+| `max_retries` | u32 | 3 | Maximum retries with exponential backoff |
+| `max_connections` | usize | 100 | Connection pool size |
+| `use_tls` | bool | `false` | Enable TLS (HTTPS scheme) |
+| `ca_cert` | Option<Vec<u8>> | `None` | Custom PEM CA certificate for TLS |
+
+### Python SDK
+
+```python
+import rekha
+
+# Connect (TLS if use_tls=True)
+client = rekha.connect("localhost:50051")
+
+# Insert
+client.insert(42, [0.1, 0.2, 0.3], payload={"title": "hello"})
+
+# Search
+results = client.search([0.1, 0.2, 0.3], top_k=10)
+for r in results:
+    print(r.id, r.score, r.payload)
+
+# Delete
+client.delete([42, 43])
+```
+
+---
+
+## 6. Development Guide
+
+### Crate Map
+
+| Crate | Responsibility | Dependencies |
+|---|---|---|
+| `rekha-core` | Types, traits, errors, distance math | (zero) |
+| `rekha-storage` | RocksDB wrapper (4 column families) | `rekha-core` |
+| `rekha-index` | Vamana graph + Product Quantization | `rekha-core`, `rekha-storage` |
+| `rekha-partition` | Multi-granularity partition strategy | `rekha-core` |
+| `rekha-raft` | Raft consensus per partition | `rekha-core` |
+| `rekha-server` | gRPC server, coordinator, service handlers | All above + tonic |
+| `rekha-client` | Rust SDK | `rekha-core` + tonic |
+| `rekha-cli` | Admin CLI | `rekha-client` + clap |
+| `rekha-py` | Python SDK (PyO3, standalone) | `rekha-core` |
+| `rekha-bench` | Benchmarks | `rekha-core` |
+
+### Justfile Commands
+
+| Command | What it does |
+|---|---|
+| `just test` | Run all unit tests (workspace, excluding `rekha-py` and `rekha-bench`) |
+| `just lint` | Format check (`cargo fmt`) + clippy (deny warnings) |
+| `just fix` | Auto-format with `cargo fmt --all` |
+| `just build` | Build workspace (debug) |
+| `just release-build` | Build release binaries |
+| `just check` | Fast compilation check (`cargo check`) |
+| `just coverage` | Generate LCOV coverage report (needs nightly + cargo-llvm-cov) |
+| `just coverage-html` | Generate HTML coverage report and open in browser |
+| `just test-name <name>` | Run tests matching `<name>` (regex, e.g., `just test-name raft`) |
+
+### Testing Conventions
+
+- **Unit tests**: Standard `#[test]` functions alongside the code they test. Run by `just test`.
+- **Integration tests**: Grouped in `tests/` directories. Run by `just test`.
+- **Ignored tests**: Tests that require a running gRPC server are marked `#[ignore]`. Run with `cargo test -- --ignored`.
+- **Parallel safety**: Tests that use RocksDB use unique temp directories (via `AtomicU64` counter) to avoid collisions.
+- **Coverage**: `just coverage` runs all workspace tests with `cargo-llvm-cov` (requires `nightly` Rust and `cargo install cargo-llvm-cov`).
+
+### Adding a New Crate
+
+1. Create `rekha-<name>/` with `Cargo.toml` and `src/lib.rs`
+2. Add to `members` and `default-members` in workspace `Cargo.toml`
+3. Add dependencies following existing patterns
+4. Add tests following error-propagation conventions
+
+### Error Propagation Pattern
+
+```rust
+// Each layer defines its own error enum, which converts to RekhaError:
+impl From<MyLayerError> for RekhaError {
+    fn from(e: MyLayerError) -> Self {
+        RekhaError::MyVariant { source: Box::new(e), detail: e.to_string() }
+    }
+}
+```

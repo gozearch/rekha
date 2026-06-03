@@ -1,0 +1,206 @@
+syntax = "proto3";
+
+package rekha;
+
+service Rekha {
+    // ── Data operations ──────────────────────────────────────
+    rpc Insert(InsertRequest) returns (InsertResponse);
+    rpc InsertBatch(stream InsertRequest) returns (InsertBatchResponse);
+    rpc Delete(DeleteRequest) returns (DeleteResponse);
+    rpc Fetch(FetchRequest) returns (FetchResponse);
+
+    // ── Search ───────────────────────────────────────────────
+    rpc Search(SearchRequest) returns (SearchResponse);
+    rpc SearchStream(SearchRequest) returns (stream ScoredPoint);
+
+    // ── Cluster management (internal) ────────────────────────
+    rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    rpc TransferShard(TransferRequest) returns (TransferResponse);
+
+    // ── Raft replication (internal) ──────────────────────────
+    rpc RaftAppendEntries(stream RaftEntry) returns (RaftAck);
+    rpc RaftRequestVote(RaftVoteRequest) returns (RaftVoteResponse);
+    rpc RaftInstallSnapshot(stream RaftSnapshotChunk) returns (RaftAck);
+}
+
+// ── Core Data Types ─────────────────────────────────────────
+
+message Vector {
+    uint64 id = 1;
+    repeated float data = 2;
+}
+
+message Payload {
+    string content_type = 1;    // "json", "text", "raw"
+    bytes data = 2;
+}
+
+message ScoredPoint {
+    uint64 id = 1;
+    float score = 2;
+    optional Payload payload = 3;
+}
+
+// ── Insert ──────────────────────────────────────────────────
+
+message InsertRequest {
+    uint64 id = 1;
+    repeated float vector = 2;
+    optional Payload payload = 3;
+}
+
+message InsertResponse {
+    uint64 id = 1;
+    bool success = 2;
+    string error = 3;
+}
+
+message InsertBatchResponse {
+    uint64 inserted_count = 1;
+    repeated string errors = 2;
+}
+
+// ── Delete ──────────────────────────────────────────────────
+
+message DeleteRequest {
+    repeated uint64 ids = 1;
+}
+
+message DeleteResponse {
+    uint64 deleted_count = 1;
+    string error = 2;
+}
+
+// ── Fetch ───────────────────────────────────────────────────
+
+message FetchRequest {
+    repeated uint64 ids = 1;
+    bool include_payloads = 2;
+}
+
+message FetchResponse {
+    repeated Vector vectors = 1;
+    repeated ScoredPoint points = 2;
+    string error = 3;
+}
+
+// ── Search ──────────────────────────────────────────────────
+
+message SearchParams {
+    uint32 ef_search = 1;
+    uint32 beam_width = 2;
+    bool include_payloads = 3;
+    optional uint64 partition_hint = 4;
+}
+
+message SearchRequest {
+    repeated float query_vector = 1;
+    uint32 top_k = 2;
+    SearchParams params = 3;
+}
+
+message SearchStats {
+    double total_ms = 1;
+    uint32 nodes_contacted = 2;
+    uint64 vectors_scanned = 3;
+    repeated string warnings = 4;
+}
+
+message SearchResponse {
+    repeated ScoredPoint results = 1;
+    SearchStats stats = 2;
+}
+
+// ── Cluster Management ──────────────────────────────────────
+
+message NodeInfo {
+    string node_id = 1;
+    string address = 2;
+    uint64 partition_id = 3;
+    repeated uint32 dim_groups = 4;
+    bool is_leader = 5;
+    uint64 raft_term = 6;
+    uint64 commit_index = 7;
+    uint64 storage_bytes = 8;
+    string status = 9;
+}
+
+message HandshakeRequest {
+    string node_id = 1;
+    string address = 2;
+}
+
+message HandshakeResponse {
+    string cluster_id = 1;
+    repeated NodeInfo peers = 2;
+    string error = 3;
+}
+
+message HeartbeatRequest {
+    string node_id = 1;
+    uint64 raft_term = 2;
+    uint64 commit_index = 3;
+    uint64 storage_bytes = 4;
+}
+
+message HeartbeatResponse {
+    bool success = 1;
+    string leader_hint = 2;
+    uint64 leader_term = 3;
+}
+
+message TransferRequest {
+    uint64 partition_id = 1;
+    string target_node = 2;
+    repeated uint64 vector_ids = 3;
+}
+
+message TransferResponse {
+    bool success = 1;
+    uint64 transferred_count = 2;
+    string error = 3;
+}
+
+// ── Raft ────────────────────────────────────────────────────
+
+message RaftEntry {
+    uint64 term = 1;
+    uint64 index = 2;
+    RaftCommand command = 3;
+}
+
+message RaftCommand {
+    oneof cmd {
+        InsertRequest insert = 1;
+        DeleteRequest delete = 2;
+        bytes custom = 3;
+    }
+}
+
+message RaftAck {
+    bool success = 1;
+    uint64 current_term = 2;
+    uint64 commit_index = 3;
+    string error = 4;
+}
+
+message RaftVoteRequest {
+    uint64 term = 1;
+    string candidate_id = 2;
+    uint64 last_log_index = 3;
+    uint64 last_log_term = 4;
+}
+
+message RaftVoteResponse {
+    uint64 term = 1;
+    bool vote_granted = 2;
+}
+
+message RaftSnapshotChunk {
+    uint64 term = 1;
+    uint64 last_included_index = 2;
+    uint64 last_included_term = 3;
+    bytes data = 4;
+    bool done = 5;
+}

@@ -40,34 +40,40 @@ It is built from the ground up in Rust.
                       │ gRPC (Tonic)
 ┌─────────────────────▼───────────────────────────────────┐
 │                    Coordinator                            │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
-│  │ Query Router │  │ Result Merger │  │ Topology Mgmt  │  │
-│  └──────┬──────┘  └──────┬───────┘  └───────┬────────┘  │
-└─────────┼─────────────────┼──────────────────┼────────────┘
-          │       ┌─────────┘                  │
-          ▼       ▼                            ▼
+│  ┌──────────┐  ┌──────────┐  ┌──────┐  ┌────────────┐  │
+│  │Query     │  │Result    │  │Peer  │  │Raft Node   │  │
+│  │Router    │  │Merger    │  │Pool  │  │Registry    │  │
+│  └──────┬───┘  └────┬─────┘  └──┬───┘  └─────┬──────┘  │
+└─────────┼────────────┼──────────┼─────────────┼─────────┘
+          │            │          │             │
+          ▼            ▼          ▼             ▼
 ┌─────────────────────────────────────────────────────────┐
 │                   Rekha Node                              │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐  │
 │  │ Vamana + │  │ RocksDB  │  │ Raft     │  │Partition│  │
-│  │ PQ Index │  │ Storage  │  │ Consensus│  │ Manager │  │
-│  └──────────┘  └──────────┘  └──────────┘  └────────┘  │
+│  │ PQ Index │  │ (4 CFs)  │  │ Consensus│  │ Manager │  │
+│  │          │  │ ┌──────┐ │  │ (Timers) │  │         │  │
+│  │          │  │ │Raft  │ │  │          │  │         │  │
+│  │          │  │ │Log   │ │  │          │  │         │  │
+│  │          │  │ │Store │ │  │          │  │         │  │
+│  └──────────┘  │ └──────┘ │  └──────────┘  └────────┘  │
+│                └──────────┘                              │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ### Crate Architecture (Cargo Workspace)
 
-| Crate | Responsibility |
-|---|---|
-| `rekha-core` | Types, traits, errors, distance math (zero deps) |
-| `rekha-storage` | RocksDB wrapper with column families |
-| `rekha-index` | Vamana graph + Product Quantization |
-| `rekha-partition` | Multi-granularity partition strategy |
-| `rekha-raft` | Raft consensus per partition |
-| `rekha-server` | gRPC server, coordinator, service handlers |
-| `rekha-client` | Rust SDK (connection pool, retry, streaming) |
-| `rekha-py` | Python SDK (PyO3 + maturin) |
-| `rekha-cli` | Admin CLI tool |
+| Crate | Responsibility | Implemented Features |
+|---|---|---|
+| `rekha-core` | Types, traits, errors, distance math (zero deps) | 36 error variants, 3 distance metrics |
+| `rekha-storage` | RocksDB wrapper with column families | 4 CFs (vectors, payloads, metadata, raft_log), WriteBatch, WAL flush on drop |
+| `rekha-index` | Vamana graph + Product Quantization | Build, search, dim-range search, early-stop pruning |
+| `rekha-partition` | Multi-granularity partition strategy | 2-level grid, topology management, node health |
+| `rekha-raft` | Raft consensus per partition | Leader election, log replication, persistence via RaftLogStore, timer loops |
+| `rekha-server` | gRPC server, coordinator, service handlers | Query coordinator (local + peer fan-out + re-rank), PeerPool, heartbeat loop, raft timers, handshake/heartbeat RPCs |
+| `rekha-client` | Rust SDK (connection pool, retry, streaming) | Multi-seed connect, exponential backoff + jitter, TLS support |
+| `rekha-python` | Python SDK (pure gRPC, no PyO3) | Insert, search, delete, fetch, streaming, cluster info |
+| `rekha-cli` | Admin CLI tool | server start, insert, search, delete |
 
 ---
 
@@ -245,7 +251,32 @@ fn search_dim_range(query, k, dim_start, dim_end, params):
 | `vectors` | Full-precision vector data | `u64 BE` | `[f32; D] LE` |
 | `payloads` | Arbitrary user payloads | `u64 BE` | `[u8]` |
 | `metadata` | Index/PQ/partition config | string | JSON |
-| `raft_log` | Raft WAL entries | `u64 (index)` | protobuf |
+| `raft_log` | Raft WAL entries | `[partition_id (8B BE)] + [log_index (8B BE)]` | `bincode(RaftLogEntry)` |
+
+The `raft_log` column family uses a composite key (`partition_id` + `log_index`, both
+big-endian) so that entries for different partitions are stored contiguously and can
+be iterated by prefix scan.
+
+### RaftLogStore
+
+A `RaftLogStore` wraps `RocksVectorStore` and provides typed access to the `raft_log`
+column family:
+
+- `store_entry()` / `store_entries()` — persist single or batched `RaftLogEntry` values
+  serialized with `bincode`
+- `load_entries(partition_id, from_index)` — prefix-scan entries starting from a given index
+- `last_log_index()` / `last_log_term()` — reverse-iterate to find the latest entry
+- `truncate_entries()` — delete entries from a given index onward (used on log conflict)
+- `store_state()` / `load_state()` — persist/load `(term, voted_for)` tuples for durable
+  election state
+- `entry_count()` — count entries for a partition
+
+### Generic CF Access
+
+The `db()` accessor function in `RaftLogStore` returns a handle to the underlying RocksDB
+instance, enabling any caller to operate on any column family by name. This pattern is used
+by the `RaftLogStore` itself for direct CF operations and is available to other components
+that need raw DB access.
 
 ### Write Path (Atomicity)
 
@@ -283,9 +314,25 @@ Each vector shard has its own Raft group with `R` replicas.
 ### Write Path
 1. Client sends `Insert` to any node
 2. Node routes to Raft leader for the target partition
-3. Leader appends to Raft log, replicates to followers
-4. Once committed (majority ack), leader applies to state machine
-5. Leader responds to client
+3. Leader persists entry to RocksDB (via `RaftLogStore.store_entry`) — **WAL-first**
+4. Entry appended to in-memory log and applied to state machine immediately
+5. Leader responds to client (single-node; multi-node would replicate to followers first)
+
+### Persistence (RaftLogStore)
+
+The `RaftLogStore` provides durable storage for the Raft log and election state:
+
+- **Log entries**: serialized with `bincode` into the `raft_log` CF keyed by
+  `[partition_id][log_index]`. This enables range iteration for loading entries
+  on node restart.
+- **Election state**: `(term, voted_for)` stored at a sentinel key per partition
+  (`[partition_id][0xFF * 8]`).
+- **Startup recovery**: `RaftNode::with_store()` calls `load_state()` and
+  `load_entries()` on construction to restore in-memory state from RocksDB.
+  This means a restarted node picks up exactly where it left off — no data loss.
+- **Log compaction**: entries can be truncated from a given index onward
+  (used on log conflicts during AppendEntries). Periodic snapshot-based
+  compaction is planned.
 
 ### Read Path
 1. Client sends `Search` to any node
@@ -293,42 +340,157 @@ Each vector shard has its own Raft group with `R` replicas.
 3. Replica runs local search on its copy of the index
 4. Results are returned directly (no Raft round-trip)
 
+### Timer Loops
+
+Two timer loops run in the server's background task:
+
+1. **Heartbeat loop** (`spawn_heartbeat_loop`): Periodically sends `HeartbeatRequest`
+   gRPC messages to all seed nodes at `heartbeat_interval_ms` (default 100ms). Each
+   heartbeat carries the node's current raft term and commit index. Also checks peer
+   health every 10th tick by calling `Coordinator::check_peer_health()`.
+
+2. **Election timer** (`spawn_raft_timers`): Periodically checks election timeout
+   for every Raft node on this server. The check frequency is the minimum of
+   `election_timeout_min_ms` and 100ms. When a timeout elapses (with randomized
+   jitter of up to 50% of the base timeout), the node transitions to candidate
+   and starts an election.
+
+### gRPC Wiring
+
+The Raft protocol messages flow through gRPC handlers in `RekhaService`:
+
+- **`raft_append_entries`**: Converts proto `RaftLogEntry` → internal `RaftLogEntry`,
+   delegates to `RaftNode::handle_append_entries()`. Returns success status, current
+   term, and commit index.
+- **`raft_request_vote`**: Converts proto vote request → `RaftNode::handle_request_vote()`.
+   Returns vote grant status and current term.
+- **`raft_install_snapshot`**: Streaming snapshot transfer (stub — returns success
+   without data).
+- **Proto conversion**: `proto_raft_command_to_internal()` maps proto `Insert`/`Delete`/`Custom`
+   commands to the internal `RaftCommand` enum used by the state machine.
+
 ---
 
 ## 7. Coordinator & Query Execution
 
-### Search Flow (Detailed)
+### Search Flow (Three-Phase Execution)
+
+The coordinator splits a search query into three phases:
+
+**Phase 1 — Local Dimension Group Fan-Out:**
+The query is split into `num_dim_groups` contiguous dimension ranges. Each
+range is searched against the local index via `search_dim_range()`, which
+computes partial L2 distances over that range with early-stop pruning.
+Results from all local groups are merged into a single candidate list.
+
+**Phase 2 — Peer Fan-Out:**
+If the `PeerPool` has connected peers, the query is fanned out to all of
+them via `PeerPool::search_fan_out()`. Each peer runs its own local search
+and returns partial results. Peers with 3 consecutive errors are removed
+from the pool. Results from all responding peers are merged into the
+candidate list.
+
+**Phase 3 — Re-Rank:**
+The merged candidate list is sorted by partial distance and truncated to
+`k * 2`. Each candidate is re-ranked using the exact L2 distance against
+the full-precision vector from local storage. Results are then sorted by
+exact distance and truncated to the final top-k.
 
 ```
-Client                  Coordinator              Node A (dim 0-191)   Node B (dim 192-383)
-  │                         │                         │                      │
-  │──── Search(query,k)────→│                         │                      │
-  │                         │──── dim_range(0,192)───→│                      │
-  │                         │──── dim_range(192,384)────────────────────────→│
-  │                         │──── dim_range(384,576)──→│                      │
-  │                         │──── dim_range(576,768)────────────────────────→│
-  │                         │                         │                      │
-  │                         │←── partial_results ─────│                      │
-  │                         │←── partial_results ────────────────────────────│
-  │                         │←── partial_results ─────│                      │
-  │                         │←── partial_results ────────────────────────────│
-  │                         │                         │                      │
-  │                         │ [Merge & early-stop]     │                      │
-  │                         │ [Re-rank with full vecs] │                      │
-  │                         │ [Fetch payloads]         │                      │
-  │                         │                         │                      │
-  │←── top-k results ───────│                         │                      │
+Client                  Coordinator              Peer Pool           Local Index
+  │                         │                         │                   │
+  │──── Search(query,k)────→│                         │                   │
+  │                         │──── Phase 1: ───────────│──────────────────→│
+  │                         │    local dim groups      │                   │
+  │                         │←── partial results ─────│───────────────────│
+  │                         │                         │                   │
+  │                         │──── Phase 2: ──────────→│                   │
+  │                         │    peer fan-out          │                   │
+  │                         │←── peer results ────────│                   │
+  │                         │                         │                   │
+  │                         │──── Phase 3: ───────────│──────────────────→│
+  │                         │    re-rank (full vecs)    │                   │
+  │                         │                         │                   │
+  │←── top-k results ───────│                         │                   │
 ```
 
-### Early-Stop During Merge
-- Coordinator maintains a min-heap of the current top-k results
-- As each dimension group reports partial distances, candidates whose
-  partial distance already exceeds the k-th best are discarded
-- This reduces network transfer and re-ranking cost
+### Peer Management
+
+**PeerPool** — maintains a `HashMap<String, PeerClient>` of gRPC connections
+to known peer nodes. The pool is refreshed periodically:
+
+- `refresh()` reconciles the pool with the current healthy peer list: drops
+  removed peers, connects to new peers.
+- `search_fan_out()` sends the query to all connected peers, aggregates
+  results, and tracks error counts per peer.
+- A peer is automatically removed after 3 consecutive errors (circuit-breaker
+  lite).
+
+**PeerClient** — wraps a `rekha_client::RekhaClient` with:
+- Lazy connection: the client is created when the peer is first used.
+- Error tracking: each failed gRPC call increments the error counter.
+- Auto-reconnect: on the next `refresh()`, dropped peers can be reconnected.
+
+**Health Monitoring:**
+- `Coordinator::check_peer_health()` marks peers that haven't sent a heartbeat
+  in `PEER_TIMEOUT` (10s) as `Unreachable`.
+- When an Unreachable peer sends a heartbeat again, it's restored to `Healthy`.
+- The `heartbeat` gRPC handler on each node registers/updates the sender's
+  `NodeInfo` with a current timestamp.
 
 ---
 
 ## 8. Client SDKs
+
+### Rust Client (`rekha-client`)
+
+The canonical Rust SDK with full retry logic, TLS, and topology discovery.
+
+```rust
+use rekha_client::RekhaClient;
+
+let client = RekhaClient::connect(&["localhost:50051".into()]).await?;
+client.insert(42, vec![0.1, 0.2, 0.3], Some(b"payload".to_vec())).await?;
+let results = client.search(vec![0.1, 0.2, 0.3], 10).await?;
+```
+
+### Python Client (`rekha-python/src/rekha/`)
+
+Pure Python gRPC client (no PyO3). Uses `grpcio` and generated proto stubs.
+
+```python
+from rekha import RekhaClient
+
+with RekhaClient.connect(["localhost:50051"]) as client:
+    client.insert(42, [0.1, 0.2, 0.3], payload=b'{"k":"v"}')
+    results = client.search([0.1, 0.2, 0.3], top_k=10)
+    for r in results:
+        print(f"id={r.id}, score={r.score}")
+
+    # Streaming search
+    for r in client.search_stream([0.1, 0.2, 0.3], 10):
+        print(f"streamed: id={r.id}, score={r.score}")
+
+    # Cluster info
+    topology = client.cluster_info()
+    print(f"Cluster: {topology.cluster_id}")
+```
+
+**API surface:**
+
+| Method | Description |
+|---|---|
+| `connect(seeds)` | Connect to any seed node |
+| `insert(id, vector, payload?)` | Insert a vector |
+| `search(query, top_k)` | Search top-k NN |
+| `search_with_params(query, top_k, params)` | Search with ef_search, beam_width, etc. |
+| `search_stream(query, top_k, params?)` | Streaming search (generator) |
+| `delete(ids)` | Delete by ID list |
+| `fetch(ids, include_payloads)` | Fetch vectors by ID |
+| `cluster_info()` | Get cluster topology |
+| `close()` | Close gRPC channel |
+
+**Retry behavior:** Exponential backoff + jitter (100ms base, doubles per attempt, up to 3 retries by default). Only retries on `UNAVAILABLE`-style errors; fatal errors (e.g. `INVALID_ARGUMENT`) propagate immediately.
 
 ### Rust SDK
 
@@ -366,9 +528,38 @@ for r in results:
 ```
 
 ### Automatic Retry
-- Exponential backoff: 100ms, 200ms, 400ms, 800ms (max 3 retries)
-- Jitter added to avoid thundering herd
-- Circuit breaker: 5 failures in 30s → open for 60s
+All mutating and query gRPC calls use `with_retry()` internally:
+
+- **Exponential backoff**: base delay = `100ms × 2^attempt` (100ms, 200ms, 400ms)
+- **Jitter**: randomized `±25%` of the base delay per attempt to avoid
+  thundering herd (derived from system time nanos).
+- **Max retries**: 3 (configurable via `ClientConfig::max_retries`).
+- **Fatal errors**: non-retryable gRPC status codes (e.g., `INVALID_ARGUMENT`)
+  propagate immediately without retry.
+- **Circuit breaker (planned)**: 5 failures in 30s → open for 60s.
+
+### Connection Options
+
+The client supports `connect_with_config(seeds, config)` for advanced setup:
+
+```rust
+let config = ClientConfig {
+    connect_timeout: Duration::from_secs(5),
+    request_timeout: Duration::from_secs(30),
+    max_retries: 5,
+    max_connections: 50,
+    use_tls: true,
+    ca_cert: Some(pem_bytes),
+};
+let client = RekhaClient::connect_with_config(&seeds, config).await?;
+```
+
+### TLS Support
+
+- **`use_tls`**: when true, the client uses `https` scheme and configures
+  `ClientTlsConfig` via tonic/rustls.
+- **`ca_cert`**: optional PEM-encoded CA certificate for custom TLS roots
+  (used instead of system roots).
 
 ---
 
@@ -485,16 +676,20 @@ observability:
 
 ## Implementation Status
 
-| Phase | Module | Status |
+| Module | Status | Notes |
 |---|---|---|
-| 1 | Core types, errors, math | ✅ Built |
-| 2 | RocksDB storage | ✅ Built |
-| 3 | Vamana graph + PQ index | ✅ Built |
-| 4 | Multi-granularity partition | ✅ Built |
-| 5 | Raft consensus | ✅ Built |
-| 6 | Protobuf definitions | ✅ Built |
-| 7 | gRPC server + coordinator | ✅ Built |
-| 8 | Rust client SDK | ✅ Built |
-| 9 | Python SDK (PyO3) | ✅ Built |
-| 10 | CLI tool | ✅ Built |
-| 11 | Integration + hardening | 🔜 Next |
+| Core types, errors, math | ✅ | 36 error variants, 3 distance metrics, serde on all types |
+| RocksDB storage | ✅ | 4 CFs, WriteBatch, WAL flush on drop, configurable max payload |
+| Vamana + PQ index | ✅ | Build, search, dim-range search, early-stop, memory usage tracking |
+| Multi-granularity partition | ✅ | Strategy + manager, topology rebuild, healthy-node filtering |
+| Raft consensus | ✅ | Leader election, log replication, persistence via RaftLogStore, timer loops |
+| gRPC service handlers | ✅ | Insert, delete, fetch, search (streaming + unary), handshake, heartbeat, Raft AppendEntries/Vote |
+| Coordinator / Search | ✅ | Three-phase: local fan-out + peer fan-out + re-rank with exact vectors |
+| Peer management | ✅ | PeerPool with auto-connect/remove, health checks via heartbeat timeout |
+| TLS support | ✅ | rustls, optional, mTLS with CA cert verification |
+| Client SDK (Rust) | ✅ | Multi-seed connect, retry + jitter, TLS, configurable timeouts |
+| CLI tool | ✅ | Server start, insert, search, delete |
+| Graceful shutdown | ✅ | ctrl+c handler via serve_with_shutdown |
+| Python SDK | ✅ | Pure gRPC client (no PyO3). Insert, search, delete, fetch, cluster_info, streaming |
+| Circuit breaker | 🔜 | Phase 5 |
+| Metrics / tracing | 🔜 | Planned

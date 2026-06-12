@@ -78,6 +78,12 @@ impl RocksVectorStore {
     }
 }
 
+impl Drop for RocksVectorStore {
+    fn drop(&mut self) {
+        let _ = self.db.flush_wal(true);
+    }
+}
+
 impl VectorStoreBackend for RocksVectorStore {
     fn put_vector(&self, id: u64, data: &[f32]) -> Result<(), RekhaError> {
         let key = Self::encode_key(id);
@@ -162,6 +168,10 @@ impl VectorStoreBackend for RocksVectorStore {
     }
 
     fn delete(&self, ids: &[u64]) -> Result<u64, RekhaError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
         let cf_vec = self
             .db
             .cf_handle(CF_VECTORS)
@@ -177,22 +187,17 @@ impl VectorStoreBackend for RocksVectorStore {
                 source: "handle not found".into(),
             })?;
 
-        let mut deleted = 0u64;
+        let mut batch = rocksdb::WriteBatch::default();
         for id in ids {
             let key = Self::encode_key(*id);
-            self.db
-                .delete_cf(&cf_vec, &key)
-                .map_err(|e| StorageError::Write {
-                    source: e.to_string(),
-                })?;
-            self.db
-                .delete_cf(&cf_pay, &key)
-                .map_err(|e| StorageError::Write {
-                    source: e.to_string(),
-                })?;
-            deleted += 1;
+            batch.delete_cf(&cf_vec, &key);
+            batch.delete_cf(&cf_pay, &key);
         }
-        Ok(deleted)
+        self.db.write(batch).map_err(|e| StorageError::Write {
+            source: e.to_string(),
+        })?;
+
+        Ok(ids.len() as u64)
     }
 
     fn iter_ids(&self) -> Result<Vec<u64>, RekhaError> {
@@ -365,5 +370,57 @@ mod tests {
         assert!(store.get_vector(1).unwrap().is_some());
         assert!(store.get_vector(2).unwrap().is_none());
         assert!(store.get_vector(3).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_get_payload_nonexistent() {
+        let dir = std::env::temp_dir().join("rekha_test_payload_nonexist");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let result = store.get_payload(999).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_max_payload_size_default() {
+        let dir = std::env::temp_dir().join("rekha_test_default_max");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        // Default max payload is 1MB: 1MB payload should be fine
+        let large = vec![0u8; 1024 * 1024];
+        store.put_payload(1, &large).unwrap();
+        // Slightly over 1MB should fail
+        let too_large = vec![0u8; 1024 * 1024 + 1];
+        let result = store.put_payload(2, &too_large);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_store_with_custom_max() {
+        let dir = std::env::temp_dir().join("rekha_test_custom_max");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir)
+            .unwrap()
+            .with_max_payload_size(100);
+        let ok_sized = vec![0u8; 50];
+        store.put_payload(1, &ok_sized).unwrap();
+        let too_big = vec![0u8; 150];
+        let result = store.put_payload(2, &too_big);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_store_drop_flush() {
+        let dir = std::env::temp_dir().join("rekha_test_drop_flush");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Insert, drop, then re-open and verify data persists
+        {
+            let store = RocksVectorStore::open(&dir).unwrap();
+            store.put_vector(42, &[1.0, 2.0, 3.0]).unwrap();
+            // drop triggers WAL flush
+        }
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let v = store.get_vector(42).unwrap().unwrap();
+        assert!((v[0] - 1.0).abs() < 1e-6);
     }
 }

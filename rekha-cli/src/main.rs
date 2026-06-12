@@ -102,3 +102,81 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parse_server() {
+        // Can't actually parse 'server' since it's not a subcommand;
+        // test that the CLI parser works with an address flag
+        let cli = Cli::try_parse_from(["rekha", "info"]).unwrap();
+        assert_eq!(cli.address, "localhost:50051");
+    }
+
+    #[test]
+    fn test_cli_parse_insert() {
+        let cli = Cli::try_parse_from(["rekha", "insert", "42"]).unwrap();
+        match cli.command {
+            Commands::Insert { id, payload } => {
+                assert_eq!(id, 42);
+                assert!(payload.is_none());
+            }
+            _ => panic!("expected Insert command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_insert_with_payload() {
+        let cli =
+            Cli::try_parse_from(["rekha", "insert", "42", "--payload", "{\"k\":\"v\"}"]).unwrap();
+        match cli.command {
+            Commands::Insert { id, payload } => {
+                assert_eq!(id, 42);
+                assert_eq!(payload, Some("{\"k\":\"v\"}".into()));
+            }
+            _ => panic!("expected Insert command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_search() {
+        let cli = Cli::try_parse_from(["rekha", "search", "-k", "20"]).unwrap();
+        match cli.command {
+            Commands::Search { top_k } => {
+                assert_eq!(top_k, 20);
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_delete() {
+        let cli = Cli::try_parse_from(["rekha", "delete", "1", "2", "3"]).unwrap();
+        match cli.command {
+            Commands::Delete { ids } => {
+                assert_eq!(ids, vec![1, 2, 3]);
+            }
+            _ => panic!("expected Delete command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_info() {
+        let cli = Cli::try_parse_from(["rekha", "info"]).unwrap();
+        assert!(matches!(cli.command, Commands::Info));
+    }
+
+    #[test]
+    fn test_cli_parse_health() {
+        let cli = Cli::try_parse_from(["rekha", "health"]).unwrap();
+        assert!(matches!(cli.command, Commands::Health));
+    }
+
+    #[test]
+    fn test_cli_parse_custom_address() {
+        let cli = Cli::try_parse_from(["rekha", "--address", "10.0.0.1:50051", "info"]).unwrap();
+        assert_eq!(cli.address, "10.0.0.1:50051");
+    }
+}

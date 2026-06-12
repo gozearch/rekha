@@ -103,6 +103,11 @@ impl DistanceMetric {
             Self::InnerProduct => "inner_product",
         }
     }
+
+    /// Compute the distance between two vectors using this metric.
+    pub fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        crate::distance::distance(a, b, *self)
+    }
 }
 
 impl std::str::FromStr for DistanceMetric {
@@ -179,6 +184,9 @@ pub struct NodeInfo {
     pub commit_index: u64,
     pub storage_bytes: u64,
     pub status: NodeStatus,
+    /// Unix timestamp (seconds) of last heartbeat from this node. 0 = unknown.
+    #[serde(default)]
+    pub last_heartbeat: u64,
 }
 
 /// Node health status.
@@ -394,6 +402,7 @@ mod tests {
                 commit_index: 10,
                 storage_bytes: 1024,
                 status: NodeStatus::Healthy,
+                last_heartbeat: 0,
             },
         );
         let topo = ClusterTopology {
@@ -421,5 +430,75 @@ mod tests {
         let cv2: CompressedVector = serde_json::from_str(&json).unwrap();
         assert_eq!(cv.id, cv2.id);
         assert_eq!(cv.pq_code, cv2.pq_code);
+    }
+
+    #[test]
+    fn test_node_info_serde_roundtrip() {
+        let info = NodeInfo {
+            node_id: "n1".into(),
+            address: "10.0.0.1:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![0, 1],
+            is_leader: true,
+            raft_term: 1,
+            commit_index: 10,
+            storage_bytes: 1024,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 1000,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let info2: NodeInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info.node_id, info2.node_id);
+        assert_eq!(info.address, info2.address);
+        assert_eq!(info.status, info2.status);
+        assert_eq!(info.last_heartbeat, info2.last_heartbeat);
+    }
+
+    #[test]
+    fn test_cluster_topology_serde_roundtrip() {
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(
+            "n1".into(),
+            NodeInfo {
+                node_id: "n1".into(),
+                address: "10.0.0.1:50051".into(),
+                partition_id: 0,
+                dim_groups: vec![0],
+                is_leader: true,
+                raft_term: 1,
+                commit_index: 5,
+                storage_bytes: 256,
+                status: NodeStatus::Healthy,
+                last_heartbeat: 0,
+            },
+        );
+        let topo = ClusterTopology {
+            cluster_id: "test".into(),
+            nodes,
+            partition_map: std::collections::HashMap::new(),
+        };
+        let json = serde_json::to_string(&topo).unwrap();
+        let topo2: ClusterTopology = serde_json::from_str(&json).unwrap();
+        assert_eq!(topo.cluster_id, topo2.cluster_id);
+        assert_eq!(topo.nodes.len(), topo2.nodes.len());
+    }
+
+    #[test]
+    fn test_raft_index_serde_roundtrip() {
+        let ri = RaftIndex { term: 3, index: 42 };
+        let json = serde_json::to_string(&ri).unwrap();
+        let ri2: RaftIndex = serde_json::from_str(&json).unwrap();
+        assert_eq!(ri.term, ri2.term);
+        assert_eq!(ri.index, ri2.index);
+    }
+
+    #[test]
+    fn test_distance_metric_dispatch() {
+        let a = vec![1.0, 2.0];
+        let b = vec![3.0, 4.0];
+        let d = DistanceMetric::L2.distance(&a, &b);
+        assert!((d - 8.0).abs() < 1e-6);
+        let d = DistanceMetric::Cosine.distance(&a, &b);
+        assert!(d >= 0.0);
     }
 }

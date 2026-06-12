@@ -151,6 +151,7 @@ mod tests {
                 commit_index: 100,
                 storage_bytes: 1024,
                 status: NodeStatus::Healthy,
+                last_heartbeat: 0,
             },
         );
 
@@ -187,6 +188,7 @@ mod tests {
                     commit_index: 50,
                     storage_bytes: 512,
                     status: NodeStatus::Healthy,
+                    last_heartbeat: 0,
                 },
             );
         }
@@ -200,6 +202,155 @@ mod tests {
     fn test_manager_dims_per_group_calculation() {
         let manager = PartitionManager::new(HashMap::new(), 4, 1024);
         assert_eq!(manager.dims_per_group, 256);
+    }
+
+    #[test]
+    fn test_register_node() {
+        let mut manager = PartitionManager::new(HashMap::new(), 4, 768);
+        assert_eq!(manager.node_count(), 0);
+        let info = NodeInfo {
+            node_id: "new-node".into(),
+            address: "10.0.0.5:50051".into(),
+            partition_id: 1,
+            dim_groups: vec![0, 2],
+            is_leader: false,
+            raft_term: 0,
+            commit_index: 0,
+            storage_bytes: 0,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        manager.register_node(info);
+        assert_eq!(manager.node_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_node() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "node-1".into(),
+            NodeInfo {
+                node_id: "node-1".into(),
+                address: "10.0.0.1:50051".into(),
+                partition_id: 0,
+                dim_groups: vec![0],
+                is_leader: true,
+                raft_term: 1,
+                commit_index: 10,
+                storage_bytes: 100,
+                status: NodeStatus::Healthy,
+                last_heartbeat: 0,
+            },
+        );
+        let mut manager = PartitionManager::new(nodes, 4, 768);
+        assert_eq!(manager.node_count(), 1);
+        manager.remove_node("node-1");
+        assert_eq!(manager.node_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_nonexistent() {
+        let mut manager = PartitionManager::new(HashMap::new(), 4, 768);
+        manager.remove_node("nonexistent"); // should not panic
+        assert_eq!(manager.node_count(), 0);
+    }
+
+    #[test]
+    fn test_healthy_nodes_all_healthy() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "n1".into(),
+            NodeInfo {
+                node_id: "n1".into(),
+                address: "addr1".into(),
+                partition_id: 0,
+                dim_groups: vec![0],
+                is_leader: false,
+                raft_term: 0,
+                commit_index: 0,
+                storage_bytes: 0,
+                status: NodeStatus::Healthy,
+                last_heartbeat: 0,
+            },
+        );
+        let manager = PartitionManager::new(nodes, 4, 768);
+        let healthy = manager.healthy_nodes();
+        assert_eq!(healthy.len(), 1);
+    }
+
+    #[test]
+    fn test_healthy_nodes_mixed() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "n1".into(),
+            NodeInfo {
+                node_id: "n1".into(),
+                address: "addr1".into(),
+                partition_id: 0,
+                dim_groups: vec![0],
+                is_leader: false,
+                raft_term: 0,
+                commit_index: 0,
+                storage_bytes: 0,
+                status: NodeStatus::Healthy,
+                last_heartbeat: 0,
+            },
+        );
+        nodes.insert(
+            "n2".into(),
+            NodeInfo {
+                node_id: "n2".into(),
+                address: "addr2".into(),
+                partition_id: 1,
+                dim_groups: vec![1],
+                is_leader: false,
+                raft_term: 0,
+                commit_index: 0,
+                storage_bytes: 0,
+                status: NodeStatus::Unreachable,
+                last_heartbeat: 0,
+            },
+        );
+        let manager = PartitionManager::new(nodes, 4, 768);
+        let healthy = manager.healthy_nodes();
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].node_id, "n1");
+    }
+
+    #[test]
+    fn test_node_ranges() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "n1".into(),
+            NodeInfo {
+                node_id: "n1".into(),
+                address: "addr".into(),
+                partition_id: 0,
+                dim_groups: vec![0, 1],
+                is_leader: true,
+                raft_term: 1,
+                commit_index: 5,
+                storage_bytes: 100,
+                status: NodeStatus::Healthy,
+                last_heartbeat: 0,
+            },
+        );
+        let manager = PartitionManager::new(nodes, 4, 768);
+        let ranges = manager.node_ranges("n1").unwrap();
+        assert!(!ranges.is_empty());
+        assert_eq!(ranges[0].vector_shard, 0);
+    }
+
+    #[test]
+    fn test_dim_group_range() {
+        let manager = PartitionManager::new(HashMap::new(), 4, 768);
+        let (start, end) = manager.dim_group_range(0).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 192);
+        let (start, end) = manager.dim_group_range(3).unwrap();
+        assert_eq!(start, 576);
+        assert_eq!(end, 768);
+        assert!(manager.dim_group_range(4).is_none());
     }
 
     #[test]
@@ -218,6 +369,7 @@ mod tests {
                     commit_index: 0,
                     storage_bytes: 0,
                     status: NodeStatus::Healthy,
+                    last_heartbeat: 0,
                 },
             );
         }

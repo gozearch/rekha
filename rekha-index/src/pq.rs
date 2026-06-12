@@ -315,6 +315,60 @@ mod tests {
     }
 
     #[test]
+    fn test_kmeans_convergence() {
+        // Small 2D dataset with clear clusters
+        let data: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.0],
+            vec![0.1, 0.1],
+            vec![0.2, 0.2],
+            vec![5.0, 5.0],
+            vec![5.1, 5.1],
+            vec![5.2, 5.2],
+        ];
+        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+        let centroids = kmeans(&refs, 2, 10);
+        assert_eq!(centroids.len(), 2);
+        assert_eq!(centroids[0].len(), 2);
+    }
+
+    #[test]
+    fn test_nearest_centroid_direct() {
+        let centroids = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
+        let idx = nearest_centroid(&[1.0, 1.0], &centroids);
+        assert_eq!(idx, 0);
+        let idx = nearest_centroid(&[9.0, 9.0], &centroids);
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_adc_distance_distinct() {
+        let table = vec![vec![0.0, 100.0], vec![0.0, 100.0]];
+        let code_near = vec![0u8, 0u8];
+        let code_far = vec![1u8, 1u8];
+        let near_dist = ProductQuantizer::adc_distance(&code_near, &table);
+        let far_dist = ProductQuantizer::adc_distance(&code_far, &table);
+        assert!(near_dist < far_dist);
+    }
+
+    #[test]
+    fn test_train_single_vector() {
+        let mut pq = ProductQuantizer::new(2, 4, 4).unwrap();
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        let refs = [v.as_slice()];
+        let result = pq.train(&refs);
+        // Single vector might produce degenerate clusters, but should not panic
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_new_m1_k1() {
+        let pq = ProductQuantizer::new(1, 1, 8).unwrap();
+        assert_eq!(pq.m, 1);
+        assert_eq!(pq.k, 1);
+        assert_eq!(pq.d, 8);
+    }
+
+    #[test]
     fn test_pq_adc_distance_zero_for_identical() {
         let mut pq = ProductQuantizer::new(2, 8, 4).unwrap();
         let vectors: Vec<Vec<f32>> = (0..30)

@@ -1,20 +1,153 @@
 use async_trait::async_trait;
 use rekha_core::{
-    ClusterTopology, Coordinator as CoordinatorTrait, NodeInfo, NodeStatus, Payload, RekhaError,
-    ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
+    ClusterTopology, Coordinator as CoordinatorTrait, DistanceMetric, NodeInfo, NodeStatus,
+    Payload, RekhaError, ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
 };
 use rekha_index::RekhaIndex;
 use rekha_partition::PartitionManager;
-use rekha_raft::RaftNode;
+use rekha_raft::{RaftLogStore, RaftNode};
 use rekha_storage::RocksVectorStore;
 
 use dashmap::DashMap;
+use rekha_client::RekhaClient as PeerRekhaClient;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::config::ServerConfig;
+
+/// How long without a heartbeat before a peer is marked Unreachable.
+const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Tracked information about a peer node.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerState {
+    pub info: NodeInfo,
+    pub last_seen: Instant,
+}
+
+/// A gRPC client connection to a peer node.
+struct PeerClient {
+    #[allow(dead_code)]
+    info: NodeInfo,
+    client: PeerRekhaClient,
+    last_used: Instant,
+    error_count: u64,
+}
+
+impl PeerClient {
+    async fn connect(info: &NodeInfo) -> Result<Self, RekhaError> {
+        let seeds = vec![info.address.clone()];
+        let client = PeerRekhaClient::connect(&seeds).await?;
+        Ok(Self {
+            info: info.clone(),
+            client,
+            last_used: Instant::now(),
+            error_count: 0,
+        })
+    }
+
+    async fn try_search(
+        &mut self,
+        query: &[f32],
+        k: usize,
+        params: &SearchParams,
+    ) -> Result<(Vec<ScoredPoint>, SearchStats), RekhaError> {
+        self.last_used = Instant::now();
+        self.client
+            .search_with_params(query.to_vec(), k, params.clone())
+            .await
+    }
+}
+
+/// Pool of gRPC clients to known peer nodes.
+pub(crate) struct PeerPool {
+    clients: HashMap<String, PeerClient>,
+}
+
+impl PeerPool {
+    pub fn new() -> Self {
+        Self {
+            clients: HashMap::new(),
+        }
+    }
+
+    /// Reconcile the pool with the current peer list.
+    /// Connects to new peers, keeps existing connections, drops removed peers.
+    pub async fn refresh(&mut self, peers: &[NodeInfo]) {
+        // Drop peers no longer in the list.
+        let active: std::collections::HashSet<String> =
+            peers.iter().map(|p| p.node_id.clone()).collect();
+        self.clients.retain(|node_id, _| active.contains(node_id));
+
+        // Connect to new or reconnecting peers.
+        for info in peers {
+            if !self.clients.contains_key(&info.node_id) {
+                match PeerClient::connect(info).await {
+                    Ok(client) => {
+                        info!("Connected to peer {} at {}", info.node_id, info.address);
+                        self.clients.insert(info.node_id.clone(), client);
+                    }
+                    Err(e) => {
+                        info!("Failed to connect to peer {}: {}", info.node_id, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fan out a search query to all connected peers.
+    /// Returns merged (candidates, stats) from all peers that responded.
+    pub async fn search_fan_out(
+        &mut self,
+        query: &[f32],
+        k: usize,
+        params: &SearchParams,
+    ) -> (Vec<ScoredPoint>, SearchStats) {
+        let mut all_candidates: Vec<ScoredPoint> = Vec::new();
+        let mut stats = SearchStats::default();
+        let mut nodes_contacted = 0u32;
+
+        let node_ids: Vec<String> = self.clients.keys().cloned().collect();
+        for node_id in &node_ids {
+            if let Some(client) = self.clients.get_mut(node_id) {
+                match client.try_search(query, k, params).await {
+                    Ok((candidates, _peer_stats)) => {
+                        nodes_contacted += 1;
+                        all_candidates.extend(candidates);
+                        client.error_count = 0;
+                    }
+                    Err(_) => {
+                        if let Some(c) = self.clients.get_mut(node_id) {
+                            c.error_count += 1;
+                            // Remove client after 3 consecutive errors.
+                            if c.error_count >= 3 {
+                                info!("Dropping peer {} after 3 errors", node_id);
+                                self.clients.remove(node_id);
+                            }
+                        }
+                        stats.warnings.push(format!("peer {node_id} search failed"));
+                    }
+                }
+            }
+        }
+
+        all_candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+        all_candidates.truncate(k * 2);
+        stats.nodes_contacted = nodes_contacted;
+        (all_candidates, stats)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.clients.len()
+    }
+}
 
 /// The distributed query coordinator.
 ///
@@ -35,12 +168,15 @@ pub struct Coordinator {
     #[allow(dead_code)]
     partition_manager: Arc<RwLock<PartitionManager>>,
     /// Raft nodes for each partition hosted on this node.
-    #[allow(dead_code)]
-    raft_nodes: DashMap<u64, Arc<RaftNode>>,
+    pub raft_nodes: DashMap<u64, Arc<RaftNode>>,
     /// Cluster topology (peer nodes).
     topology: Arc<RwLock<ClusterTopology>>,
     /// Whether this coordinator is initialized.
     initialized: Arc<RwLock<bool>>,
+    /// Peer node tracking (node_id → state).
+    peers: Arc<RwLock<HashMap<String, PeerState>>>,
+    /// gRPC client pool for peer nodes.
+    peer_pool: Arc<RwLock<PeerPool>>,
 }
 
 impl Coordinator {
@@ -62,6 +198,8 @@ impl Coordinator {
                 partition_map: HashMap::new(),
             })),
             initialized: Arc::new(RwLock::new(false)),
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            peer_pool: Arc::new(RwLock::new(PeerPool::new())),
         }
     }
 
@@ -90,12 +228,133 @@ impl Coordinator {
             commit_index: 0,
             storage_bytes: 0,
             status: NodeStatus::Healthy,
+            last_heartbeat: 0,
         }
     }
 
     /// Get a reference to the local store.
     pub fn store(&self) -> &Arc<RocksVectorStore> {
         &self.store
+    }
+
+    pub fn cluster_id(&self) -> &str {
+        "rekha-dev"
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.config.cluster.node_id
+    }
+
+    pub fn bind_addr(&self) -> &str {
+        &self.config.cluster.bind_addr
+    }
+
+    pub fn seed_nodes(&self) -> &[String] {
+        &self.config.cluster.seed_nodes
+    }
+
+    /// Register or update a peer from a heartbeat or handshake.
+    pub async fn register_peer(&self, info: NodeInfo) {
+        let mut peers = self.peers.write().await;
+        let mut info = info;
+        info.last_heartbeat = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        peers.insert(
+            info.node_id.clone(),
+            PeerState {
+                info,
+                last_seen: Instant::now(),
+            },
+        );
+        drop(peers);
+        self.refresh_peer_pool().await;
+    }
+
+    /// Get the list of healthy peers (for pool refresh and handshake responses).
+    pub async fn healthy_peers(&self) -> Vec<NodeInfo> {
+        let peers = self.peers.read().await;
+        peers
+            .values()
+            .filter(|p| p.info.status == NodeStatus::Healthy)
+            .map(|p| p.info.clone())
+            .collect()
+    }
+
+    /// Refresh the peer connection pool from current healthy peer list.
+    async fn refresh_peer_pool(&self) {
+        let healthy = self.healthy_peers().await;
+        let mut pool = self.peer_pool.write().await;
+        let external: Vec<NodeInfo> = healthy
+            .into_iter()
+            .filter(|p| p.node_id != self.config.cluster.node_id)
+            .collect();
+        pool.refresh(&external).await;
+    }
+
+    /// Get the list of known peers for handshake responses.
+    /// Excludes the given node_id (the requester).
+    pub async fn peers_for_handshake(&self, exclude: &str) -> Vec<NodeInfo> {
+        let peers = self.peers.read().await;
+        peers
+            .values()
+            .filter(|p| p.info.node_id != exclude)
+            .map(|p| p.info.clone())
+            .collect()
+    }
+
+    /// Mark peers that haven't sent a heartbeat recently as Unreachable.
+    pub async fn check_peer_health(&self) {
+        let mut peers = self.peers.write().await;
+        let mut changed = false;
+        for peer in peers.values_mut() {
+            if peer.last_seen.elapsed() > PEER_TIMEOUT && peer.info.status == NodeStatus::Healthy {
+                peer.info.status = NodeStatus::Unreachable;
+                changed = true;
+            } else if peer.last_seen.elapsed() <= PEER_TIMEOUT
+                && peer.info.status == NodeStatus::Unreachable
+            {
+                peer.info.status = NodeStatus::Healthy;
+                changed = true;
+            }
+        }
+        if changed {
+            drop(peers);
+            self.sync_topology().await;
+        }
+    }
+
+    /// Rebuild the cluster topology from current peer state + local node.
+    async fn sync_topology(&self) {
+        let peers = self.peers.read().await;
+        let mut nodes = HashMap::new();
+        nodes.insert(self.config.cluster.node_id.clone(), self.local_node_info());
+        for peer in peers.values() {
+            nodes.insert(peer.info.node_id.clone(), peer.info.clone());
+        }
+        let mut topo = self.topology.write().await;
+        topo.nodes = nodes;
+    }
+
+    /// Return the config reference (for server heartbeat loop).
+    pub fn config_ref(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    /// Register a Raft node for a partition.
+    pub fn register_raft_node(&self, partition_id: u64, node: Arc<RaftNode>) {
+        self.raft_nodes.insert(partition_id, node);
+    }
+
+    /// Get a Raft node by partition ID.
+    pub fn raft_node(&self, partition_id: u64) -> Option<Arc<RaftNode>> {
+        self.raft_nodes.get(&partition_id).map(|n| n.clone())
+    }
+
+    /// Create a persistent log store backed by the local RocksDB.
+    pub fn raft_log_store(&self) -> RaftLogStore {
+        RaftLogStore::new(self.store.clone())
     }
 }
 
@@ -115,16 +374,13 @@ impl CoordinatorTrait for Coordinator {
             detail: "index not initialized".into(),
         })?;
 
-        let _dim_count = self.config.partition.num_dim_groups as usize;
         let num_groups = self.config.partition.num_dim_groups;
         let total_dim = query.len();
         let dims_per_group = total_dim / num_groups as usize;
 
-        // Multi-granularity search:
-        // 1. Run search on each dimension group with early-stop
-        // 2. Merge results from all groups
-        let mut all_candidates: Vec<ScoredPoint> = Vec::new();
-        let mut dim_groups_contacted = 0u32;
+        // Phase 1: Collect candidates from local index (dimension group fan-out).
+        let mut candidates: Vec<ScoredPoint> = Vec::new();
+        let mut local_groups = 0u32;
 
         for group in 0..num_groups {
             let start_dim = (group as usize) * dims_per_group;
@@ -132,20 +388,17 @@ impl CoordinatorTrait for Coordinator {
 
             match index.search_dim_range(&query, k * 2, start_dim, end_dim, &params) {
                 Ok((ids, dists)) => {
-                    dim_groups_contacted += 1;
+                    local_groups += 1;
                     for (i, id) in ids.iter().enumerate() {
                         let score = dists.get(i).copied().unwrap_or(f32::MAX);
 
-                        // Early-stop: if this candidate's partial distance
-                        // already exceeds our current k-th best, skip.
-                        if all_candidates.len() >= k {
-                            all_candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
-                            if score > all_candidates[k - 1].score {
+                        if candidates.len() >= k {
+                            candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+                            if score > candidates[k - 1].score {
                                 continue;
                             }
                         }
 
-                        // Fetch payload if requested.
                         let payload = if params.include_payloads {
                             self.store
                                 .get_payload(*id)
@@ -156,7 +409,7 @@ impl CoordinatorTrait for Coordinator {
                             None
                         };
 
-                        all_candidates.push(ScoredPoint {
+                        candidates.push(ScoredPoint {
                             id: *id,
                             score,
                             payload,
@@ -166,20 +419,48 @@ impl CoordinatorTrait for Coordinator {
                 Err(e) => {
                     stats
                         .warnings
-                        .push(format!("dim_group {group} search failed: {e}"));
+                        .push(format!("local dim_group {group} search failed: {e}"));
                 }
             }
         }
 
-        // 2. Sort all candidates by score and take top-k.
-        all_candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
-        all_candidates.truncate(k);
+        // Phase 2: Fan out to peer nodes if available.
+        let peer_count = {
+            let pool = self.peer_pool.read().await;
+            if !pool.is_empty() {
+                let mut pool = self.peer_pool.write().await;
+                let (peer_results, peer_stats) = pool.search_fan_out(&query, k, &params).await;
+                stats.nodes_contacted = local_groups + peer_stats.nodes_contacted;
+                stats.warnings.extend(peer_stats.warnings);
+                candidates.extend(peer_results);
+                pool.len()
+            } else {
+                stats.nodes_contacted = local_groups;
+                0
+            }
+        };
+
+        // Phase 3: Re-rank top candidates with full-precision vectors.
+        // Sort by partial score and take top (k * 2) for re-ranking.
+        candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+        candidates.truncate(k * 2);
+
+        // Re-rank with exact distances.
+        let metric = DistanceMetric::L2; // default; configurable later
+        for candidate in candidates.iter_mut().take(k * 2) {
+            let id = candidate.id;
+            if let Ok(Some(full_vec)) = self.store.get_vector(id) {
+                let exact_dist = metric.distance(&full_vec, &query);
+                candidate.score = exact_dist;
+            }
+        }
+        candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+        candidates.truncate(k);
 
         stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        stats.nodes_contacted = dim_groups_contacted;
-        stats.vectors_scanned = index.len() as u64;
+        stats.vectors_scanned = index.len() as u64 + peer_count as u64 * k as u64;
 
-        Ok((all_candidates, stats))
+        Ok((candidates, stats))
     }
 
     async fn insert(
@@ -188,13 +469,21 @@ impl CoordinatorTrait for Coordinator {
         vector: Vec<f32>,
         payload: Option<Payload>,
     ) -> Result<(), RekhaError> {
-        // Store locally.
-        self.store.put_vector(id, &vector)?;
+        // Route through Raft if a Raft node exists for partition 0.
+        if let Some(raft_node) = self.raft_node(0) {
+            let cmd = rekha_raft::state::RaftCommand::Insert {
+                id,
+                vector,
+                payload: payload.map(|p| p.data),
+            };
+            return raft_node.propose(cmd).await;
+        }
 
+        // Fallback: direct store write (single-node / uninitialized).
+        self.store.put_vector(id, &vector)?;
         if let Some(ref p) = payload {
             self.store.put_payload(id, &p.data)?;
         }
-
         Ok(())
     }
 
@@ -318,5 +607,244 @@ mod tests {
         let coord = test_coordinator();
         let info = coord.node_info("any-node").await.unwrap();
         assert_eq!(info.node_id, "test-node");
+    }
+
+    #[tokio::test]
+    async fn test_register_peer() {
+        let coord = test_coordinator();
+        let info = NodeInfo {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![0, 1],
+            is_leader: false,
+            raft_term: 1,
+            commit_index: 5,
+            storage_bytes: 256,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        coord.register_peer(info.clone()).await;
+        let peers = coord.peers_for_handshake("").await;
+        assert!(!peers.is_empty());
+        assert_eq!(peers[0].node_id, "peer-1");
+    }
+
+    #[tokio::test]
+    async fn test_register_peer_update() {
+        let coord = test_coordinator();
+        let info = NodeInfo {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![0, 1],
+            is_leader: false,
+            raft_term: 1,
+            commit_index: 5,
+            storage_bytes: 256,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        coord.register_peer(info).await;
+        let updated_info = NodeInfo {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![0, 1],
+            is_leader: true,
+            raft_term: 2,
+            commit_index: 10,
+            storage_bytes: 512,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        coord.register_peer(updated_info).await;
+        let peers = coord.peers_for_handshake("").await;
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0].is_leader);
+    }
+
+    #[tokio::test]
+    async fn test_peers_for_handshake_excludes_requester() {
+        let coord = test_coordinator();
+        let info = NodeInfo {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![0, 1],
+            is_leader: false,
+            raft_term: 1,
+            commit_index: 5,
+            storage_bytes: 256,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        coord.register_peer(info).await;
+        let peers = coord.peers_for_handshake("peer-1").await;
+        assert!(peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_peers_for_handshake_empty() {
+        let coord = test_coordinator();
+        let peers = coord.peers_for_handshake("any").await;
+        assert!(peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_healthy_peers() {
+        let coord = test_coordinator();
+        let info = NodeInfo {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![0, 1],
+            is_leader: false,
+            raft_term: 1,
+            commit_index: 5,
+            storage_bytes: 256,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        coord.register_peer(info).await;
+        let healthy = coord.healthy_peers().await;
+        assert_eq!(healthy.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_raft_node() {
+        let coord = test_coordinator();
+        let state = rekha_raft::ReplicatedState::new(0);
+        let node = std::sync::Arc::new(rekha_raft::RaftNode::new("n1".into(), 0, vec![], state));
+        coord.register_raft_node(0, node);
+        let found = coord.raft_node(0);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().node_id(), "n1");
+    }
+
+    #[tokio::test]
+    async fn test_raft_node_nonexistent() {
+        let coord = test_coordinator();
+        let node = coord.raft_node(999);
+        assert!(node.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_raft_log_store_creation() {
+        let coord = test_coordinator();
+        let log_store = coord.raft_log_store();
+        // RaftLogStore created from the coordinator's store should be usable
+        let entry = rekha_raft::node::RaftLogEntry {
+            term: 1,
+            index: 1,
+            command: rekha_raft::state::RaftCommand::NoOp,
+        };
+        log_store.store_entry(0, &entry).unwrap();
+        let entries = log_store.load_entries(0, 1).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_with_local_index() {
+        let coord = test_coordinator();
+        let store = temp_store();
+        let mut index = rekha_index::RekhaIndex::new(
+            8,
+            4,
+            16,
+            4,
+            (*store).clone(),
+            rekha_core::DistanceMetric::L2,
+        )
+        .unwrap();
+        for i in 0..20 {
+            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+            index.add_vector_for_test(i, v);
+        }
+        index.build().unwrap();
+        coord.initialize(index).await;
+
+        let (results, _stats) = coord
+            .search(vec![0.0; 8], 5, SearchParams::default())
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results.len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn test_search_with_payloads() {
+        let coord = test_coordinator();
+        let store = temp_store();
+        let payload_data = b"test-payload".to_vec();
+
+        // Insert vector and payload directly into store
+        store.put_vector(42, &[1.0; 8]).unwrap();
+        store.put_payload(42, &payload_data).unwrap();
+
+        // Initialize index
+        let mut index = rekha_index::RekhaIndex::new(
+            8,
+            4,
+            16,
+            4,
+            (*store).clone(),
+            rekha_core::DistanceMetric::L2,
+        )
+        .unwrap();
+        for i in 0..10 {
+            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+            index.add_vector_for_test(i, v);
+        }
+        index.build().unwrap();
+        coord.initialize(index).await;
+
+        let params = SearchParams {
+            include_payloads: true,
+            ..Default::default()
+        };
+        let (results, _stats) = coord.search(vec![0.0; 8], 5, params).await.unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_re_rank_exact() {
+        let coord = test_coordinator();
+        let store = temp_store();
+        let mut index = rekha_index::RekhaIndex::new(
+            8,
+            4,
+            16,
+            4,
+            (*store).clone(),
+            rekha_core::DistanceMetric::L2,
+        )
+        .unwrap();
+        // Add vectors where one is an exact match for the query
+        for i in 0..10 {
+            let v: Vec<f32> = (0..8).map(|d| (i as f32 * 10.0 + d as f32)).collect();
+            index.add_vector_for_test(i, v);
+        }
+        index.build().unwrap();
+        coord.initialize(index).await;
+
+        // Search for a vector identical to id=5
+        let query: Vec<f32> = (0..8).map(|d| 50.0 + d as f32).collect();
+        let (results, _stats) = coord
+            .search(query, 3, SearchParams::default())
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        // The exact match (id=5) should be the first result
+        assert_eq!(results[0].id, 5);
+        // Score should be 0.0 for exact match
+        assert!(results[0].score.abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn test_peer_pool_new_empty() {
+        let pool = PeerPool::new();
+        assert!(pool.is_empty());
+        assert_eq!(pool.len(), 0);
     }
 }

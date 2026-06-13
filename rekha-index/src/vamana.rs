@@ -514,6 +514,44 @@ mod tests {
     }
 
     #[test]
+    fn test_greedy_search_direct() {
+        let vectors = make_vectors(15, 4);
+        let refs = make_refs(&vectors);
+        let mut g = VamanaGraph::new(4);
+        g.build(&refs).unwrap();
+        // greedy_search is private; we test it indirectly via build + search
+        let (ids, _) = g.search(&[0.0; 4], &vectors, 3, 10).unwrap();
+        assert!(!ids.is_empty());
+        assert!(ids.len() <= 3);
+    }
+
+    #[test]
+    fn test_is_built_flag() {
+        let mut g = VamanaGraph::new(6);
+        assert!(!g.is_built());
+        let vectors = make_vectors(10, 4);
+        let refs = make_refs(&vectors);
+        g.build(&refs).unwrap();
+        assert!(g.is_built());
+    }
+
+    #[test]
+    fn test_len_with_vectors() {
+        let vectors = make_vectors(25, 4);
+        let refs = make_refs(&vectors);
+        let mut g = VamanaGraph::new(6);
+        assert_eq!(g.len(), 0);
+        g.build(&refs).unwrap();
+        assert_eq!(g.len(), 25);
+    }
+
+    #[test]
+    fn test_is_empty_on_new() {
+        let g = VamanaGraph::new(8);
+        assert!(g.is_empty());
+    }
+
+    #[test]
     fn test_vamana_robust_prune_dominated() {
         let vectors = vec![
             (0, vec![0.0, 0.0]),

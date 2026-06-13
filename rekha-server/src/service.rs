@@ -1,5 +1,6 @@
 use rekha_core::{
-    Coordinator as CoordinatorTrait, Payload, RekhaError, SearchParams, VectorStoreBackend,
+    Coordinator as CoordinatorTrait, NodeInfo, NodeStatus, Payload, RekhaError, SearchParams,
+    VectorStoreBackend,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -7,10 +8,10 @@ use tracing::info;
 
 use crate::coordinator::Coordinator;
 use crate::proto::{
-    self, rekha_server::Rekha, DeleteRequest, DeleteResponse, FetchRequest, FetchResponse,
-    HandshakeRequest, HandshakeResponse, HeartbeatRequest, HeartbeatResponse, InsertBatchResponse,
-    InsertRequest, InsertResponse, RaftAck, RaftEntry, RaftSnapshotChunk, RaftVoteRequest,
-    RaftVoteResponse, ScoredPoint, SearchRequest, SearchResponse, TransferRequest,
+    self, rekha_server::Rekha, AppendEntriesRequest, DeleteRequest, DeleteResponse, FetchRequest,
+    FetchResponse, HandshakeRequest, HandshakeResponse, HeartbeatRequest, HeartbeatResponse,
+    InsertBatchResponse, InsertRequest, InsertResponse, RaftAck, RaftSnapshotChunk,
+    RaftVoteRequest, RaftVoteResponse, ScoredPoint, SearchRequest, SearchResponse, TransferRequest,
     TransferResponse,
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -263,9 +264,41 @@ impl Rekha for RekhaService {
         let req = request.into_inner();
         info!("Handshake from node {} at {}", req.node_id, req.address);
 
+        // Register the requester as a peer.
+        let peer_info = NodeInfo {
+            node_id: req.node_id.clone(),
+            address: req.address.clone(),
+            partition_id: 0,
+            dim_groups: (0..self.coordinator.config_ref().partition.num_dim_groups).collect(),
+            is_leader: false,
+            raft_term: 0,
+            commit_index: 0,
+            storage_bytes: 0,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        self.coordinator.register_peer(peer_info).await;
+
+        // Return known peers list (minus the requester).
+        let peers = self.coordinator.peers_for_handshake(&req.node_id).await;
+        let proto_peers = peers
+            .into_iter()
+            .map(|n| crate::proto::NodeInfo {
+                node_id: n.node_id,
+                address: n.address,
+                partition_id: n.partition_id,
+                dim_groups: n.dim_groups,
+                is_leader: n.is_leader,
+                raft_term: n.raft_term,
+                commit_index: n.commit_index,
+                storage_bytes: n.storage_bytes,
+                status: format!("{:?}", n.status).to_lowercase(),
+            })
+            .collect();
+
         Ok(Response::new(HandshakeResponse {
-            cluster_id: "rekha-dev".into(),
-            peers: vec![],
+            cluster_id: self.coordinator.cluster_id().into(),
+            peers: proto_peers,
             error: String::new(),
         }))
     }
@@ -274,11 +307,32 @@ impl Rekha for RekhaService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let _req = request.into_inner();
+        let req = request.into_inner();
+        let local = self.coordinator.local_node_info();
+
+        // Register/update the sender.
+        let peer_info = NodeInfo {
+            node_id: req.node_id.clone(),
+            address: String::new(), // heartbeat doesn't carry address; use stored or skip
+            partition_id: 0,
+            dim_groups: Vec::new(),
+            is_leader: false,
+            raft_term: req.raft_term,
+            commit_index: req.commit_index,
+            storage_bytes: req.storage_bytes,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        self.coordinator.register_peer(peer_info).await;
+
         Ok(Response::new(HeartbeatResponse {
             success: true,
-            leader_hint: String::new(),
-            leader_term: 0,
+            leader_hint: if local.is_leader {
+                local.node_id
+            } else {
+                String::new()
+            },
+            leader_term: local.raft_term,
         }))
     }
 
@@ -296,24 +350,79 @@ impl Rekha for RekhaService {
     // ── Raft ──────────────────────────────────────────────────
     async fn raft_append_entries(
         &self,
-        _request: Request<tonic::Streaming<RaftEntry>>,
+        request: Request<AppendEntriesRequest>,
     ) -> Result<Response<RaftAck>, Status> {
-        Ok(Response::new(RaftAck {
-            success: true,
-            current_term: 0,
-            commit_index: 0,
-            error: String::new(),
-        }))
+        let req = request.into_inner();
+
+        // Find the Raft node for this partition.
+        let raft_node = self
+            .coordinator
+            .raft_node(req.partition_id)
+            .ok_or_else(|| Status::not_found("no raft node for partition"))?;
+
+        // Convert proto entries to RaftLogEntry.
+        let entries: Vec<_> = req
+            .entries
+            .into_iter()
+            .map(|e| rekha_raft::node::RaftLogEntry {
+                term: e.term,
+                index: e.index,
+                command: proto_raft_command_to_internal(e.command.unwrap_or_default()),
+            })
+            .collect();
+
+        match raft_node
+            .handle_append_entries(
+                req.leader_term,
+                &req.leader_id,
+                req.prev_log_index,
+                req.prev_log_term,
+                entries,
+                req.leader_commit,
+            )
+            .await
+        {
+            Ok((success, current_term)) => Ok(Response::new(RaftAck {
+                success,
+                current_term,
+                commit_index: raft_node.commit_index().await,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(RaftAck {
+                success: false,
+                current_term: raft_node.current_term().await,
+                commit_index: 0,
+                error: e.to_string(),
+            })),
+        }
     }
 
     async fn raft_request_vote(
         &self,
-        _request: Request<RaftVoteRequest>,
+        request: Request<RaftVoteRequest>,
     ) -> Result<Response<RaftVoteResponse>, Status> {
-        Ok(Response::new(RaftVoteResponse {
-            term: 0,
-            vote_granted: false,
-        }))
+        let req = request.into_inner();
+
+        // The vote request doesn't carry partition_id in the proto message.
+        // For now, use partition 0 (single-partition assumption).
+        // In a multi-partition setup, the partition_id would need to be in the message.
+        let raft_node = self
+            .coordinator
+            .raft_node(0)
+            .ok_or_else(|| Status::not_found("no raft node for partition 0"))?;
+
+        match raft_node
+            .handle_request_vote(
+                req.term,
+                &req.candidate_id,
+                req.last_log_index,
+                req.last_log_term,
+            )
+            .await
+        {
+            Ok((vote_granted, term)) => Ok(Response::new(RaftVoteResponse { term, vote_granted })),
+            Err(e) => Err(Self::map_error(e)),
+        }
     }
 
     async fn raft_install_snapshot(
@@ -326,6 +435,28 @@ impl Rekha for RekhaService {
             commit_index: 0,
             error: String::new(),
         }))
+    }
+}
+
+/// Convert a proto RaftCommand to the internal RaftCommand type.
+fn proto_raft_command_to_internal(
+    cmd: crate::proto::RaftCommand,
+) -> rekha_raft::state::RaftCommand {
+    use crate::proto::raft_command::Cmd;
+    match cmd.cmd {
+        Some(Cmd::Insert(insert)) => rekha_raft::state::RaftCommand::Insert {
+            id: insert.id,
+            vector: insert.vector,
+            payload: insert.payload.and_then(|p| {
+                if p.data.is_empty() {
+                    None
+                } else {
+                    Some(p.data)
+                }
+            }),
+        },
+        Some(Cmd::Delete(delete)) => rekha_raft::state::RaftCommand::Delete { ids: delete.ids },
+        Some(Cmd::Custom(_)) | None => rekha_raft::state::RaftCommand::NoOp,
     }
 }
 
@@ -418,5 +549,86 @@ mod tests {
         let err = RekhaError::Index(rekha_core::IndexError::EmptyIndex);
         let status = RekhaService::map_error(err);
         assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_proto_raft_command_insert() {
+        let insert = crate::proto::InsertRequest {
+            id: 42,
+            vector: vec![1.0, 2.0, 3.0],
+            payload: Some(crate::proto::Payload {
+                content_type: "raw".into(),
+                data: vec![0, 1, 2],
+            }),
+        };
+        let proto_cmd = crate::proto::RaftCommand {
+            cmd: Some(crate::proto::raft_command::Cmd::Insert(insert)),
+        };
+        let cmd = super::proto_raft_command_to_internal(proto_cmd);
+        match cmd {
+            rekha_raft::state::RaftCommand::Insert {
+                id,
+                vector,
+                payload,
+            } => {
+                assert_eq!(id, 42);
+                assert_eq!(vector, vec![1.0, 2.0, 3.0]);
+                assert_eq!(payload, Some(vec![0, 1, 2]));
+            }
+            _ => panic!("expected Insert variant"),
+        }
+    }
+
+    #[test]
+    fn test_proto_raft_command_delete() {
+        let delete = crate::proto::DeleteRequest { ids: vec![1, 2, 3] };
+        let proto_cmd = crate::proto::RaftCommand {
+            cmd: Some(crate::proto::raft_command::Cmd::Delete(delete)),
+        };
+        let cmd = super::proto_raft_command_to_internal(proto_cmd);
+        match cmd {
+            rekha_raft::state::RaftCommand::Delete { ids } => {
+                assert_eq!(ids, vec![1, 2, 3]);
+            }
+            _ => panic!("expected Delete variant"),
+        }
+    }
+
+    #[test]
+    fn test_proto_raft_command_custom() {
+        let proto_cmd = crate::proto::RaftCommand {
+            cmd: Some(crate::proto::raft_command::Cmd::Custom(vec![1, 2, 3])),
+        };
+        let cmd = super::proto_raft_command_to_internal(proto_cmd);
+        assert!(matches!(cmd, rekha_raft::state::RaftCommand::NoOp));
+    }
+
+    #[test]
+    fn test_proto_raft_command_default() {
+        let proto_cmd = crate::proto::RaftCommand { cmd: None };
+        let cmd = super::proto_raft_command_to_internal(proto_cmd);
+        assert!(matches!(cmd, rekha_raft::state::RaftCommand::NoOp));
+    }
+
+    #[test]
+    fn test_proto_raft_command_insert_empty_payload() {
+        let insert = crate::proto::InsertRequest {
+            id: 1,
+            vector: vec![0.5],
+            payload: Some(crate::proto::Payload {
+                content_type: "raw".into(),
+                data: vec![], // empty payload should become None
+            }),
+        };
+        let proto_cmd = crate::proto::RaftCommand {
+            cmd: Some(crate::proto::raft_command::Cmd::Insert(insert)),
+        };
+        let cmd = super::proto_raft_command_to_internal(proto_cmd);
+        match cmd {
+            rekha_raft::state::RaftCommand::Insert { payload, .. } => {
+                assert!(payload.is_none());
+            }
+            _ => panic!("expected Insert variant"),
+        }
     }
 }

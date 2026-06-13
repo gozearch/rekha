@@ -166,4 +166,57 @@ mod tests {
         let v3 = vec![0.3f32; 64];
         assert!(validate_dimensions(&[&v1, &v3], 128).is_err());
     }
+
+    #[test]
+    fn test_dot_product() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        // 1*4 + 2*5 + 3*6 = 4 + 10 + 18 = 32
+        assert!((dot_product(&a, &b) - 32.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_l2_norm() {
+        let a = vec![3.0, 4.0];
+        // sqrt(9 + 16) = sqrt(25) = 5
+        assert!((l2_norm(&a) - 5.0).abs() < 1e-6);
+        let zero = vec![0.0, 0.0];
+        assert!(l2_norm(&zero).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_inner_product_distance() {
+        let a = vec![1.0, 2.0];
+        let b = vec![3.0, 4.0];
+        // dot = 11, distance = -11
+        assert!((inner_product_distance(&a, &b) - (-11.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_distance_dispatch() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        // L2: (1-0)^2 + (0-1)^2 = 2
+        assert!((distance(&a, &b, DistanceMetric::L2) - 2.0).abs() < 1e-6);
+        // Cosine: orthogonal → 1
+        assert!((distance(&a, &b, DistanceMetric::Cosine) - 1.0).abs() < 1e-6);
+        // InnerProduct: -(1*0 + 0*1) = 0
+        assert!(distance(&a, &b, DistanceMetric::InnerProduct).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_distance_zero_norm() {
+        let zero = vec![0.0, 0.0];
+        let a = vec![1.0, 0.0];
+        // zero vector returns 1.0
+        assert!((cosine_distance(&zero, &a) - 1.0).abs() < 1e-6);
+        assert!((cosine_distance(&a, &zero) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_early_stop_approximate() {
+        // For cosine/IP, threshold is relaxed (1.1x)
+        assert!(can_early_stop(12.0, 10.0, DistanceMetric::Cosine));
+        assert!(!can_early_stop(10.5, 10.0, DistanceMetric::InnerProduct));
+    }
 }

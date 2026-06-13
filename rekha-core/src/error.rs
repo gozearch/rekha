@@ -391,4 +391,197 @@ mod tests {
         let err = RaftError::NotLeader { leader_hint: None };
         assert_eq!(err.to_string(), "not leader, leader unknown");
     }
+
+    #[test]
+    fn test_rekha_error_cluster_changed() {
+        let err = RekhaError::ClusterChanged {
+            detail: "new node joined".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "cluster membership changed: new node joined"
+        );
+    }
+
+    #[test]
+    fn test_rekha_error_consensus() {
+        let err = RekhaError::Consensus(RaftError::ElectionTimeout);
+        assert_eq!(err.to_string(), "consensus error: election timed out");
+    }
+
+    #[test]
+    fn test_rekha_error_wrapped_storage() {
+        let err = RekhaError::Storage(StorageError::Corruption {
+            detail: "bad block".into(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "storage error: corruption detected: bad block"
+        );
+    }
+
+    #[test]
+    fn test_rekha_error_wrapped_index() {
+        let err = RekhaError::Index(IndexError::NotTrained { component: "PQ" });
+        assert_eq!(err.to_string(), "index error: PQ has not been trained");
+    }
+
+    #[test]
+    fn test_rekha_error_wrapped_partition() {
+        let err = RekhaError::Partition(PartitionError::ShardNotFound { shard_id: 3 });
+        assert_eq!(err.to_string(), "partition error: shard 3 not found");
+    }
+
+    #[test]
+    fn test_storage_error_column_family() {
+        let err = StorageError::ColumnFamily {
+            name: "vectors".into(),
+            source: "handle not found".into(),
+        };
+        assert_eq!(err.to_string(), "column family vectors: handle not found");
+    }
+
+    #[test]
+    fn test_storage_error_read() {
+        let err = StorageError::Read {
+            key: vec![0, 0, 0, 0, 0, 0, 0, 42],
+            source: "IO error".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "read error at key [0, 0, 0, 0, 0, 0, 0, 42]: IO error"
+        );
+    }
+
+    #[test]
+    fn test_storage_error_write() {
+        let err = StorageError::Write {
+            source: "disk full".into(),
+        };
+        assert_eq!(err.to_string(), "write error: disk full");
+    }
+
+    #[test]
+    fn test_storage_error_batch_write() {
+        let err = StorageError::BatchWrite {
+            committed: 5,
+            failed: 2,
+            source: "timeout".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "batch write: committed 5, failed 2: timeout"
+        );
+    }
+
+    #[test]
+    fn test_storage_error_corruption() {
+        let err = StorageError::Corruption {
+            detail: "checksum mismatch".into(),
+        };
+        assert_eq!(err.to_string(), "corruption detected: checksum mismatch");
+    }
+
+    #[test]
+    fn test_storage_error_serialization() {
+        let err = StorageError::Serialization {
+            detail: "invalid encoding".into(),
+        };
+        assert_eq!(err.to_string(), "serialization error: invalid encoding");
+    }
+
+    #[test]
+    fn test_index_error_graph_build() {
+        let err = IndexError::GraphBuild {
+            detail: "out of memory".into(),
+        };
+        assert_eq!(err.to_string(), "graph build failed: out of memory");
+    }
+
+    #[test]
+    fn test_index_error_search() {
+        let err = IndexError::Search {
+            detail: "no results".into(),
+        };
+        assert_eq!(err.to_string(), "search failed: no results");
+    }
+
+    #[test]
+    fn test_index_error_not_trained() {
+        let err = IndexError::NotTrained {
+            component: "ProductQuantizer",
+        };
+        assert_eq!(err.to_string(), "ProductQuantizer has not been trained");
+    }
+
+    #[test]
+    fn test_index_error_incompatible_dim() {
+        let err = IndexError::IncompatibleDimension {
+            expected: 768,
+            actual: 64,
+        };
+        assert_eq!(err.to_string(), "expected dimension 768, got 64");
+    }
+
+    #[test]
+    fn test_partition_error_invalid_topology() {
+        let err = PartitionError::InvalidTopology {
+            detail: "overlapping ranges".into(),
+        };
+        assert_eq!(err.to_string(), "invalid topology: overlapping ranges");
+    }
+
+    #[test]
+    fn test_partition_error_rebalance() {
+        let err = PartitionError::RebalanceInProgress { partition_id: 7 };
+        assert_eq!(err.to_string(), "rebalance in progress for partition 7");
+    }
+
+    #[test]
+    fn test_partition_error_dim_group_mismatch() {
+        let err = PartitionError::DimensionGroupMismatch {
+            expected: 4,
+            actual: 2,
+        };
+        assert_eq!(
+            err.to_string(),
+            "dimension group mismatch: expected 4, got 2"
+        );
+    }
+
+    #[test]
+    fn test_partition_error_shard_not_found() {
+        let err = PartitionError::ShardNotFound { shard_id: 5 };
+        assert_eq!(err.to_string(), "shard 5 not found");
+    }
+
+    #[test]
+    fn test_raft_error_log_compaction() {
+        let err = RaftError::LogCompaction {
+            detail: "snapshot too large".into(),
+        };
+        assert_eq!(err.to_string(), "log compaction: snapshot too large");
+    }
+
+    #[test]
+    fn test_raft_error_snapshot_failed() {
+        let err = RaftError::SnapshotFailed {
+            detail: "disk full".into(),
+        };
+        assert_eq!(err.to_string(), "snapshot failed: disk full");
+    }
+
+    #[test]
+    fn test_raft_error_membership_change() {
+        let err = RaftError::MembershipChange {
+            detail: "node already exists".into(),
+        };
+        assert_eq!(err.to_string(), "membership change: node already exists");
+    }
+
+    #[test]
+    fn test_raft_error_commit_failed() {
+        let err = RaftError::CommitFailed { index: 42, term: 5 };
+        assert_eq!(err.to_string(), "commit failed at index 42 term 5");
+    }
 }

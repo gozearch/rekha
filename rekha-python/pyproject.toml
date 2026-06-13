@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rekha"
+version = "0.1.0"
+description = "Rekha - Distributed Vector Database Python SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "grpcio>=1.60",
+    "protobuf>=5.0",
+]
+
+[project.urls]
+homepage = "https://github.com/your-org/rekha"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"rekha.proto" = ["*.pyi"]

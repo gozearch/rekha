@@ -19,7 +19,7 @@ service Rekha {
     rpc TransferShard(TransferRequest) returns (TransferResponse);
 
     // ── Raft replication (internal) ──────────────────────────
-    rpc RaftAppendEntries(stream RaftEntry) returns (RaftAck);
+    rpc RaftAppendEntries(AppendEntriesRequest) returns (RaftAck);
     rpc RaftRequestVote(RaftVoteRequest) returns (RaftVoteResponse);
     rpc RaftInstallSnapshot(stream RaftSnapshotChunk) returns (RaftAck);
 }
@@ -183,6 +183,16 @@ message RaftAck {
     uint64 current_term = 2;
     uint64 commit_index = 3;
     string error = 4;
+}
+
+message AppendEntriesRequest {
+    uint64 partition_id = 1;
+    uint64 leader_term = 2;
+    string leader_id = 3;
+    uint64 prev_log_index = 4;
+    uint64 prev_log_term = 5;
+    repeated RaftEntry entries = 6;
+    uint64 leader_commit = 7;
 }
 
 message RaftVoteRequest {

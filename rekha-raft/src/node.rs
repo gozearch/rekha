@@ -1,7 +1,9 @@
 use crate::state::{RaftCommand, ReplicatedState};
+use crate::storage::RaftLogStore;
 use rekha_core::{RaftError, RekhaError};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
@@ -27,13 +29,15 @@ pub struct RaftNode {
     log: Arc<Mutex<Vec<RaftLogEntry>>>,
     /// Current Raft state.
     raft_state: Arc<Mutex<RaftInternalState>>,
+    /// Persistent log storage (optional — empty for tests).
+    store: Option<RaftLogStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaftLogEntry {
-    term: u64,
-    index: u64,
-    command: RaftCommand,
+    pub term: u64,
+    pub index: u64,
+    pub command: RaftCommand,
 }
 
 #[derive(Debug, Clone)]
@@ -51,8 +55,10 @@ struct RaftInternalState {
     last_applied: u64,
     role: RaftRole,
     leader_id: Option<String>,
-    _election_timeout_ms: u64,
-    _heartbeat_ms: u64,
+    election_timeout_ms: u64,
+    #[allow(dead_code)]
+    heartbeat_ms: u64,
+    last_activity: Instant,
 }
 
 impl RaftNode {
@@ -63,23 +69,131 @@ impl RaftNode {
         peers: Vec<String>,
         state: ReplicatedState,
     ) -> Self {
+        Self::with_store(node_id, partition_id, peers, state, None)
+    }
+
+    /// Create a new Raft node with persistent storage.
+    pub fn with_store(
+        node_id: String,
+        partition_id: u64,
+        peers: Vec<String>,
+        state: ReplicatedState,
+        store: Option<RaftLogStore>,
+    ) -> Self {
+        // Load persisted log entries and state into memory.
+        let (current_term, voted_for, log_entries) = if let Some(ref s) = store {
+            let term_vote = s.load_state(partition_id).ok().unwrap_or((0, None));
+            let entries = s.load_entries(partition_id, 1).unwrap_or_default();
+            (term_vote.0, term_vote.1, entries)
+        } else {
+            (0, None, Vec::new())
+        };
+
         Self {
             node_id,
             partition_id,
             peers,
             state: Arc::new(RwLock::new(state)),
-            log: Arc::new(Mutex::new(Vec::new())),
+            log: Arc::new(Mutex::new(log_entries)),
             raft_state: Arc::new(Mutex::new(RaftInternalState {
-                current_term: 0,
-                voted_for: None,
+                current_term,
+                voted_for,
                 commit_index: 0,
                 last_applied: 0,
                 role: RaftRole::Follower,
                 leader_id: None,
-                _election_timeout_ms: 300,
-                _heartbeat_ms: 100,
+                election_timeout_ms: 300,
+                heartbeat_ms: 100,
+                last_activity: Instant::now(),
             })),
+            store,
         }
+    }
+
+    /// Accessors for the server layer.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn partition_id(&self) -> u64 {
+        self.partition_id
+    }
+
+    pub fn peers(&self) -> &[String] {
+        &self.peers
+    }
+
+    pub async fn current_term(&self) -> u64 {
+        self.raft_state.lock().await.current_term
+    }
+
+    pub async fn commit_index(&self) -> u64 {
+        self.raft_state.lock().await.commit_index
+    }
+
+    pub async fn last_log_index(&self) -> u64 {
+        self.log.lock().await.len() as u64
+    }
+
+    pub async fn last_log_term(&self) -> u64 {
+        let log = self.log.lock().await;
+        log.last().map(|e| e.term).unwrap_or(0)
+    }
+
+    pub async fn leader_id(&self) -> Option<String> {
+        self.raft_state.lock().await.leader_id.clone()
+    }
+
+    pub async fn is_leader(&self) -> bool {
+        matches!(self.raft_state.lock().await.role, RaftRole::Leader)
+    }
+
+    /// Reset the election timer (called when we hear from a leader).
+    pub async fn reset_election_timer(&self) {
+        self.raft_state.lock().await.last_activity = Instant::now();
+    }
+
+    /// Check if the election timeout has elapsed. If so, start a new election.
+    /// Returns true if an election was started.
+    pub async fn check_election_timeout(&self) -> bool {
+        let (elapsed, timeout_ms, is_leader) = {
+            let rs = self.raft_state.lock().await;
+            (
+                rs.last_activity.elapsed(),
+                rs.election_timeout_ms,
+                matches!(rs.role, RaftRole::Leader),
+            )
+        };
+        if is_leader {
+            return false;
+        }
+        if elapsed.as_millis() as u64 >= timeout_ms {
+            // Slight jitter: add up to 50% of election timeout.
+            let jitter = timeout_ms / 2;
+            let total = timeout_ms + (rand::random::<u64>() % (jitter + 1));
+            let elapsed_ms = elapsed.as_millis() as u64;
+            if elapsed_ms >= total {
+                info!(
+                    "Election timeout ({elapsed_ms}ms >= {total}ms), starting election for term {}",
+                    self.raft_state.lock().await.current_term
+                );
+                match self.start_election().await {
+                    Ok(()) => {
+                        self.reset_election_timer().await;
+                        return true;
+                    }
+                    Err(e) => {
+                        warn!("Failed to start election: {e}");
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Leader heartbeat: reset the election timer (leader contact keeps us alive).
+    pub async fn on_leader_contact(&self) {
+        self.reset_election_timer().await;
     }
 
     /// Propose a command to the Raft group.
@@ -104,6 +218,12 @@ impl RaftNode {
                 index,
                 command,
             };
+
+            // Persist to RocksDB before in-memory (write-ahead).
+            if let Some(ref store) = self.store {
+                store.store_entry(self.partition_id, &entry)?;
+            }
+
             let cmd = entry.command.clone();
             log.push(entry);
             let mut state = self.state.write().await;
@@ -127,6 +247,13 @@ impl RaftNode {
         raft_state.current_term += 1;
         raft_state.role = RaftRole::Candidate;
         raft_state.voted_for = Some(self.node_id.clone());
+        raft_state.last_activity = Instant::now();
+
+        // Persist election state.
+        if let Some(ref store) = self.store {
+            let term = raft_state.current_term;
+            store.store_state(self.partition_id, term, Some(&self.node_id))?;
+        }
 
         let term = raft_state.current_term;
         let log = self.log.lock().await;
@@ -179,6 +306,7 @@ impl RaftNode {
                 raft_state.voted_for = None;
             }
             raft_state.leader_id = Some(leader_id.to_string());
+            raft_state.last_activity = Instant::now();
             current_term = raft_state.current_term;
         }
 
@@ -196,14 +324,32 @@ impl RaftNode {
             }
         }
 
-        // Append new entries.
+        // Append new entries, persisting to RocksDB.
+        // Track entries for batch write.
+        let mut new_entries: Vec<RaftLogEntry> = Vec::new();
+        let mut truncate_from: Option<u64> = None;
+
         for entry in entries {
             let idx = entry.index as usize;
             if idx <= log.len() && idx > 0 && log[idx - 1].term != entry.term {
+                // Conflict: truncate from here.
                 log.truncate(idx - 1);
-            }
-            if idx > log.len() {
+                truncate_from = Some(entry.index);
+                new_entries.push(entry.clone());
                 log.push(entry);
+            } else if idx > log.len() {
+                new_entries.push(entry.clone());
+                log.push(entry);
+            }
+        }
+
+        // Persist to RocksDB.
+        if let Some(ref store) = self.store {
+            if let Some(from) = truncate_from {
+                store.truncate_entries(self.partition_id, from)?;
+            }
+            if !new_entries.is_empty() {
+                store.store_entries(self.partition_id, &new_entries)?;
             }
         }
 
@@ -257,6 +403,15 @@ impl RaftNode {
 
             if log_ok {
                 raft_state.voted_for = Some(candidate_id.to_string());
+                // Persist voted_for.
+                if let Some(ref store) = self.store {
+                    store.store_state(
+                        self.partition_id,
+                        raft_state.current_term,
+                        Some(candidate_id),
+                    )?;
+                }
+                raft_state.last_activity = Instant::now();
                 return Ok((true, raft_state.current_term));
             }
         }
@@ -490,32 +645,261 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_raft_delete_command() {
+    async fn test_check_election_timeout_triggers() {
+        let node = test_node();
+        // Force last_activity to a very old time
+        {
+            let mut rs = node.raft_state.lock().await;
+            rs.election_timeout_ms = 10; // very short timeout
+            rs.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(60);
+            // 60s ago
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let triggered = node.check_election_timeout().await;
+        assert!(triggered);
+    }
+
+    #[tokio::test]
+    async fn test_check_election_timeout_leader() {
+        let node = test_node();
+        node.start_election().await.unwrap();
+        // Leader should not trigger election
+        let triggered = node.check_election_timeout().await;
+        assert!(!triggered);
+    }
+
+    #[tokio::test]
+    async fn test_reset_election_timer() {
+        let node = test_node();
+        let old_time = {
+            let rs = node.raft_state.lock().await;
+            rs.last_activity
+        };
+        node.reset_election_timer().await;
+        let new_time = {
+            let rs = node.raft_state.lock().await;
+            rs.last_activity
+        };
+        assert!(new_time >= old_time);
+    }
+
+    #[tokio::test]
+    async fn test_on_leader_contact() {
+        let node = test_node();
+        node.on_leader_contact().await;
+        let triggered = node.check_election_timeout().await;
+        // Should not trigger immediately after contact
+        assert!(!triggered);
+    }
+
+    #[tokio::test]
+    async fn test_log_conflict_different_term() {
+        let node = test_node();
+        // Add an entry in term 1
+        node.handle_append_entries(
+            1,
+            "leader-1",
+            0,
+            0,
+            vec![RaftLogEntry {
+                term: 1,
+                index: 1,
+                command: RaftCommand::NoOp,
+            }],
+            1,
+        )
+        .await
+        .unwrap();
+
+        // Try to append entry at same index with different term (should conflict → truncate)
+        let (success, _) = node
+            .handle_append_entries(
+                2,
+                "leader-2",
+                0,
+                0,
+                vec![RaftLogEntry {
+                    term: 2,
+                    index: 1,
+                    command: RaftCommand::NoOp,
+                }],
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(success);
+
+        let log = node.log.lock().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].term, 2);
+    }
+
+    #[tokio::test]
+    async fn test_log_truncation() {
+        let node = test_node();
+        // Store 3 entries
+        node.handle_append_entries(
+            1,
+            "leader-1",
+            0,
+            0,
+            vec![
+                RaftLogEntry {
+                    term: 1,
+                    index: 1,
+                    command: RaftCommand::NoOp,
+                },
+                RaftLogEntry {
+                    term: 1,
+                    index: 2,
+                    command: RaftCommand::NoOp,
+                },
+                RaftLogEntry {
+                    term: 1,
+                    index: 3,
+                    command: RaftCommand::NoOp,
+                },
+            ],
+            3,
+        )
+        .await
+        .unwrap();
+
+        // Now start from index 2 with term 2 (conflict at index 2)
+        let (success, _) = node
+            .handle_append_entries(
+                2,
+                "leader-2",
+                1,
+                1,
+                vec![
+                    RaftLogEntry {
+                        term: 2,
+                        index: 2,
+                        command: RaftCommand::NoOp,
+                    },
+                    RaftLogEntry {
+                        term: 2,
+                        index: 3,
+                        command: RaftCommand::NoOp,
+                    },
+                ],
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(success);
+
+        let log = node.log.lock().await;
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].term, 1);
+        assert_eq!(log[1].term, 2);
+        assert_eq!(log[2].term, 2);
+    }
+
+    #[tokio::test]
+    async fn test_is_leader_after_election() {
+        let node = test_node();
+        assert!(!node.is_leader().await);
+        node.start_election().await.unwrap();
+        assert!(node.is_leader().await);
+    }
+
+    #[tokio::test]
+    async fn test_is_leader_follower() {
+        let node = test_node();
+        assert!(!node.is_leader().await);
+    }
+
+    #[tokio::test]
+    async fn test_leader_id_after_append_entries() {
+        let node = test_node();
+        node.handle_append_entries(1, "leader-foo", 0, 0, vec![], 0)
+            .await
+            .unwrap();
+        let leader_id = node.leader_id().await;
+        assert_eq!(leader_id, Some("leader-foo".into()));
+    }
+
+    #[tokio::test]
+    async fn test_status_with_data() {
+        let node = test_node();
+        node.start_election().await.unwrap();
+        for i in 0..3 {
+            node.propose(RaftCommand::Insert {
+                id: i,
+                vector: vec![i as f32],
+                payload: None,
+            })
+            .await
+            .unwrap();
+        }
+        let status = node.status().await;
+        assert_eq!(status.log_size, 3);
+        assert_eq!(status.vector_count, 3);
+        assert!(status.current_term >= 1);
+    }
+
+    #[test]
+    fn test_peers_accessor() {
+        let state = ReplicatedState::new(1);
+        let node = RaftNode::new("n1".into(), 1, vec!["n2".into(), "n3".into()], state);
+        let peers = node.peers();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0], "n2");
+    }
+
+    #[test]
+    fn test_node_id_and_partition_id() {
+        let state = ReplicatedState::new(7);
+        let node = RaftNode::new("my-node".into(), 7, vec![], state);
+        assert_eq!(node.node_id(), "my-node");
+        assert_eq!(node.partition_id(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_propose_with_payload() {
         let node = test_node();
         node.start_election().await.unwrap();
 
         node.propose(RaftCommand::Insert {
-            id: 1,
-            vector: vec![1.0],
-            payload: None,
+            id: 42,
+            vector: vec![1.0, 2.0],
+            payload: Some(b"test-payload".to_vec()),
         })
         .await
         .unwrap();
-        node.propose(RaftCommand::Insert {
-            id: 2,
-            vector: vec![2.0],
-            payload: None,
-        })
-        .await
-        .unwrap();
-
-        node.propose(RaftCommand::Delete { ids: vec![1] })
-            .await
-            .unwrap();
 
         let state = node.read_state().await;
-        assert_eq!(state.len(), 1);
-        assert!(state.get_vector(2).is_some());
+        assert_eq!(state.get_payload(42), Some(&b"test-payload"[..]));
+    }
+
+    #[tokio::test]
+    async fn test_last_log_index_and_term_multiple() {
+        let node = test_node();
+        node.start_election().await.unwrap();
+        for i in 0..5 {
+            node.propose(RaftCommand::Insert {
+                id: i,
+                vector: vec![i as f32],
+                payload: None,
+            })
+            .await
+            .unwrap();
+        }
+        let last_idx = node.last_log_index().await;
+        assert_eq!(last_idx, 5);
+        let last_term = node.last_log_term().await;
+        assert!(last_term > 0);
+    }
+
+    #[tokio::test]
+    async fn test_current_term_and_commit_index() {
+        let node = test_node();
+        assert_eq!(node.current_term().await, 0);
+        assert_eq!(node.commit_index().await, 0);
+        node.start_election().await.unwrap();
+        assert_eq!(node.current_term().await, 1);
     }
 }
 

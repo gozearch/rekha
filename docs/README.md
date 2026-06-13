@@ -31,7 +31,7 @@ git clone <repo> && cd rekha
 cargo build --release
 ```
 
-> `rekha-py` (Python SDK via PyO3) is excluded from the workspace. To build it: `cd rekha-py && cargo build`.
+> For the Python SDK, see `rekha-python/`. Pure gRPC client — no PyO3 required.
 
 ### Run a Single-Node Server
 
@@ -237,93 +237,28 @@ For live backup, use RocksDB's `Checkpoint` API (see `RocksVectorStore::create_c
 
 ## 3. Configuration Reference
 
-All config is YAML. The schema is defined by `ServerConfig` in `rekha-server/src/config.rs`.
+> **Full reference**: See [`config.md`](config.md) for the complete configuration
+> documentation, including every field, its default, type constraints, sizing
+> guidance, Raft tuning for geo-distributed deployments, memory formulas, TLS
+> examples, and config loading.
 
-### `cluster`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `node_id` | string | – | Unique node identifier (e.g., `"node-1"`) |
-| `seed_nodes` | string[] | – | Initial seed nodes for cluster discovery |
-| `bind_addr` | string | – | gRPC listen address (e.g., `"0.0.0.0:50051"`) |
-| `data_dir` | string | – | Data directory (RocksDB + configuration files) |
-
-### `tls`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | bool | `false` | Enable TLS (rustls — pure Rust, no OpenSSL) |
-| `cert_path` | string | `null` | Path to server TLS certificate (PEM) — required when `enabled: true` |
-| `key_path` | string | `null` | Path to server TLS private key (PEM) — required when `enabled: true` |
-| `ca_cert_path` | string | `null` | Optional CA cert for mTLS client verification |
-
-### `partition`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `num_vector_shards` | u64 | `1` | Number of Raft replication groups (horizontal shards) |
-| `replication_factor` | usize | `1` | Replicas per shard (1 = no replication) |
-| `num_dim_groups` | u32 | `4` | Dimension-based vertical partitions per shard |
-| `dim_group_size` | usize | `64` | Dimensions per group (`dim_group_size * num_dim_groups` = vector dimension) |
-
-### `index`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `type` | string | `"vamana"` | Index type (currently only `vamana`) |
-| `graph_degree` | usize | `64` | Vamana graph out-degree (R) — higher = more accurate, more memory |
-| `search_list_size` | usize | `128` | Beam width during search (ef_search) — higher = more accurate, slower |
-| `pq_num_sub_vectors` | usize | `64` | PQ: number of sub-vectors (M) — determines compression ratio |
-| `pq_num_centroids` | usize | `256` | PQ: centroids per sub-vector (K) — 256 = 1 byte per sub-vector |
-| `re_rank_k` | usize | `256` | Candidates to re-rank with full-precision vectors after PQ search |
-
-### `raft`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `heartbeat_interval_ms` | u64 | `100` | Leader heartbeat interval (ms) |
-| `election_timeout_min_ms` | u64 | `300` | Minimum election timeout (ms) — randomized per node |
-| `election_timeout_max_ms` | u64 | `500` | Maximum election timeout (ms) |
-| `snapshot_interval` | u64 | `10000` | Raft log compaction interval (entries between snapshots) |
-
-### `storage`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `max_payload_size` | usize | `1048576` | Maximum payload size in bytes (1 MB) |
-| `max_inline_size` | usize | `1048576` | Maximum inline value size in bytes |
-
-### `observability`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `metrics` | string | `"prometheus"` | Metrics backend (`"prometheus"` or `"none"`) |
-| `tracing` | string | `"none"` | Distributed tracing backend (`"jaeger"` or `"none"`) |
-| `logging` | string | `"structured"` | Log format (`"structured"` or `"plain"`) |
-
-### Full Example
+A minimal single-node config:
 
 ```yaml
 cluster:
   node_id: "node-1"
-  seed_nodes:
-    - "node-1:50051"
-    - "node-2:50051"
-    - "node-3:50051"
+  seed_nodes: ["127.0.0.1:50051"]
   bind_addr: "0.0.0.0:50051"
-  data_dir: "/data/rekha"
+  data_dir: "/tmp/rekha-data"
 
 tls:
-  enabled: true
-  cert_path: "/etc/rekha/certs/server.crt"
-  key_path: "/etc/rekha/certs/server.key"
-  ca_cert_path: "/etc/rekha/certs/ca.crt"
+  enabled: false
 
 partition:
-  num_vector_shards: 16
-  replication_factor: 3
+  num_vector_shards: 1
+  replication_factor: 1
   num_dim_groups: 4
-  dim_group_size: 192
+  dim_group_size: 64
 
 index:
   type: "vamana"
@@ -345,7 +280,7 @@ storage:
 
 observability:
   metrics: "prometheus"
-  tracing: "jaeger"
+  tracing: "none"
   logging: "structured"
 ```
 
@@ -520,22 +455,31 @@ let points = client.fetch(&[42], true).await?;
 
 ### Python SDK
 
+Package in `rekha-python/`. Pure gRPC client (no PyO3).
+
 ```python
-import rekha
+from rekha import RekhaClient
 
-# Connect (TLS if use_tls=True)
-client = rekha.connect("localhost:50051")
+# Connect
+with RekhaClient.connect(["localhost:50051"]) as client:
+    # Insert
+    client.insert(42, [0.1, 0.2, 0.3], payload=b'{"k":"v"}')
 
-# Insert
-client.insert(42, [0.1, 0.2, 0.3], payload={"title": "hello"})
+    # Search
+    results = client.search([0.1, 0.2, 0.3], top_k=10)
+    for r in results:
+        print(f"id={r.id}, score={r.score}")
 
-# Search
-results = client.search([0.1, 0.2, 0.3], top_k=10)
-for r in results:
-    print(r.id, r.score, r.payload)
+    # Streaming search
+    for r in client.search_stream([0.1, 0.2, 0.3], 10):
+        print(f"streamed: id={r.id}")
 
-# Delete
-client.delete([42, 43])
+    # Delete
+    count = client.delete([42, 43])
+
+    # Cluster info
+    topology = client.cluster_info()
+    print(f"Cluster: {topology.cluster_id}")
 ```
 
 ---
@@ -554,14 +498,14 @@ client.delete([42, 43])
 | `rekha-server` | gRPC server, coordinator, service handlers | All above + tonic |
 | `rekha-client` | Rust SDK | `rekha-core` + tonic |
 | `rekha-cli` | Admin CLI | `rekha-client` + clap |
-| `rekha-py` | Python SDK (PyO3, standalone) | `rekha-core` |
+| `rekha-python` | Python SDK (pure gRPC, no PyO3) | (Python: grpcio, protobuf) |
 | `rekha-bench` | Benchmarks | `rekha-core` |
 
 ### Justfile Commands
 
 | Command | What it does |
 |---|---|
-| `just test` | Run all unit tests (workspace, excluding `rekha-py` and `rekha-bench`) |
+| `just test` | Run all unit tests (workspace, excluding `rekha-bench`) |
 | `just lint` | Format check (`cargo fmt`) + clippy (deny warnings) |
 | `just fix` | Auto-format with `cargo fmt --all` |
 | `just build` | Build workspace (debug) |

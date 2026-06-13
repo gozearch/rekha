@@ -9,8 +9,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/user/rekha/actions/workflows/ci.yml">
-    <img src="https://github.com/user/rekha/actions/workflows/ci.yml/badge.svg" alt="CI Status">
+  <a href="https://github.com/gozearch/rekha/actions/workflows/ci.yml">
+    <img src="https://github.com/gozearch/rekha/actions/workflows/ci.yml/badge.svg" alt="CI Status">
+  </a>
+  <a href="https://codecov.io/gh/gozearch/rekha">
+    <img src="https://codecov.io/gh/gozearch/rekha/branch/master/graph/badge.svg" alt="Code Coverage">
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">

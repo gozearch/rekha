@@ -172,6 +172,25 @@ mod tests {
     }
 
     #[test]
+    fn test_all_partitions_single_shard() {
+        let strategy = MultiGranularityStrategy::new(1, 4, 768).unwrap();
+        let partitions = strategy.all_partitions();
+        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions[0], (0, 0));
+        assert_eq!(partitions[3], (0, 3));
+    }
+
+    #[test]
+    fn test_all_partitions_multi() {
+        let strategy = MultiGranularityStrategy::new(3, 2, 512).unwrap();
+        let partitions = strategy.all_partitions();
+        assert_eq!(partitions.len(), 6);
+        assert_eq!(partitions[0], (0, 0));
+        assert_eq!(partitions[2], (1, 0));
+        assert_eq!(partitions[5], (2, 1));
+    }
+
+    #[test]
     fn test_strategy_single_shard_single_group() {
         let strategy = MultiGranularityStrategy::new(1, 1, 128).unwrap();
         assert_eq!(strategy.dims_per_group, 128);

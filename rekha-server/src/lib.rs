@@ -1,5 +1,6 @@
 pub mod config;
 pub mod coordinator;
+pub mod raft_network;
 pub mod server;
 pub mod service;
 

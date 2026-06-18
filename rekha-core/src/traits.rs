@@ -47,14 +47,8 @@ pub trait VectorIndex: Send + Sync {
 /// Partition management trait.
 /// Defines how vectors are distributed across nodes.
 pub trait PartitionStrategy: Send + Sync {
-    /// Assign a vector ID to a partition key.
-    fn assign(&self, id: u64, num_dimensions: usize) -> crate::PartitionKey;
-
-    /// Get the dimension range for a given dimension group.
-    fn dim_group_range(&self, group: u32) -> Option<(usize, usize)>;
-
-    /// Number of dimension groups configured.
-    fn num_dim_groups(&self) -> u32;
+    /// Assign a vector ID to a partition.
+    fn assign(&self, id: u64) -> crate::PartitionKey;
 
     /// Number of vector shards configured.
     fn num_vector_shards(&self) -> u64;

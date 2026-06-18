@@ -122,23 +122,17 @@ impl std::str::FromStr for DistanceMetric {
     }
 }
 
-/// A partition key describes how a vector is assigned to a partition.
+/// A partition key describes how a vector is assigned to a shard.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PartitionKey {
-    /// Partition by vector ID (horizontal sharding).
+    /// Partition by vector ID (horizontal sharding across nodes).
     VectorId(u64),
-    /// Partition by dimension range (vertical partitioning).
-    DimensionRange(u32, u32),
-    /// Combined multi-granularity partition.
-    Hybrid { vector_shard: u64, dim_group: u32 },
 }
 
 impl PartitionKey {
     pub fn vector_shard(&self, num_shards: u64) -> u64 {
         match self {
             Self::VectorId(id) => id % num_shards,
-            Self::DimensionRange(_, _) => 0,
-            Self::Hybrid { vector_shard, .. } => *vector_shard % num_shards,
         }
     }
 }
@@ -339,12 +333,9 @@ mod tests {
     fn test_partition_key_vector_shard() {
         let pk = PartitionKey::VectorId(42);
         assert_eq!(pk.vector_shard(4), 2);
-        let pk = PartitionKey::DimensionRange(0, 128);
+        let pk = PartitionKey::VectorId(0);
         assert_eq!(pk.vector_shard(4), 0);
-        let pk = PartitionKey::Hybrid {
-            vector_shard: 10,
-            dim_group: 1,
-        };
+        let pk = PartitionKey::VectorId(10);
         assert_eq!(pk.vector_shard(4), 2);
     }
 

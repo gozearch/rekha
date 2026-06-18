@@ -1,107 +1,33 @@
 use rekha_core::{PartitionError, PartitionKey, PartitionStrategy, RekhaError};
 
-/// The multi-granularity partition strategy, combining:
+/// Vector-ID based sharding strategy.
 ///
-/// 1. **Vector-based partitioning** (horizontal sharding):
-///    Vectors are split by ID range into `num_vector_shards` shards.
-///    Each node owns a subset of full vectors.
-///
-/// 2. **Dimension-based partitioning** (vertical partitioning):
-///    Within each vector shard, vectors are split across dimension groups.
-///    Each dimension group handles a contiguous range of dimensions.
-///
-/// This 2D grid (vector_shard × dim_group) enables:
-/// - Balanced distribution of compute: each node handles a manageable subset of vectors AND dims
-/// - Early-stop pruning: partial distance computations can stop when exceeding the threshold
-/// - Efficient parallel search: queries fan out to relevant (shard, dim_group) pairs
-pub struct MultiGranularityStrategy {
-    /// Number of vector shards (horizontal partitions).
+/// Vectors are distributed across shards by `id % num_vector_shards`.
+/// Each shard is a self-contained index with full vector dimensions.
+/// Shards are replicated across nodes via Raft groups.
+pub struct ShardStrategy {
     num_vector_shards: u64,
-    /// Number of dimension groups (vertical partitions).
-    /// Must divide total vector dimension evenly.
-    num_dim_groups: u32,
-    /// Total vector dimension.
-    /// Dimensions per group (total_dim / num_dim_groups).
-    dims_per_group: usize,
 }
 
-impl MultiGranularityStrategy {
-    /// Create a new multi-granularity partition strategy.
-    ///
-    /// # Arguments
-    /// * `num_vector_shards` - Number of vector-based partitions (shards)
-    /// * `num_dim_groups` - Number of dimension-based groups
-    /// * `total_dim` - Total vector dimensionality
-    pub fn new(
-        num_vector_shards: u64,
-        num_dim_groups: u32,
-        total_dim: usize,
-    ) -> Result<Self, RekhaError> {
+impl ShardStrategy {
+    pub fn new(num_vector_shards: u64) -> Result<Self, RekhaError> {
         if num_vector_shards == 0 {
             return Err(PartitionError::InvalidTopology {
                 detail: "num_vector_shards must be > 0".into(),
             }
             .into());
         }
-        if num_dim_groups == 0 {
-            return Err(PartitionError::InvalidTopology {
-                detail: "num_dim_groups must be > 0".into(),
-            }
-            .into());
-        }
-        if !total_dim.is_multiple_of(num_dim_groups as usize) {
-            return Err(PartitionError::InvalidTopology {
-                detail: format!(
-                    "total_dim {total_dim} not divisible by num_dim_groups {num_dim_groups}"
-                ),
-            }
-            .into());
-        }
-
-        Ok(Self {
-            num_vector_shards,
-            num_dim_groups,
-            dims_per_group: total_dim / num_dim_groups as usize,
-        })
+        Ok(Self { num_vector_shards })
     }
 
-    /// Return the dimension range for a given dimension group.
-    pub fn dim_group_range(&self, group: u32) -> Option<(usize, usize)> {
-        if group >= self.num_dim_groups {
-            return None;
-        }
-        let start = (group as usize) * self.dims_per_group;
-        let end = start + self.dims_per_group;
-        Some((start, end))
-    }
-
-    /// Enumerate all (vector_shard, dim_group) pairs in the grid.
-    pub fn all_partitions(&self) -> Vec<(u64, u32)> {
-        let mut partitions =
-            Vec::with_capacity((self.num_vector_shards * self.num_dim_groups as u64) as usize);
-        for s in 0..self.num_vector_shards {
-            for g in 0..self.num_dim_groups {
-                partitions.push((s, g));
-            }
-        }
-        partitions
+    pub fn num_vector_shards(&self) -> u64 {
+        self.num_vector_shards
     }
 }
 
-impl PartitionStrategy for MultiGranularityStrategy {
-    fn assign(&self, id: u64, _num_dimensions: usize) -> PartitionKey {
-        PartitionKey::Hybrid {
-            vector_shard: id % self.num_vector_shards,
-            dim_group: 0, // All dim groups are queried for a full search
-        }
-    }
-
-    fn dim_group_range(&self, group: u32) -> Option<(usize, usize)> {
-        self.dim_group_range(group)
-    }
-
-    fn num_dim_groups(&self) -> u32 {
-        self.num_dim_groups
+impl PartitionStrategy for ShardStrategy {
+    fn assign(&self, id: u64) -> PartitionKey {
+        PartitionKey::VectorId(id % self.num_vector_shards)
     }
 
     fn num_vector_shards(&self) -> u64 {
@@ -114,90 +40,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_partition_strategy() {
-        let strategy = MultiGranularityStrategy::new(4, 4, 768).unwrap();
-        assert_eq!(strategy.dims_per_group, 192);
-
-        let range = strategy.dim_group_range(0).unwrap();
-        assert_eq!(range, (0, 192));
-
-        let range = strategy.dim_group_range(3).unwrap();
-        assert_eq!(range, (576, 768));
-
-        let key = strategy.assign(42, 768);
-        assert_eq!(key.vector_shard(4), 2); // 42 % 4 = 2
+    fn test_shard_strategy_assign() {
+        let strategy = ShardStrategy::new(4).unwrap();
+        let key = strategy.assign(42);
+        assert_eq!(key.vector_shard(4), 2);
     }
 
     #[test]
     fn test_strategy_zero_shards() {
-        let result = MultiGranularityStrategy::new(0, 4, 768);
+        let result = ShardStrategy::new(0);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_strategy_zero_dim_groups() {
-        let result = MultiGranularityStrategy::new(4, 0, 768);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_strategy_dim_not_divisible() {
-        let result = MultiGranularityStrategy::new(4, 7, 768);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_strategy_out_of_range_group() {
-        let strategy = MultiGranularityStrategy::new(4, 4, 768).unwrap();
-        assert!(strategy.dim_group_range(4).is_none());
     }
 
     #[test]
     fn test_strategy_assign_different_ids() {
-        let strategy = MultiGranularityStrategy::new(4, 4, 768).unwrap();
-        let key_a = strategy.assign(0, 768);
-        let key_b = strategy.assign(4, 768);
-        assert_eq!(key_a.vector_shard(4), 0);
-        assert_eq!(key_b.vector_shard(4), 0);
-
-        let key_c = strategy.assign(1, 768);
-        assert_eq!(key_c.vector_shard(4), 1);
+        let strategy = ShardStrategy::new(4).unwrap();
+        assert_eq!(strategy.assign(0).vector_shard(4), 0);
+        assert_eq!(strategy.assign(4).vector_shard(4), 0);
+        assert_eq!(strategy.assign(1).vector_shard(4), 1);
+        assert_eq!(strategy.assign(7).vector_shard(2), 1);
     }
 
     #[test]
-    fn test_strategy_assign_non_standard_dims() {
-        let strategy = MultiGranularityStrategy::new(2, 2, 512).unwrap();
-        let key = strategy.assign(7, 512);
-        assert_eq!(key.vector_shard(2), 1);
+    fn test_strategy_num_shards() {
+        let strategy = ShardStrategy::new(6).unwrap();
+        assert_eq!(strategy.num_vector_shards(), 6);
     }
 
     #[test]
-    fn test_all_partitions_single_shard() {
-        let strategy = MultiGranularityStrategy::new(1, 4, 768).unwrap();
-        let partitions = strategy.all_partitions();
-        assert_eq!(partitions.len(), 4);
-        assert_eq!(partitions[0], (0, 0));
-        assert_eq!(partitions[3], (0, 3));
-    }
-
-    #[test]
-    fn test_all_partitions_multi() {
-        let strategy = MultiGranularityStrategy::new(3, 2, 512).unwrap();
-        let partitions = strategy.all_partitions();
-        assert_eq!(partitions.len(), 6);
-        assert_eq!(partitions[0], (0, 0));
-        assert_eq!(partitions[2], (1, 0));
-        assert_eq!(partitions[5], (2, 1));
-    }
-
-    #[test]
-    fn test_strategy_single_shard_single_group() {
-        let strategy = MultiGranularityStrategy::new(1, 1, 128).unwrap();
-        assert_eq!(strategy.dims_per_group, 128);
-        assert_eq!(strategy.num_dim_groups(), 1);
-        assert_eq!(strategy.num_vector_shards(), 1);
-
-        let range = strategy.dim_group_range(0).unwrap();
-        assert_eq!(range, (0, 128));
+    fn test_single_shard() {
+        let strategy = ShardStrategy::new(1).unwrap();
+        assert_eq!(strategy.assign(42).vector_shard(1), 0);
+        assert_eq!(strategy.assign(0).vector_shard(1), 0);
     }
 }

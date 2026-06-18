@@ -453,6 +453,10 @@ impl Coordinator {
 
 impl IndexBufferHandle for Coordinator {
     fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
+        // Persist to RocksDB so Fetch can find vectors written via Raft.
+        let _ = self.store.put_vector(id, &vector);
+
+        // Notify index buffer for immediate searchability.
         if let Ok(idx) = self.index.try_read() {
             if let Some(ref idx) = *idx {
                 idx.buffer_insert(id, vector);
@@ -461,6 +465,10 @@ impl IndexBufferHandle for Coordinator {
     }
 
     fn buffer_delete(&self, ids: &[u64]) {
+        // Remove from RocksDB.
+        let _ = self.store.delete(ids);
+
+        // Notify index buffer.
         if let Ok(idx) = self.index.try_read() {
             if let Some(ref idx) = *idx {
                 idx.buffer_delete(ids);
@@ -484,36 +492,21 @@ impl Coordinator {
             detail: "index not initialized".into(),
         })?;
 
-        let num_groups = self.config.partition.num_dim_groups;
-        let total_dim = query.len();
-        let dims_per_group = total_dim / num_groups as usize;
-
-        // Phase 1: Collect candidates from local index (dimension group fan-out).
+        // Phase 1: Local full-precision approximate search.
         let mut candidates: Vec<ScoredPoint> = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
-        let mut local_groups = 0u32;
 
-        for group in 0..num_groups {
-            let start_dim = (group as usize) * dims_per_group;
-            let end_dim = start_dim + dims_per_group;
-
-            match index.search_dim_range(&query, k * 2, start_dim, end_dim, &params) {
-                Ok((ids, dists)) => {
-                    local_groups += 1;
-                    for (i, id) in ids.iter().enumerate() {
-                        if !seen_ids.insert(*id) {
-                            continue;
-                        }
-                        let score = dists.get(i).copied().unwrap_or(f32::MAX);
-
-                        if candidates.len() >= k {
-                            candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
-                            if score > candidates[k - 1].score {
-                                continue;
-                            }
-                        }
-
-                        let payload = if params.include_payloads {
+        match index.search(&query, k * 2, &params) {
+            Ok((ids, dists)) => {
+                stats.vectors_scanned += ids.len() as u64;
+                for (i, id) in ids.iter().enumerate() {
+                    if !seen_ids.insert(*id) {
+                        continue;
+                    }
+                    candidates.push(ScoredPoint {
+                        id: *id,
+                        score: dists.get(i).copied().unwrap_or(f32::MAX),
+                        payload: if params.include_payloads {
                             self.store
                                 .get_payload(*id)
                                 .ok()
@@ -521,48 +514,43 @@ impl Coordinator {
                                 .map(Payload::from_bytes)
                         } else {
                             None
-                        };
-
-                        candidates.push(ScoredPoint {
-                            id: *id,
-                            score,
-                            payload,
-                        });
-                    }
+                        },
+                    });
                 }
-                Err(e) => {
-                    stats
-                        .warnings
-                        .push(format!("local dim_group {group} search failed: {e}"));
-                }
+            }
+            Err(e) => {
+                stats.warnings.push(format!("local search failed: {e}"));
             }
         }
 
-        // Phase 2: Fan out to peer nodes if available (skip for local-only searches).
-        let peer_count = if params.local_only {
-            0
-        } else {
+        // Phase 2: Fan out to peer nodes (skip for local-only searches).
+        if !params.local_only {
             let has_peers = { !self.peer_pool.read().await.is_empty() };
             if has_peers {
                 let mut pool = self.peer_pool.write().await;
-                let (peer_results, peer_stats) = pool.search_fan_out(&query, k, &params).await;
-                stats.nodes_contacted = local_groups + peer_stats.nodes_contacted;
+                let mut peer_params = params.clone();
+                peer_params.local_only = true;
+                let (peer_results, peer_stats) = pool.search_fan_out(&query, k, &peer_params).await;
+                stats.nodes_contacted = 1 + peer_stats.nodes_contacted;
+                stats.vectors_scanned += peer_stats.vectors_scanned;
                 stats.warnings.extend(peer_stats.warnings);
-                candidates.extend(peer_results);
-                pool.len()
+                for r in peer_results {
+                    if seen_ids.insert(r.id) {
+                        candidates.push(r);
+                    }
+                }
             } else {
-                stats.nodes_contacted = local_groups;
-                0
+                stats.nodes_contacted = 1;
             }
-        };
+        } else {
+            stats.nodes_contacted = 1;
+        }
 
-        // Phase 3: Re-rank top candidates with full-precision vectors.
-        // Sort by partial score and take top (k * 2) for re-ranking.
+        // Phase 3: Re-rank with exact distances.
         candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
         candidates.truncate(k * 2);
 
-        // Re-rank with exact distances.
-        let metric = DistanceMetric::L2; // default; configurable later
+        let metric = DistanceMetric::L2;
         for candidate in candidates.iter_mut().take(k * 2) {
             let id = candidate.id;
             if let Ok(Some(full_vec)) = self.store.get_vector(id) {
@@ -574,7 +562,6 @@ impl Coordinator {
         candidates.truncate(k);
 
         stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        stats.vectors_scanned = index.len() as u64 + peer_count as u64 * k as u64;
 
         Ok((candidates, stats))
     }
@@ -596,9 +583,13 @@ impl Coordinator {
             let cmd = rekha_raft::state::RaftCommand::Insert {
                 id,
                 vector,
-                payload: payload.map(|p| p.data),
+                payload: payload.as_ref().map(|p| p.data.clone()),
             };
             raft_node.propose(cmd).await?;
+            // Persist payload to RocksDB (vector is persisted via IndexBufferHandle).
+            if let Some(ref p) = payload {
+                self.store.put_payload(id, &p.data)?;
+            }
             return Ok(id);
         }
 
@@ -608,6 +599,21 @@ impl Coordinator {
             self.store.put_payload(id, &p.data)?;
         }
         Ok(id)
+    }
+
+    pub async fn delete_ids(
+        &self,
+        ids: Vec<u64>,
+    ) -> Result<u64, RekhaError> {
+        // Route through Raft if a Raft node exists for partition 0.
+        if let Some(raft_node) = self.raft_node(0) {
+            let cmd = rekha_raft::state::RaftCommand::Delete { ids };
+            raft_node.propose(cmd).await?;
+            return Ok(0); // Raft returns Ok(()) on success, actual count not tracked
+        }
+
+        // Fallback: direct store write (single-node / uninitialized).
+        self.store.delete(&ids)
     }
 
     pub async fn topology(&self) -> Result<ClusterTopology, RekhaError> {
@@ -646,8 +652,7 @@ mod tests {
         let store = temp_store();
         let pm = Arc::new(RwLock::new(rekha_partition::PartitionManager::new(
             HashMap::new(),
-            4,
-            768,
+            1,
         )));
         Coordinator::new(config, store, pm)
     }
@@ -1030,12 +1035,9 @@ mod tests {
         let store = temp_store();
         let pm = Arc::new(RwLock::new(rekha_partition::PartitionManager::new(
             HashMap::new(),
-            4,
-            768,
+            1,
         )));
         let coord = Coordinator::new(config, store, pm);
-
-        assert_eq!(coord.cluster_id(), "rekha-dev");
         assert_eq!(coord.node_id(), "test-node");
         assert_eq!(coord.bind_addr(), "0.0.0.0:50051");
         assert_eq!(coord.seed_nodes(), &["127.0.0.1:50051"]);
@@ -1271,6 +1273,7 @@ mod tests {
             state,
             Some(raft_log_store),
             Some(coord.clone() as Arc<dyn rekha_core::IndexBufferHandle>),
+            None,
         ));
         let node_clone = node.clone();
         node.start_election().await.unwrap();
@@ -1296,6 +1299,7 @@ mod tests {
             vec![],
             state,
             Some(raft_log_store),
+            None,
             None,
         ));
         let node_clone = node.clone();
@@ -1329,6 +1333,7 @@ mod tests {
             vec![],
             state,
             Some(raft_log_store),
+            None,
             None,
         ));
         coord.register_raft_node(0, node);

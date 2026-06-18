@@ -1,3 +1,4 @@
+use crate::network::RaftPeerNetwork;
 use crate::state::{RaftCommand, ReplicatedState};
 use crate::storage::RaftLogStore;
 use rekha_core::{IndexBufferHandle, RaftError, RekhaError};
@@ -33,6 +34,8 @@ pub struct RaftNode {
     store: Option<RaftLogStore>,
     /// Handle to notify the index about committed inserts (optional).
     index_handle: Option<Arc<dyn IndexBufferHandle>>,
+    /// Network interface for sending Raft RPCs to peers.
+    network: Option<Arc<dyn RaftPeerNetwork>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,17 +74,18 @@ impl RaftNode {
         peers: Vec<String>,
         state: ReplicatedState,
     ) -> Self {
-        Self::with_store(node_id, partition_id, peers, state, None, None)
+        Self::with_store(node_id, partition_id, peers, state, None, None, None)
     }
 
-    /// Create a new Raft node with persistent storage.
+    /// Create a new Raft node with persistent storage and network.
     pub fn with_store(
         node_id: String,
         partition_id: u64,
         peers: Vec<String>,
-        state: ReplicatedState,
+        mut state: ReplicatedState,
         store: Option<RaftLogStore>,
         index_handle: Option<Arc<dyn IndexBufferHandle>>,
+        network: Option<Arc<dyn RaftPeerNetwork>>,
     ) -> Self {
         // Load persisted log entries and state into memory.
         let (current_term, voted_for, log_entries) = if let Some(ref s) = store {
@@ -92,6 +96,13 @@ impl RaftNode {
             (0, None, Vec::new())
         };
 
+        // Replay log entries into state machine (crash recovery).
+        let last_index = log_entries.last().map(|e| e.index).unwrap_or(0);
+        for entry in &log_entries {
+            entry.command.apply(&mut state);
+        }
+        state.last_applied = last_index;
+
         Self {
             node_id,
             partition_id,
@@ -101,8 +112,8 @@ impl RaftNode {
             raft_state: Arc::new(Mutex::new(RaftInternalState {
                 current_term,
                 voted_for,
-                commit_index: 0,
-                last_applied: 0,
+                commit_index: last_index,
+                last_applied: last_index,
                 role: RaftRole::Follower,
                 leader_id: None,
                 election_timeout_ms: 300,
@@ -111,6 +122,7 @@ impl RaftNode {
             })),
             store,
             index_handle,
+            network,
         }
     }
 
@@ -217,8 +229,8 @@ impl RaftNode {
     }
 
     /// Propose a command to the Raft group.
-    /// If this node is the leader, it will replicate the command.
-    /// If not, returns an error with the leader hint.
+    /// The leader persists the entry, replicates it to followers,
+    /// and applies it only after achieving majority acknowledgment.
     pub async fn propose(&self, command: RaftCommand) -> Result<(), RekhaError> {
         let (is_leader, term, leader_hint) = {
             let raft_state = self.raft_state.lock().await;
@@ -230,7 +242,12 @@ impl RaftNode {
             }
         };
 
-        if is_leader {
+        if !is_leader {
+            return Err(RaftError::NotLeader { leader_hint }.into());
+        }
+
+        // 1. Write entry to local log (with WAL persistence).
+        let (entry, prev_log_index, prev_log_term) = {
             let mut log = self.log.lock().await;
             let index = log.len() as u64 + 1;
             let entry = RaftLogEntry {
@@ -239,28 +256,97 @@ impl RaftNode {
                 command,
             };
 
-            // Persist to RocksDB before in-memory (write-ahead).
             if let Some(ref store) = self.store {
                 store.store_entry(self.partition_id, &entry)?;
             }
 
-            let cmd = entry.command.clone();
-            log.push(entry);
-            let mut state = self.state.write().await;
-            cmd.apply(&mut state);
-            drop(state);
-            drop(log);
+            let prev_log_index = index.saturating_sub(1);
+            let prev_log_term = if prev_log_index > 0 {
+                log[prev_log_index as usize - 1].term
+            } else {
+                0
+            };
 
-            // Notify the index about the committed command.
-            self.notify_index(&cmd);
+            log.push(entry.clone());
+            (entry, prev_log_index, prev_log_term)
+        };
+        // log lock released
 
-            let mut rs = self.raft_state.lock().await;
-            rs.commit_index = index;
-            rs.last_applied = index;
-            Ok(())
+        // 2. Replicate to followers.
+        let n_peers = self.peers.len();
+        let majority = (n_peers as u64 + 1) / 2 + 1;
+        let mut acks = 1u64; // self-vote
+
+        if n_peers > 0 {
+            if let Some(ref network) = self.network {
+                let peer_ids: Vec<String> = self.peers.clone();
+                let partition_id = self.partition_id;
+                let leader_commit = entry.index;
+
+                let mut handles = Vec::with_capacity(n_peers);
+                for peer_id in peer_ids {
+                    let n = network.clone();
+                    let pid = peer_id.clone();
+                    let lid = self.node_id.clone();
+                    let ents = vec![entry.clone()];
+                    handles.push(tokio::spawn(async move {
+                        n.append_entries(
+                            &pid,
+                            partition_id,
+                            term,
+                            &lid,
+                            prev_log_index,
+                            prev_log_term,
+                            ents,
+                            leader_commit,
+                        )
+                        .await
+                    }));
+                }
+
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok((true, _))) => acks += 1,
+                        Ok(Ok((false, peer_term))) => {
+                            warn!(
+                                "Follower rejected AppendEntries (peer term {peer_term} > {term})"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!("AppendEntries to peer failed: {e}");
+                        }
+                        Err(e) => {
+                            warn!("AppendEntries task panicked: {e}");
+                        }
+                    }
+                }
+            } else {
+                warn!("No network interface — cannot replicate, treating as single-node");
+                acks = majority; // single-node: no network needed
+            }
         } else {
-            Err(RaftError::NotLeader { leader_hint }.into())
+            acks = majority; // no peers = single node = automatic majority
         }
+
+        // 3. Check quorum — only apply if majority acknowledged.
+        if acks < majority {
+            return Err(RaftError::ReplicationFailed {
+                detail: format!("got {acks}/{majority} acks (need majority)"),
+            }
+            .into());
+        }
+
+        // 4. Apply to state machine.
+        {
+            let mut state = self.state.write().await;
+            entry.command.apply(&mut state);
+            self.notify_index(&entry.command);
+        }
+
+        let mut rs = self.raft_state.lock().await;
+        rs.commit_index = entry.index;
+        rs.last_applied = entry.index;
+        Ok(())
     }
 
     /// Initiate leader election.
@@ -508,6 +594,11 @@ impl RaftNode {
     /// Set the index buffer handle after construction.
     pub fn set_index_handle(&mut self, handle: Arc<dyn IndexBufferHandle>) {
         self.index_handle = Some(handle);
+    }
+
+    /// Set the network interface after construction.
+    pub fn set_network(&mut self, network: Arc<dyn RaftPeerNetwork>) {
+        self.network = Some(network);
     }
 }
 

@@ -56,8 +56,7 @@ impl ServerInstance {
         // Create partition manager.
         let partition_manager = Arc::new(RwLock::new(PartitionManager::new(
             HashMap::new(),
-            config.partition.num_dim_groups,
-            config.partition.dim_group_size * config.partition.num_dim_groups as usize,
+            config.partition.num_vector_shards,
         )));
 
         // Create coordinator.
@@ -92,6 +91,7 @@ impl ServerInstance {
                 state,
                 Some(raft_log_store.clone()),
                 Some(coordinator.clone() as Arc<dyn rekha_core::IndexBufferHandle>),
+                None,
             ));
             coordinator.register_raft_node(shard, raft_node);
         }

@@ -228,6 +228,7 @@ pub enum RaftError {
     SnapshotFailed { detail: String },
     MembershipChange { detail: String },
     CommitFailed { index: u64, term: u64 },
+    ReplicationFailed { detail: String },
 }
 
 impl fmt::Display for RaftError {
@@ -243,6 +244,9 @@ impl fmt::Display for RaftError {
             Self::MembershipChange { detail } => write!(f, "membership change: {detail}"),
             Self::CommitFailed { index, term } => {
                 write!(f, "commit failed at index {index} term {term}")
+            }
+            Self::ReplicationFailed { detail } => {
+                write!(f, "replication failed: {detail}")
             }
         }
     }
@@ -354,6 +358,11 @@ mod tests {
 
         let err = RaftError::ElectionTimeout;
         assert_eq!(err.to_string(), "election timed out");
+
+        let err = RaftError::ReplicationFailed {
+            detail: "only got 1/3 acks".into(),
+        };
+        assert_eq!(err.to_string(), "replication failed: only got 1/3 acks");
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub struct VamanaGraph {
     ids: Vec<u64>,
     /// ID -> position mapping.
     id_to_pos: fnv::FnvHashMap<u64, usize>,
+    /// Medoid vector ID — the optimal entry point for graph search.
+    medoid_id: Option<u64>,
     /// Whether the graph has been indexed/constructed.
     built: bool,
 }
@@ -36,6 +38,7 @@ impl VamanaGraph {
             edges: Vec::new(),
             ids: Vec::new(),
             id_to_pos: FnvHashMap::default(),
+            medoid_id: None,
             built: false,
         }
     }
@@ -59,6 +62,7 @@ impl VamanaGraph {
         // Phase 1: Build a RNG (Randomized Neighborhood Graph) via medoid insertion.
         // Find medoid (point closest to all others).
         let medoid_idx = self.find_medoid(vectors);
+        self.medoid_id = Some(vectors[medoid_idx].0);
 
         for i in 0..n {
             if i == medoid_idx {
@@ -126,34 +130,38 @@ impl VamanaGraph {
     }
 
     /// Search for the top-k nearest neighbors.
-    /// `L` is the search list size (beam width), larger = more accurate but slower.
+    /// `l` is the search list size (beam width), larger = more accurate but slower.
     /// `k` is the number of results to return.
     pub fn search(
         &self,
         query: &[f32],
         vectors: &[(u64, Vec<f32>)],
         k: usize,
-        _l: usize,
+        l: usize,
     ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
         if !self.built || self.ids.is_empty() {
             return Err(IndexError::EmptyIndex.into());
         }
 
-        let start_pos = 0;
+        let medoid_id = self.medoid_id.unwrap_or(self.ids[0]);
+        let start_pos = self.id_to_pos[&medoid_id];
         let mut visited = FnvHashSet::default();
         let mut candidates: BinaryHeap<SearchNode> = BinaryHeap::new();
-        let mut kth_best = f32::MAX;
+        let mut kth_best = KthBest::new(k);
+        let ef_search = l.max(k * 2);
 
-        let start_dist = l2_squared(query, &vectors[self.id_to_pos[&self.ids[start_pos]]].1);
+        let start_dist = l2_squared(query, &vectors[start_pos].1);
         candidates.push(SearchNode {
             dist: start_dist,
-            id: self.ids[start_pos],
+            id: medoid_id,
             pos: start_pos,
         });
-        visited.insert(self.ids[start_pos]);
+        visited.insert(medoid_id);
+        kth_best.insert(start_dist);
 
         while let Some(node) = candidates.pop() {
-            if node.dist > kth_best {
+            let max_dist = kth_best.threshold();
+            if node.dist > max_dist && visited.len() > ef_search {
                 break;
             }
 
@@ -167,26 +175,14 @@ impl VamanaGraph {
                     if let Some(&neighbor_pos) = self.id_to_pos.get(&neighbor_id) {
                         let dist = l2_squared(query, &vectors[neighbor_pos].1);
 
-                        if dist < kth_best {
+                        if dist < kth_best.threshold() {
                             candidates.push(SearchNode {
                                 dist,
                                 id: neighbor_id,
                                 pos: neighbor_pos,
                             });
-
-                            // Update kth-best tracking.
-                            if visited.len() > k {
-                                let mut all_dists: Vec<f32> = visited
-                                    .iter()
-                                    .filter_map(|vid| self.id_to_pos.get(vid))
-                                    .map(|&p| l2_squared(query, &vectors[p].1))
-                                    .collect();
-                                all_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                                if all_dists.len() >= k {
-                                    kth_best = all_dists[k - 1];
-                                }
-                            }
                         }
+                        kth_best.insert(dist);
                     }
                 }
             }
@@ -379,7 +375,6 @@ impl VamanaGraph {
 #[derive(Debug, Clone)]
 struct SearchNode {
     dist: f32,
-    #[allow(dead_code)]
     id: u64,
     pos: usize,
 }
@@ -403,6 +398,57 @@ impl Ord for SearchNode {
         // Reverse for min-heap: BinaryHeap pops the largest, so smaller dists
         // should be considered "greater" in ordering.
         other.dist.total_cmp(&self.dist)
+    }
+}
+
+/// Max-heap wrapper for tracking the k-th best distance.
+/// `BinaryHeap` is a max-heap by default, so larger distance = higher priority.
+/// `peek()` returns the worst (largest distance) of the top-k.
+#[derive(Debug, Clone)]
+struct KthBest {
+    heap: BinaryHeap<KthNode>,
+    k: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct KthNode(f32);
+
+impl Eq for KthNode {}
+
+impl PartialOrd for KthNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KthNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // max-heap: larger distance is higher priority
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl KthBest {
+    fn new(k: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(k + 1),
+            k,
+        }
+    }
+
+    fn insert(&mut self, dist: f32) {
+        self.heap.push(KthNode(dist));
+        if self.heap.len() > self.k {
+            self.heap.pop();
+        }
+    }
+
+    fn threshold(&self) -> f32 {
+        if self.heap.len() >= self.k {
+            self.heap.peek().unwrap().0
+        } else {
+            f32::MAX
+        }
     }
 }
 

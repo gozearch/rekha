@@ -325,19 +325,26 @@ impl VectorIndex for RekhaIndex {
             });
         }
 
-        let _ef_search = params.ef_search.max(k);
+        let ef_search = params.ef_search.max(k);
 
-        // Tier 1: Vamana graph search (indexed vectors)
+        // Tier 1: Vamana graph approximate search (indexed vectors).
+        // Uses beam search with search list size = ef_search.
         let mut all_candidates: Vec<(f32, u64)> = if self.ready && !self.vectors.is_empty() {
-            self.vectors
-                .iter()
-                .map(|(id, v)| (l2_squared(query, v), *id))
-                .collect()
+            match self.graph.search(query, &self.vectors, k, ef_search) {
+                Ok((ids, dists)) => dists.into_iter().zip(ids.into_iter()).collect(),
+                Err(_) => {
+                    // Fallback: brute-force if graph search fails (e.g. unbuilt graph).
+                    self.vectors
+                        .iter()
+                        .map(|(id, v)| (l2_squared(query, v), *id))
+                        .collect()
+                }
+            }
         } else {
             Vec::new()
         };
 
-        // Tier 2: Buffer brute-force search (recent inserts)
+        // Tier 2: Buffer brute-force search (recent inserts not yet in graph).
         if let Ok(buf) = self.insert_buffer.read() {
             for (id, vec) in &buf.vectors {
                 if buf.contains_deleted(*id) {
@@ -353,7 +360,7 @@ impl VectorIndex for RekhaIndex {
 
         // Merge: sort by distance, take top k*2 for safety
         all_candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        all_candidates.truncate(_ef_search);
+        all_candidates.truncate(ef_search);
 
         let result_ids: Vec<u64> = all_candidates.iter().take(k).map(|(_, id)| *id).collect();
         let result_dists: Vec<f32> = all_candidates.iter().take(k).map(|(d, _)| *d).collect();

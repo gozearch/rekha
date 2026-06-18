@@ -121,14 +121,25 @@ impl Rekha for RekhaService {
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
         let req = request.into_inner();
-        let deleted = self
-            .coordinator
-            .store()
-            .delete(&req.ids)
-            .map_err(Self::map_error)?;
+
+        let result = self.coordinator.delete_ids(req.ids).await;
+        if let Err(ref e) = result {
+            if let RekhaError::Consensus(RaftError::NotLeader {
+                leader_hint: Some(leader_id),
+            }) = e
+            {
+                let addr = self.coordinator.peer_address(leader_id).await;
+                let detail = match addr {
+                    Some(a) => format!("not leader, try {leader_id}@{a}"),
+                    None => format!("not leader, try {leader_id}"),
+                };
+                return Err(Status::failed_precondition(detail));
+            }
+            return Err(Self::map_error(e.clone()));
+        }
 
         Ok(Response::new(DeleteResponse {
-            deleted_count: deleted,
+            deleted_count: 0,
             error: String::new(),
         }))
     }
@@ -693,7 +704,7 @@ mod tests {
             rekha_storage::RocksVectorStore::open("/tmp/rekha_svc_test_db").unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 1),
         ));
         let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         let service = RekhaService::new(coord);
@@ -717,7 +728,7 @@ mod tests {
             rekha_storage::RocksVectorStore::open("/tmp/svc_ct_test_db").unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 1),
         ));
         let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         let service = RekhaService::new(coord);
@@ -779,7 +790,7 @@ mod tests {
             rekha_storage::RocksVectorStore::open("/tmp/svc_search_err_db").unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 1),
         ));
         let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         let service = RekhaService::new(coord);
@@ -803,7 +814,7 @@ mod tests {
             rekha_storage::RocksVectorStore::open("/tmp/svc_del_test_db").unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 1),
         ));
         let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         let service = RekhaService::new(coord);
@@ -832,7 +843,7 @@ mod tests {
             rekha_storage::RocksVectorStore::open(format!("{dir}/db")).unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 1),
         ));
         let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         RekhaService::new(coord)
@@ -1044,6 +1055,7 @@ mod tests {
             state,
             Some(raft_log_store),
             None,
+            None,
         ));
         node.start_election().await.unwrap();
         service.coordinator.register_raft_node(0, node);
@@ -1088,6 +1100,7 @@ mod tests {
             vec![],
             state,
             Some(raft_log_store),
+            None,
             None,
         ));
         service.coordinator.register_raft_node(0, node);

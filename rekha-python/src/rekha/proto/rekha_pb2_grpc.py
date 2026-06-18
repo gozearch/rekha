@@ -34,6 +34,26 @@ class RekhaStub:
         Args:
             channel: A grpc.Channel.
         """
+        self.CreateCollection = channel.unary_unary(
+                '/rekha.Rekha/CreateCollection',
+                request_serializer=rekha__pb2.CreateCollectionRequest.SerializeToString,
+                response_deserializer=rekha__pb2.CreateCollectionResponse.FromString,
+                _registered_method=True)
+        self.DropCollection = channel.unary_unary(
+                '/rekha.Rekha/DropCollection',
+                request_serializer=rekha__pb2.DropCollectionRequest.SerializeToString,
+                response_deserializer=rekha__pb2.DropCollectionResponse.FromString,
+                _registered_method=True)
+        self.ListCollections = channel.unary_unary(
+                '/rekha.Rekha/ListCollections',
+                request_serializer=rekha__pb2.ListCollectionsRequest.SerializeToString,
+                response_deserializer=rekha__pb2.ListCollectionsResponse.FromString,
+                _registered_method=True)
+        self.CollectionExists = channel.unary_unary(
+                '/rekha.Rekha/CollectionExists',
+                request_serializer=rekha__pb2.CollectionExistsRequest.SerializeToString,
+                response_deserializer=rekha__pb2.CollectionExistsResponse.FromString,
+                _registered_method=True)
         self.Insert = channel.unary_unary(
                 '/rekha.Rekha/Insert',
                 request_serializer=rekha__pb2.InsertRequest.SerializeToString,
@@ -98,6 +118,31 @@ class RekhaStub:
 
 class RekhaServicer:
     """Missing associated documentation comment in .proto file."""
+
+    def CreateCollection(self, request, context):
+        """── Collection management ────────────────────────────────
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DropCollection(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListCollections(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CollectionExists(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def Insert(self, request, context):
         """── Data operations ──────────────────────────────────────
@@ -178,6 +223,26 @@ class RekhaServicer:
 
 def add_RekhaServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'CreateCollection': grpc.unary_unary_rpc_method_handler(
+                    servicer.CreateCollection,
+                    request_deserializer=rekha__pb2.CreateCollectionRequest.FromString,
+                    response_serializer=rekha__pb2.CreateCollectionResponse.SerializeToString,
+            ),
+            'DropCollection': grpc.unary_unary_rpc_method_handler(
+                    servicer.DropCollection,
+                    request_deserializer=rekha__pb2.DropCollectionRequest.FromString,
+                    response_serializer=rekha__pb2.DropCollectionResponse.SerializeToString,
+            ),
+            'ListCollections': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListCollections,
+                    request_deserializer=rekha__pb2.ListCollectionsRequest.FromString,
+                    response_serializer=rekha__pb2.ListCollectionsResponse.SerializeToString,
+            ),
+            'CollectionExists': grpc.unary_unary_rpc_method_handler(
+                    servicer.CollectionExists,
+                    request_deserializer=rekha__pb2.CollectionExistsRequest.FromString,
+                    response_serializer=rekha__pb2.CollectionExistsResponse.SerializeToString,
+            ),
             'Insert': grpc.unary_unary_rpc_method_handler(
                     servicer.Insert,
                     request_deserializer=rekha__pb2.InsertRequest.FromString,
@@ -248,6 +313,114 @@ def add_RekhaServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class Rekha:
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def CreateCollection(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rekha.Rekha/CreateCollection',
+            rekha__pb2.CreateCollectionRequest.SerializeToString,
+            rekha__pb2.CreateCollectionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DropCollection(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rekha.Rekha/DropCollection',
+            rekha__pb2.DropCollectionRequest.SerializeToString,
+            rekha__pb2.DropCollectionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListCollections(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rekha.Rekha/ListCollections',
+            rekha__pb2.ListCollectionsRequest.SerializeToString,
+            rekha__pb2.ListCollectionsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CollectionExists(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rekha.Rekha/CollectionExists',
+            rekha__pb2.CollectionExistsRequest.SerializeToString,
+            rekha__pb2.CollectionExistsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def Insert(request,

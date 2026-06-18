@@ -462,13 +462,18 @@ Pure Python gRPC client (no PyO3). Uses `grpcio` and generated proto stubs.
 from rekha import RekhaClient
 
 with RekhaClient.connect(["localhost:50051"]) as client:
-    client.insert(42, [0.1, 0.2, 0.3], payload=b'{"k":"v"}')
-    results = client.search([0.1, 0.2, 0.3], top_k=10)
+    # Insert (id=0 means auto-generate)
+    client.insert([0.1, 0.2, 0.3], "default", payload=b'{"k":"v"}')
+
+    # Insert with explicit ID
+    client.insert([0.1, 0.2, 0.3], "default", id=42, payload=b'{"k":"v"}')
+
+    results = client.search([0.1, 0.2, 0.3], top_k=10, collection_name="default")
     for r in results:
         print(f"id={r.id}, score={r.score}")
 
     # Streaming search
-    for r in client.search_stream([0.1, 0.2, 0.3], 10):
+    for r in client.search_stream([0.1, 0.2, 0.3], 10, "default"):
         print(f"streamed: id={r.id}, score={r.score}")
 
     # Cluster info
@@ -481,12 +486,12 @@ with RekhaClient.connect(["localhost:50051"]) as client:
 | Method | Description |
 |---|---|
 | `connect(seeds)` | Connect to any seed node |
-| `insert(id, vector, payload?)` | Insert a vector |
-| `search(query, top_k)` | Search top-k NN |
-| `search_with_params(query, top_k, params)` | Search with ef_search, beam_width, etc. |
-| `search_stream(query, top_k, params?)` | Streaming search (generator) |
-| `delete(ids)` | Delete by ID list |
-| `fetch(ids, include_payloads)` | Fetch vectors by ID |
+| `insert(vector, collection_name, id=0, payload=None)` | Insert a vector (id=0 = auto-generate) |
+| `search(query, top_k, collection_name)` | Search top-k NN |
+| `search_with_params(query, top_k, collection_name, params, local_only=False)` | Search with ef_search, beam_width, etc. |
+| `search_stream(query, top_k, collection_name, params=None, local_only=False)` | Streaming search (generator) |
+| `delete(ids, collection_name)` | Delete by ID list |
+| `fetch(ids, collection_name, include_payloads=False)` | Fetch vectors by ID |
 | `cluster_info()` | Get cluster topology |
 | `close()` | Close gRPC channel |
 

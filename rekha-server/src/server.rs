@@ -486,7 +486,7 @@ mod tests {
         let config = ServerConfig::dev_default("test-node", &temp_dir());
         let server = ServerInstance::from_config(config).await.unwrap();
         // spawn_raft_timers is called by run(). Verify the coordinator has raft nodes.
-        assert!(server.coordinator.raft_nodes.len() > 0);
+        assert!(!server.coordinator.raft_nodes.is_empty());
     }
 
     #[tokio::test]

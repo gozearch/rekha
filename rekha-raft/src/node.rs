@@ -988,13 +988,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_index_handle() {
-        let node = test_node();
-        let handle = std::sync::Arc::new(()); // Placeholder — real handle not needed for coverage
-                                              // verify set_index_handle doesn't panic
-                                              // We can't test the notify path easily without a real IndexBufferHandle,
-                                              // but calling set_index_handle should succeed
-        let mut mutable_node =
-            RaftNode::new("test-node".into(), 0, vec![], ReplicatedState::new(0));
+        let _node = test_node();
+        let _handle = std::sync::Arc::new(()); // Placeholder — real handle not needed for coverage
+                                               // verify set_index_handle doesn't panic
+                                               // We can't test the notify path easily without a real IndexBufferHandle,
+                                               // but calling set_index_handle should succeed
+        let mutable_node = RaftNode::new("test-node".into(), 0, vec![], ReplicatedState::new(0));
         // Without handle, propose should succeed (index_handle is None)
         mutable_node.start_election().await.unwrap();
         mutable_node.propose(RaftCommand::NoOp).await.unwrap();

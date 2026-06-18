@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 import time
-from typing import List, Optional, Tuple
+from typing import Any, Generator, List, Optional, Tuple
 
 import grpc
 
@@ -101,13 +101,17 @@ class RekhaClient:
                 time.sleep((base_ms + jitter) / 1000.0)
 
     def insert(
-        self, id: int, vector: List[float], payload: Optional[bytes] = None
-    ) -> None:
+        self,
+        vector: List[float],
+        collection_name: str,
+        id: int = 0,
+        payload: Optional[bytes] = None,
+    ) -> int:
         pb_payload = None
         if payload is not None:
             pb_payload = pb.Payload(content_type="raw", data=payload)
 
-        request = pb.InsertRequest(id=id, vector=vector, payload=pb_payload)
+        request = pb.InsertRequest(id=id, vector=vector, collection_name=collection_name, payload=pb_payload)
 
         def call():
             response = self._stub.Insert(request, timeout=self._config["request_timeout"])
@@ -116,20 +120,23 @@ class RekhaClient:
                     grpc.StatusCode.INTERNAL,
                     response.error if response.error else "insert failed",
                 )
+            return response.id
 
-        self._with_retry("insert", call)
+        return self._with_retry("insert", call)
 
     def search(
-        self, query: List[float], top_k: int
+        self, query: List[float], top_k: int, collection_name: str
     ) -> List[ScoredPoint]:
-        results, _ = self.search_with_params(query, top_k, SearchParams())
+        results, _ = self.search_with_params(query, top_k, collection_name, SearchParams())
         return results
 
     def search_with_params(
         self,
         query: List[float],
         top_k: int,
+        collection_name: str,
         params: SearchParams,
+        local_only: bool = False,
     ) -> Tuple[List[ScoredPoint], SearchStats]:
         pb_params = pb.SearchParams(
             ef_search=params.ef_search,
@@ -137,7 +144,13 @@ class RekhaClient:
             include_payloads=params.include_payloads,
             partition_hint=params.partition_hint,
         )
-        request = pb.SearchRequest(query_vector=query, top_k=top_k, params=pb_params)
+        request = pb.SearchRequest(
+            query_vector=query,
+            top_k=top_k,
+            params=pb_params,
+            local_only=local_only,
+            collection_name=collection_name,
+        )
 
         def call():
             response = self._stub.Search(request, timeout=self._config["request_timeout"])
@@ -161,8 +174,8 @@ class RekhaClient:
 
         return self._with_retry("search", call)
 
-    def delete(self, ids: List[int]) -> int:
-        request = pb.DeleteRequest(ids=ids)
+    def delete(self, ids: List[int], collection_name: str) -> int:
+        request = pb.DeleteRequest(ids=ids, collection_name=collection_name)
 
         def call():
             response = self._stub.Delete(request, timeout=self._config["request_timeout"])
@@ -171,9 +184,9 @@ class RekhaClient:
         return self._with_retry("delete", call)
 
     def fetch(
-        self, ids: List[int], include_payloads: bool = False
+        self, ids: List[int], collection_name: str, include_payloads: bool = False
     ) -> List[ScoredPoint]:
-        request = pb.FetchRequest(ids=ids, include_payloads=include_payloads)
+        request = pb.FetchRequest(ids=ids, collection_name=collection_name, include_payloads=include_payloads)
 
         def call():
             response = self._stub.Fetch(request, timeout=self._config["request_timeout"])
@@ -214,8 +227,13 @@ class RekhaClient:
         return self._with_retry("cluster_info", call)
 
     def search_stream(
-        self, query: List[float], top_k: int, params: Optional[SearchParams] = None
-    ):
+        self,
+        query: List[float],
+        top_k: int,
+        collection_name: str,
+        params: Optional[SearchParams] = None,
+        local_only: bool = False,
+    ) -> Generator[ScoredPoint, None, None]:
         params = params or SearchParams()
         pb_params = pb.SearchParams(
             ef_search=params.ef_search,
@@ -223,7 +241,13 @@ class RekhaClient:
             include_payloads=params.include_payloads,
             partition_hint=params.partition_hint,
         )
-        request = pb.SearchRequest(query_vector=query, top_k=top_k, params=pb_params)
+        request = pb.SearchRequest(
+            query_vector=query,
+            top_k=top_k,
+            params=pb_params,
+            local_only=local_only,
+            collection_name=collection_name,
+        )
 
         for p in self._stub.SearchStream(request, timeout=self._config["request_timeout"]):
             yield ScoredPoint(

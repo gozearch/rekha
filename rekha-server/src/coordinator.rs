@@ -490,6 +490,7 @@ impl Coordinator {
 
         // Phase 1: Collect candidates from local index (dimension group fan-out).
         let mut candidates: Vec<ScoredPoint> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
         let mut local_groups = 0u32;
 
         for group in 0..num_groups {
@@ -500,6 +501,9 @@ impl Coordinator {
                 Ok((ids, dists)) => {
                     local_groups += 1;
                     for (i, id) in ids.iter().enumerate() {
+                        if !seen_ids.insert(*id) {
+                            continue;
+                        }
                         let score = dists.get(i).copied().unwrap_or(f32::MAX);
 
                         if candidates.len() >= k {

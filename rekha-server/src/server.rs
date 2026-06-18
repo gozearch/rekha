@@ -66,10 +66,15 @@ impl ServerInstance {
             partition_manager,
         ));
 
-        // Create Raft nodes for each vector shard.
+        // Create Raft nodes for each assigned vector shard.
         let raft_log_store = coordinator.raft_log_store();
-        let num_shards = config.partition.num_vector_shards;
-        for shard in 0..num_shards {
+        let shards: Vec<u64> = if config.cluster.assigned_shards.is_empty() {
+            (0..config.partition.num_vector_shards).collect()
+        } else {
+            config.cluster.assigned_shards.clone()
+        };
+        let num_assigned_shards = shards.len();
+        for shard in shards {
             let state = rekha_raft::ReplicatedState::new(shard);
             let node_id = &config.cluster.node_id;
             let peers: Vec<String> = config
@@ -95,7 +100,7 @@ impl ServerInstance {
             ));
             coordinator.register_raft_node(shard, raft_node);
         }
-        info!("Created {} Raft nodes for partitions", num_shards);
+        info!("Created {} Raft nodes for partitions", num_assigned_shards);
 
         // Create an empty (unbuilt) index and initialize the coordinator.
         let dim = config.partition.dim_group_size * config.partition.num_dim_groups as usize;
@@ -353,6 +358,36 @@ impl ServerInstance {
         });
     }
 
+    /// Spawn a background loop that periodically creates snapshots
+    /// of the Raft state and truncates compacted log entries.
+    fn spawn_snapshot_loop(&self) {
+        let coordinator = self.coordinator.clone();
+        let snapshot_interval = self.config.raft.snapshot_interval;
+        let check_interval_ms = (snapshot_interval * 100).min(60_000); // at most every 60s
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+
+                let partition_ids: Vec<u64> = coordinator
+                    .raft_nodes
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .collect();
+
+                for pid in partition_ids {
+                    if let Some(node) = coordinator.raft_node(pid) {
+                        if node.should_snapshot(snapshot_interval).await {
+                            if let Err(e) = node.create_snapshot().await {
+                                warn!("Failed to create snapshot for partition {pid}: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Run the server (blocking). Handles SIGTERM/SIGINT for graceful shutdown.
     /// Spawns a background heartbeat loop for cluster discovery and health monitoring.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -363,6 +398,7 @@ impl ServerInstance {
         self.spawn_heartbeat_loop();
         self.spawn_raft_timers();
         self.spawn_raft_heartbeat_loop();
+        self.spawn_snapshot_loop();
 
         let shutdown = async {
             tokio::signal::ctrl_c()

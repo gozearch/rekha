@@ -150,6 +150,7 @@ impl PeerPool {
         self.clients.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.clients.len()
     }
@@ -601,10 +602,7 @@ impl Coordinator {
         Ok(id)
     }
 
-    pub async fn delete_ids(
-        &self,
-        ids: Vec<u64>,
-    ) -> Result<u64, RekhaError> {
+    pub async fn delete_ids(&self, ids: Vec<u64>) -> Result<u64, RekhaError> {
         // Route through Raft if a Raft node exists for partition 0.
         if let Some(raft_node) = self.raft_node(0) {
             let cmd = rekha_raft::state::RaftCommand::Delete { ids };
@@ -614,6 +612,45 @@ impl Coordinator {
 
         // Fallback: direct store write (single-node / uninitialized).
         self.store.delete(&ids)
+    }
+
+    /// Transfer a shard's data to a target node.
+    /// Reads all vector IDs from the store, batches them, and sends via client.
+    pub async fn transfer_shard(
+        &self,
+        target_addr: &str,
+        shard_id: u64,
+    ) -> Result<u64, RekhaError> {
+        use rekha_client::RekhaClient;
+
+        let client = RekhaClient::connect(&[target_addr.to_string()]).await?;
+        let ids = self.store.iter_ids()?;
+        let mut transferred = 0u64;
+
+        // Batch transfer: collect and send in groups.
+        let mut batch = Vec::new();
+        for id in ids {
+            if id % self.config.partition.num_vector_shards != shard_id {
+                continue; // Not our shard
+            }
+            if let Ok(Some(vector)) = self.store.get_vector(id) {
+                let payload = self.store.get_payload(id).ok().flatten();
+                batch.push((id, vector, payload));
+                if batch.len() >= 100 {
+                    for (bid, bvec, bpayload) in batch.drain(..) {
+                        let _ = client.insert(bid, bvec, "default", bpayload).await;
+                        transferred += 1;
+                    }
+                }
+            }
+        }
+        // Drain remaining.
+        for (id, vector, payload) in batch {
+            let _ = client.insert(id, vector, "default", payload).await;
+            transferred += 1;
+        }
+
+        Ok(transferred)
     }
 
     pub async fn topology(&self) -> Result<ClusterTopology, RekhaError> {

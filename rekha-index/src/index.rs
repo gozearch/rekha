@@ -331,7 +331,7 @@ impl VectorIndex for RekhaIndex {
         // Uses beam search with search list size = ef_search.
         let mut all_candidates: Vec<(f32, u64)> = if self.ready && !self.vectors.is_empty() {
             match self.graph.search(query, &self.vectors, k, ef_search) {
-                Ok((ids, dists)) => dists.into_iter().zip(ids.into_iter()).collect(),
+                Ok((ids, dists)) => dists.into_iter().zip(ids).collect(),
                 Err(_) => {
                     // Fallback: brute-force if graph search fails (e.g. unbuilt graph).
                     self.vectors

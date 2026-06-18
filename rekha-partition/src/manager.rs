@@ -152,7 +152,11 @@ mod tests {
         for i in 0..4 {
             nodes.insert(
                 format!("node-{}", i),
-                make_node(&format!("node-{}", i), &format!("10.0.0.{}:50051", i + 1), i as u64),
+                make_node(
+                    &format!("node-{}", i),
+                    &format!("10.0.0.{}:50051", i + 1),
+                    i as u64,
+                ),
             );
         }
         let manager = PartitionManager::new(nodes, 4);

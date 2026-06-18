@@ -87,14 +87,12 @@ fn raft_entry_to_proto(entry: &RaftLogEntry) -> crate::proto::RaftEntry {
                 collection_name: String::new(),
             },
         )),
-        RaftCommand::Delete { ids } => {
-            Some(crate::proto::raft_command::Cmd::Delete(
-                crate::proto::DeleteRequest {
-                    ids: ids.clone(),
-                    collection_name: String::new(),
-                },
-            ))
-        }
+        RaftCommand::Delete { ids } => Some(crate::proto::raft_command::Cmd::Delete(
+            crate::proto::DeleteRequest {
+                ids: ids.clone(),
+                collection_name: String::new(),
+            },
+        )),
         RaftCommand::NoOp => None,
     };
 
@@ -105,6 +103,7 @@ fn raft_entry_to_proto(entry: &RaftLogEntry) -> crate::proto::RaftEntry {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 impl RaftPeerNetwork for GrpcRaftNetwork {
     async fn append_entries(

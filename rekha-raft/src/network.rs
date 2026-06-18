@@ -8,6 +8,7 @@ use crate::node::RaftLogEntry;
 /// The server layer provides a gRPC implementation of this trait.
 /// Tests provide a mock implementation for deterministic behavior.
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait RaftPeerNetwork: Send + Sync {
     /// Send AppendEntries to a peer. Returns (success, current_term).
     async fn append_entries(

@@ -274,7 +274,8 @@ impl RaftNode {
 
         // 2. Replicate to followers.
         let n_peers = self.peers.len();
-        let majority = (n_peers as u64 + 1) / 2 + 1;
+        let group_size = n_peers as u64 + 1;
+        let majority = group_size / 2 + 1;
         let mut acks = 1u64; // self-vote
 
         if n_peers > 0 {
@@ -599,6 +600,105 @@ impl RaftNode {
     /// Set the network interface after construction.
     pub fn set_network(&mut self, network: Arc<dyn RaftPeerNetwork>) {
         self.network = Some(network);
+    }
+
+    /// Create a snapshot of the current replicated state and truncate the log.
+    /// Returns (term, last_included_index) of the snapshot.
+    pub async fn create_snapshot(&self) -> Result<(u64, u64), RekhaError> {
+        let state = self.state.read().await;
+        let raft_rs = self.raft_state.lock().await;
+        let snapshot_term = raft_rs.current_term;
+        let snapshot_index = raft_rs.last_applied;
+        drop(raft_rs);
+
+        if snapshot_index == 0 {
+            return Err(RaftError::SnapshotFailed {
+                detail: "nothing to snapshot (last_applied = 0)".into(),
+            }
+            .into());
+        }
+
+        // Serialize the state for the snapshot.
+        let snapshot_data = bincode::serialize(&*state).map_err(|e| RaftError::SnapshotFailed {
+            detail: format!("failed to serialize snapshot: {e}"),
+        })?;
+        drop(state);
+
+        // Store snapshot in RocksDB.
+        if let Some(ref store) = self.store {
+            store.store_snapshot(
+                self.partition_id,
+                snapshot_term,
+                snapshot_index,
+                &snapshot_data,
+            )?;
+            // Truncate log entries before the snapshot point.
+            store.truncate_entries_before(self.partition_id, snapshot_index)?;
+        }
+
+        info!(
+            "Created snapshot for partition {} at index {} term {} ({} bytes)",
+            self.partition_id,
+            snapshot_index,
+            snapshot_term,
+            snapshot_data.len()
+        );
+
+        Ok((snapshot_term, snapshot_index))
+    }
+
+    /// Install a snapshot received from a leader.
+    /// Replaces the current state and truncates the log.
+    pub async fn install_snapshot(
+        &self,
+        term: u64,
+        last_included_index: u64,
+        data: &[u8],
+    ) -> Result<(), RekhaError> {
+        let snapshot: ReplicatedState =
+            bincode::deserialize(data).map_err(|e| RaftError::SnapshotFailed {
+                detail: format!("failed to deserialize snapshot: {e}"),
+            })?;
+
+        // Replace state and log with the snapshot.
+        {
+            let mut state = self.state.write().await;
+            *state = snapshot;
+            state.last_applied = last_included_index;
+        }
+
+        {
+            let mut log = self.log.lock().await;
+            log.clear();
+        }
+
+        {
+            let mut rs = self.raft_state.lock().await;
+            rs.commit_index = last_included_index;
+            rs.last_applied = last_included_index;
+            if term > rs.current_term {
+                rs.current_term = term;
+            }
+        }
+
+        // Persist the snapshot.
+        if let Some(ref store) = self.store {
+            store.store_snapshot(self.partition_id, term, last_included_index, data)?;
+            store.truncate_entries_before(self.partition_id, last_included_index)?;
+        }
+
+        info!(
+            "Installed snapshot for partition {} at index {} term {}",
+            self.partition_id, last_included_index, term
+        );
+
+        Ok(())
+    }
+
+    /// Check if snapshot should be created based on log size.
+    pub async fn should_snapshot(&self, snapshot_interval: u64) -> bool {
+        let log_len = self.log.lock().await.len() as u64;
+        log_len >= snapshot_interval
     }
 }
 

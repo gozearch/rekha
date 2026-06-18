@@ -19,7 +19,54 @@ impl ServerConfig {
         let path = path.into();
         let contents = std::fs::read_to_string(&path)?;
         let config: Self = serde_yaml::from_str(&contents)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Validate configuration invariants.
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.partition.num_vector_shards == 0 {
+            return Err("num_vector_shards must be > 0".into());
+        }
+        if self.partition.replication_factor == 0 {
+            return Err("replication_factor must be > 0".into());
+        }
+        if self.partition.num_dim_groups == 0 {
+            return Err("num_dim_groups must be > 0".into());
+        }
+        if self.partition.dim_group_size == 0 {
+            return Err("dim_group_size must be > 0".into());
+        }
+        if self.cluster.node_id.is_empty() {
+            return Err("node_id must not be empty".into());
+        }
+        if self.cluster.bind_addr.is_empty() {
+            return Err("bind_addr must not be empty".into());
+        }
+        if self.index.graph_degree == 0 {
+            return Err("graph_degree must be > 0".into());
+        }
+        if self.index.pq_num_sub_vectors == 0 {
+            return Err("pq_num_sub_vectors must be > 0".into());
+        }
+        if self.index.pq_num_centroids == 0 {
+            return Err("pq_num_centroids must be > 0".into());
+        }
+        if self.raft.heartbeat_interval_ms == 0 {
+            return Err("heartbeat_interval_ms must be > 0".into());
+        }
+        if self.raft.election_timeout_min_ms == 0 {
+            return Err("election_timeout_min_ms must be > 0".into());
+        }
+        if self.tls.enabled {
+            if self.tls.cert_path.is_none() {
+                return Err("TLS enabled but cert_path not set".into());
+            }
+            if self.tls.key_path.is_none() {
+                return Err("TLS enabled but key_path not set".into());
+            }
+        }
+        Ok(())
     }
 
     /// Default configuration for a single-node development setup.
@@ -30,6 +77,7 @@ impl ServerConfig {
                 seed_nodes: vec![format!("127.0.0.1:50051")],
                 bind_addr: "0.0.0.0:50051".into(),
                 data_dir: data_dir.into(),
+                assigned_shards: vec![],
             },
             partition: PartitionConfig {
                 num_vector_shards: 1,
@@ -94,6 +142,9 @@ pub struct ClusterConfig {
     pub seed_nodes: Vec<String>,
     pub bind_addr: String,
     pub data_dir: String,
+    /// Shard IDs that this node hosts. Empty = host all shards (single-node default).
+    #[serde(default)]
+    pub assigned_shards: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

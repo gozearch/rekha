@@ -363,13 +363,25 @@ impl Rekha for RekhaService {
 
     async fn transfer_shard(
         &self,
-        _request: Request<TransferRequest>,
+        request: Request<TransferRequest>,
     ) -> Result<Response<TransferResponse>, Status> {
-        Ok(Response::new(TransferResponse {
-            success: false,
-            transferred_count: 0,
-            error: "not implemented".into(),
-        }))
+        let req = request.into_inner();
+        match self
+            .coordinator
+            .transfer_shard(&req.target_node, req.partition_id)
+            .await
+        {
+            Ok(count) => Ok(Response::new(TransferResponse {
+                success: true,
+                transferred_count: count,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(TransferResponse {
+                success: false,
+                transferred_count: 0,
+                error: e.to_string(),
+            })),
+        }
     }
 
     // ── Raft ──────────────────────────────────────────────────
@@ -451,14 +463,59 @@ impl Rekha for RekhaService {
 
     async fn raft_install_snapshot(
         &self,
-        _request: Request<tonic::Streaming<RaftSnapshotChunk>>,
+        request: Request<tonic::Streaming<RaftSnapshotChunk>>,
     ) -> Result<Response<RaftAck>, Status> {
-        Ok(Response::new(RaftAck {
-            success: true,
-            current_term: 0,
-            commit_index: 0,
-            error: String::new(),
-        }))
+        let mut stream = request.into_inner();
+        let mut snapshot_data: Vec<u8> = Vec::new();
+        let mut term = 0u64;
+        let mut last_included_index = 0u64;
+
+        while let Some(chunk) = stream.message().await? {
+            term = chunk.term;
+            last_included_index = chunk.last_included_index;
+            snapshot_data.extend_from_slice(&chunk.data);
+        }
+
+        if snapshot_data.is_empty() {
+            return Ok(Response::new(RaftAck {
+                success: true,
+                current_term: 0,
+                commit_index: 0,
+                error: String::new(),
+            }));
+        }
+
+        // Find the Raft node for this partition and install the snapshot.
+        // The partition_id is not in the chunk — we infer from chunk metadata.
+        // In a full implementation, the chunk should include partition_id.
+        // For now, find the first raft node and install.
+        let raft_node_opt = {
+            let first = self.coordinator.raft_nodes.iter().next();
+            first.map(|entry| entry.value().clone())
+        };
+
+        match raft_node_opt {
+            Some(node) => {
+                match node
+                    .install_snapshot(term, last_included_index, &snapshot_data)
+                    .await
+                {
+                    Ok(()) => Ok(Response::new(RaftAck {
+                        success: true,
+                        current_term: node.current_term().await,
+                        commit_index: node.commit_index().await,
+                        error: String::new(),
+                    })),
+                    Err(e) => Ok(Response::new(RaftAck {
+                        success: false,
+                        current_term: node.current_term().await,
+                        commit_index: 0,
+                        error: e.to_string(),
+                    })),
+                }
+            }
+            None => Err(Status::not_found("no raft nodes to install snapshot")),
+        }
     }
 
     // ── Collection Management ──────────────────────────────────

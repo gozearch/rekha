@@ -49,6 +49,13 @@ fn state_key(namespace: &Option<String>, partition_id: u64) -> Vec<u8> {
     key
 }
 
+fn snapshot_key(namespace: &Option<String>, partition_id: u64) -> Vec<u8> {
+    let mut key = namespace_prefix(namespace);
+    key.extend_from_slice(&partition_id.to_be_bytes());
+    key.extend_from_slice(&(u64::MAX - 1).to_be_bytes());
+    key
+}
+
 fn entry_key(namespace: &Option<String>, partition_id: u64, index: u64) -> Vec<u8> {
     let mut key = namespace_prefix(namespace);
     key.extend_from_slice(&partition_id.to_be_bytes());
@@ -310,6 +317,101 @@ impl RaftLogStore {
                 detail: format!("failed to read Raft state: {e}"),
             }),
         }
+    }
+
+    /// Store a snapshot for a partition.
+    pub fn store_snapshot(
+        &self,
+        partition_id: u64,
+        term: u64,
+        last_included_index: u64,
+        data: &[u8],
+    ) -> Result<(), rekha_core::RekhaError> {
+        let key = snapshot_key(&self.namespace, partition_id);
+        // Encode: [term (8)] [last_index (8)] [data...]
+        let mut value = Vec::with_capacity(16 + data.len());
+        value.extend_from_slice(&term.to_be_bytes());
+        value.extend_from_slice(&last_included_index.to_be_bytes());
+        value.extend_from_slice(data);
+
+        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
+            rekha_core::RekhaError::Internal {
+                detail: "raft_log column family not found".into(),
+            }
+        })?;
+        db(&self.store)
+            .put_cf(&cf, key, value)
+            .map_err(|e| rekha_core::RekhaError::Internal {
+                detail: format!("failed to write Raft snapshot: {e}"),
+            })
+    }
+
+    /// Load the snapshot for a partition.
+    pub fn load_snapshot(
+        &self,
+        partition_id: u64,
+    ) -> Result<Option<(u64, u64, Vec<u8>)>, rekha_core::RekhaError> {
+        let key = snapshot_key(&self.namespace, partition_id);
+        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
+            rekha_core::RekhaError::Internal {
+                detail: "raft_log column family not found".into(),
+            }
+        })?;
+        match db(&self.store).get_cf(&cf, key) {
+            Ok(Some(value)) => {
+                if value.len() < 16 {
+                    return Ok(None);
+                }
+                let term = u64::from_be_bytes(value[0..8].try_into().unwrap());
+                let last_index = u64::from_be_bytes(value[8..16].try_into().unwrap());
+                let data = value[16..].to_vec();
+                Ok(Some((term, last_index, data)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(rekha_core::RekhaError::Internal {
+                detail: format!("failed to read Raft snapshot: {e}"),
+            }),
+        }
+    }
+
+    /// Delete log entries with index < `before_index`.
+    pub fn truncate_entries_before(
+        &self,
+        partition_id: u64,
+        before_index: u64,
+    ) -> Result<(), rekha_core::RekhaError> {
+        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
+            rekha_core::RekhaError::Internal {
+                detail: "raft_log column family not found".into(),
+            }
+        })?;
+        let prefix = entry_prefix(&self.namespace, partition_id);
+        let start_key = entry_key(&self.namespace, partition_id, 1);
+        let end_key = entry_key(&self.namespace, partition_id, before_index);
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let iter = db(&self.store).iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
+        for result in iter {
+            let (key, _value) = result.map_err(|e| rekha_core::RekhaError::Internal {
+                detail: format!("db iteration error: {e}"),
+            })?;
+            if !key.starts_with(&prefix) || key.len() != prefix.len() + 8 {
+                break;
+            }
+            // Stop if we've passed before_index
+            if key.as_ref() > end_key.as_slice() {
+                break;
+            }
+            batch.delete_cf(&cf, &key);
+        }
+        db(&self.store)
+            .write(batch)
+            .map_err(|e| rekha_core::RekhaError::Internal {
+                detail: format!("failed to truncate Raft entries: {e}"),
+            })
     }
 
     /// Helper: create a temp store for testing.

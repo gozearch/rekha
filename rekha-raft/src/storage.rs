@@ -7,12 +7,17 @@ use std::sync::Arc;
 /// Persistent Raft log storage backed by RocksDB.
 ///
 /// Key layout within the `raft_log` column family:
-/// - Entry key:   `[partition_id (8B BE)] [log_index (8B BE)]`
+/// - Entry key:   `[namespace\0] [partition_id (8B BE)] [log_index (8B BE)]`
 /// - Entry value: `bincode(RaftLogEntry)`
-/// - State key:   `[partition_id (8B BE)] [0xFF * 8]`
+/// - State key:   `[namespace\0] [partition_id (8B BE)] [0xFF * 8]`
 /// - State value: `bincode { term: u64, voted_for: Option<String> }`
+///
+/// The `namespace` prefix isolates data for different collections within
+/// the same RocksDB instance. When `namespace` is `None`, the format is
+/// backward-compatible with single-collection keys.
 pub struct RaftLogStore {
     store: Arc<RocksVectorStore>,
+    namespace: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -25,33 +30,61 @@ fn db(store: &RocksVectorStore) -> &DBWithThreadMode<rocksdb::MultiThreaded> {
     store.db().as_ref()
 }
 
-fn state_key(partition_id: u64) -> Vec<u8> {
-    let mut key = partition_id.to_be_bytes().to_vec();
+fn namespace_prefix(namespace: &Option<String>) -> Vec<u8> {
+    match namespace {
+        Some(ns) => {
+            let mut buf = Vec::with_capacity(ns.len() + 1);
+            buf.extend_from_slice(ns.as_bytes());
+            buf.push(0);
+            buf
+        }
+        None => Vec::new(),
+    }
+}
+
+fn state_key(namespace: &Option<String>, partition_id: u64) -> Vec<u8> {
+    let mut key = namespace_prefix(namespace);
+    key.extend_from_slice(&partition_id.to_be_bytes());
     key.extend_from_slice(&u64::MAX.to_be_bytes());
     key
 }
 
-fn entry_key(partition_id: u64, index: u64) -> Vec<u8> {
-    let mut key = partition_id.to_be_bytes().to_vec();
+fn entry_key(namespace: &Option<String>, partition_id: u64, index: u64) -> Vec<u8> {
+    let mut key = namespace_prefix(namespace);
+    key.extend_from_slice(&partition_id.to_be_bytes());
     key.extend_from_slice(&index.to_be_bytes());
     key
 }
 
-fn entry_prefix(partition_id: u64) -> Vec<u8> {
-    partition_id.to_be_bytes().to_vec()
+fn entry_prefix(namespace: &Option<String>, partition_id: u64) -> Vec<u8> {
+    let mut key = namespace_prefix(namespace);
+    key.extend_from_slice(&partition_id.to_be_bytes());
+    key
 }
 
 impl Clone for RaftLogStore {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            namespace: self.namespace.clone(),
         }
     }
 }
 
 impl RaftLogStore {
     pub fn new(store: Arc<RocksVectorStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            namespace: None,
+        }
+    }
+
+    /// Create with a namespace prefix for collection isolation.
+    pub fn with_namespace(store: Arc<RocksVectorStore>, namespace: String) -> Self {
+        Self {
+            store,
+            namespace: Some(namespace),
+        }
     }
 
     /// Persist a single log entry.
@@ -60,7 +93,7 @@ impl RaftLogStore {
         partition_id: u64,
         entry: &RaftLogEntry,
     ) -> Result<(), rekha_core::RekhaError> {
-        let key = entry_key(partition_id, entry.index);
+        let key = entry_key(&self.namespace, partition_id, entry.index);
         let value = bincode::serialize(entry).map_err(|e| rekha_core::RekhaError::Internal {
             detail: format!("failed to serialize Raft entry: {e}"),
         })?;
@@ -89,7 +122,7 @@ impl RaftLogStore {
         })?;
         let mut batch = rocksdb::WriteBatch::default();
         for entry in entries {
-            let key = entry_key(partition_id, entry.index);
+            let key = entry_key(&self.namespace, partition_id, entry.index);
             let value =
                 bincode::serialize(entry).map_err(|e| rekha_core::RekhaError::Internal {
                     detail: format!("failed to serialize Raft entry: {e}"),
@@ -114,8 +147,8 @@ impl RaftLogStore {
                 detail: "raft_log column family not found".into(),
             }
         })?;
-        let prefix = entry_prefix(partition_id);
-        let from_key = entry_key(partition_id, from_index);
+        let prefix = entry_prefix(&self.namespace, partition_id);
+        let from_key = entry_key(&self.namespace, partition_id, from_index);
         let mut entries = Vec::new();
         let iter = db(&self.store).iterator_cf(
             &cf,
@@ -144,7 +177,7 @@ impl RaftLogStore {
                 detail: "raft_log column family not found".into(),
             }
         })?;
-        let prefix = entry_prefix(partition_id);
+        let prefix = entry_prefix(&self.namespace, partition_id);
         let mut start = prefix.clone();
         start.extend_from_slice(&u64::MAX.to_be_bytes());
         let iter = db(&self.store).iterator_cf(
@@ -170,7 +203,7 @@ impl RaftLogStore {
                 detail: "raft_log column family not found".into(),
             }
         })?;
-        let prefix = entry_prefix(partition_id);
+        let prefix = entry_prefix(&self.namespace, partition_id);
         let mut start = prefix.clone();
         start.extend_from_slice(&u64::MAX.to_be_bytes());
         let iter = db(&self.store).iterator_cf(
@@ -203,8 +236,8 @@ impl RaftLogStore {
                 detail: "raft_log column family not found".into(),
             }
         })?;
-        let prefix = entry_prefix(partition_id);
-        let from_key = entry_key(partition_id, from_index);
+        let prefix = entry_prefix(&self.namespace, partition_id);
+        let from_key = entry_key(&self.namespace, partition_id, from_index);
         let mut batch = rocksdb::WriteBatch::default();
         let iter = db(&self.store).iterator_cf(
             &cf,
@@ -233,7 +266,7 @@ impl RaftLogStore {
         term: u64,
         voted_for: Option<&str>,
     ) -> Result<(), rekha_core::RekhaError> {
-        let key = state_key(partition_id);
+        let key = state_key(&self.namespace, partition_id);
         let state = PersistedState {
             term,
             voted_for: voted_for.map(|s| s.to_string()),
@@ -258,7 +291,7 @@ impl RaftLogStore {
         &self,
         partition_id: u64,
     ) -> Result<(u64, Option<String>), rekha_core::RekhaError> {
-        let key = state_key(partition_id);
+        let key = state_key(&self.namespace, partition_id);
         let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
             rekha_core::RekhaError::Internal {
                 detail: "raft_log column family not found".into(),
@@ -298,7 +331,7 @@ impl RaftLogStore {
                 detail: "raft_log column family not found".into(),
             }
         })?;
-        let prefix = entry_prefix(partition_id);
+        let prefix = entry_prefix(&self.namespace, partition_id);
         let mut count = 0u64;
         let iter = db(&self.store).iterator_cf(
             &cf,

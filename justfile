@@ -37,3 +37,29 @@ check:
 # Run a specific test by name
 test-name name:
     cargo test $(name) --workspace --exclude rekha-bench
+
+# ── Docker ────────────────────────────────────────────────
+
+# Build Docker image
+docker-build:
+    docker build -t rekha:latest .
+
+# Start 3-node cluster
+docker-up:
+    docker compose up -d
+
+# Stop cluster
+docker-down:
+    docker compose down
+
+# Stop cluster and delete volumes
+docker-down-clean:
+    docker compose down -v
+
+# Follow logs from all nodes
+docker-logs:
+    docker compose logs -f
+
+# Execute a rekha command on a specific node
+docker-exec node cmd:
+    docker compose exec {{node}} rekha {{cmd}}

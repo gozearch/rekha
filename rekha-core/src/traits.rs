@@ -1,6 +1,5 @@
 use crate::error::RekhaError;
-use crate::types::{NodeInfo, SearchParams, SearchStats};
-use async_trait::async_trait;
+use crate::types::SearchParams;
 
 /// The core vector index trait.
 /// Implementations: VamanaGraph, (future) HNSW, Flat.
@@ -61,30 +60,14 @@ pub trait PartitionStrategy: Send + Sync {
     fn num_vector_shards(&self) -> u64;
 }
 
-/// The distributed coordinator — routes queries and manages cluster state.
-#[async_trait]
-pub trait Coordinator: Send + Sync {
-    /// Execute a search across all relevant partitions and merge results.
-    async fn search(
-        &self,
-        query: Vec<f32>,
-        k: usize,
-        params: SearchParams,
-    ) -> Result<(Vec<crate::ScoredPoint>, SearchStats), RekhaError>;
-
-    /// Insert a vector into the appropriate partition.
-    async fn insert(
-        &self,
-        id: u64,
-        vector: Vec<f32>,
-        payload: Option<crate::Payload>,
-    ) -> Result<(), RekhaError>;
-
-    /// Get cluster topology.
-    async fn topology(&self) -> Result<crate::ClusterTopology, RekhaError>;
-
-    /// Get health info for a specific node.
-    async fn node_info(&self, node_id: &str) -> Result<NodeInfo, RekhaError>;
+/// A handle for pushing recent inserts to an index buffer.
+/// Used by RaftNode to notify the index about committed inserts.
+/// Avoids circular dependency between rekha-raft and rekha-index.
+pub trait IndexBufferHandle: Send + Sync {
+    /// Push a committed insert to the index buffer for immediate searchability.
+    fn buffer_insert(&self, id: u64, vector: Vec<f32>);
+    /// Mark committed deletes in the index buffer.
+    fn buffer_delete(&self, ids: &[u64]);
 }
 
 /// Storage backend trait for persisting vectors and metadata.

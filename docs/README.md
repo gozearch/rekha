@@ -9,11 +9,12 @@ Rekha is a distributed vector database built in Rust, designed for billion-scale
 ## Table of Contents
 
 1. [Quick Start (Local Dev)](#1-quick-start-local-dev)
-2. [Production Deployment](#2-production-deployment)
-3. [Configuration Reference](#3-configuration-reference)
-4. [CLI Reference](#4-cli-reference)
-5. [Client SDKs](#5-client-sdks)
-6. [Development Guide](#6-development-guide)
+2. [Docker Cluster](#2-docker-cluster)
+3. [Production Deployment](#3-production-deployment)
+4. [Configuration Reference](#4-configuration-reference)
+5. [CLI Reference](#5-cli-reference)
+6. [Client SDKs](#6-client-sdks)
+7. [Development Guide](#7-development-guide)
 
 ---
 
@@ -35,10 +36,7 @@ cargo build --release
 
 ### Run a Single-Node Server
 
-The server is currently a library crate. You can run it by adding a thin binary or using the CLI with a `server` subcommand once wired. For now, create a run script:
-
 ```bash
-# examples/run_dev.rs — or add to rekha-cli as `rekha server --config`
 cargo run --bin rekha -- server --config config.yaml
 ```
 
@@ -122,7 +120,86 @@ cargo test --workspace   # Same as above, without `just`
 
 ---
 
-## 2. Production Deployment
+## 2. Docker Cluster
+
+A 3-node Rekha cluster can be started locally with Docker Compose. Each node
+runs in its own container with a dedicated data volume.
+
+### Prerequisites
+
+- Docker Engine 24+
+- Docker Compose v2
+
+### Build & Start
+
+```bash
+# Build the image and start the 3-node cluster
+docker compose up -d
+
+# Wait for Raft elections to converge (~30s)
+docker compose logs -f
+```
+
+The cluster topology:
+
+| Container | Host Port | Node ID | Data Volume |
+|---|---|---|---|
+| `rekha-node-1` | `:50051` | `node-1` | `rekha-data-1` |
+| `rekha-node-2` | `:50052` | `node-2` | `rekha-data-2` |
+| `rekha-node-3` | `:50053` | `node-3` | `rekha-data-3` |
+
+### Insert & Search
+
+```bash
+# Insert a vector via node-1
+echo "0.1 0.2 0.3 0.4" | docker compose exec -T node-1 rekha insert 1
+
+# Insert via node-2
+echo "0.4 0.3 0.2 0.1" | docker compose exec -T node-2 rekha insert 2
+
+# Search via node-3
+echo "0.1 0.2 0.3 0.4" | docker compose exec -T node-3 rekha search -k 10
+
+# Check cluster health
+docker compose exec node-1 rekha health
+docker compose exec node-1 rekha info
+```
+
+### Configuration
+
+Config files: `docker/node-{1,2,3}.yaml`. All three share:
+
+- **Partitioning**: 6 vector shards, replication factor 3, 4 dim groups of 64
+- **Index**: Vamana with graph_degree 64, PQ sub-vectors 64
+- **Raft**: 100ms heartbeat, 300–500ms election timeout
+- **TLS**: disabled (plaintext inter-node)
+
+They differ only in `cluster.node_id`.
+
+### Tear Down
+
+```bash
+# Stop containers (preserves volumes)
+docker compose down
+
+# Stop containers and delete all data
+docker compose down -v
+```
+
+### Justfile Commands
+
+```bash
+just docker-build       # Build Docker image
+just docker-up          # Start cluster
+just docker-down        # Stop cluster
+just docker-down-clean  # Stop cluster + delete volumes
+just docker-logs        # Follow logs
+just docker-exec n cmd  # Run command on node
+```
+
+---
+
+## 3. Production Deployment
 
 ### Topology Design
 
@@ -235,7 +312,7 @@ For live backup, use RocksDB's `Checkpoint` API (see `RocksVectorStore::create_c
 
 ---
 
-## 3. Configuration Reference
+## 4. Configuration Reference
 
 > **Full reference**: See [`config.md`](config.md) for the complete configuration
 > documentation, including every field, its default, type constraints, sizing
@@ -286,7 +363,7 @@ observability:
 
 ---
 
-## 4. CLI Reference
+## 5. CLI Reference
 
 The `rekha` binary provides admin commands for interacting with the cluster.
 
@@ -383,7 +460,7 @@ echo "0.1 0.2 0.3" | rekha --tls --ca-cert /etc/rekha/certs/ca.crt search -k 10
 
 ---
 
-## 5. Client SDKs
+## 6. Client SDKs
 
 ### Rust SDK
 
@@ -484,7 +561,7 @@ with RekhaClient.connect(["localhost:50051"]) as client:
 
 ---
 
-## 6. Development Guide
+## 7. Development Guide
 
 ### Crate Map
 

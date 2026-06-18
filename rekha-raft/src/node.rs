@@ -1,6 +1,6 @@
 use crate::state::{RaftCommand, ReplicatedState};
 use crate::storage::RaftLogStore;
-use rekha_core::{RaftError, RekhaError};
+use rekha_core::{IndexBufferHandle, RaftError, RekhaError};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +31,8 @@ pub struct RaftNode {
     raft_state: Arc<Mutex<RaftInternalState>>,
     /// Persistent log storage (optional — empty for tests).
     store: Option<RaftLogStore>,
+    /// Handle to notify the index about committed inserts (optional).
+    index_handle: Option<Arc<dyn IndexBufferHandle>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +71,7 @@ impl RaftNode {
         peers: Vec<String>,
         state: ReplicatedState,
     ) -> Self {
-        Self::with_store(node_id, partition_id, peers, state, None)
+        Self::with_store(node_id, partition_id, peers, state, None, None)
     }
 
     /// Create a new Raft node with persistent storage.
@@ -79,6 +81,7 @@ impl RaftNode {
         peers: Vec<String>,
         state: ReplicatedState,
         store: Option<RaftLogStore>,
+        index_handle: Option<Arc<dyn IndexBufferHandle>>,
     ) -> Self {
         // Load persisted log entries and state into memory.
         let (current_term, voted_for, log_entries) = if let Some(ref s) = store {
@@ -107,6 +110,7 @@ impl RaftNode {
                 last_activity: Instant::now(),
             })),
             store,
+            index_handle,
         }
     }
 
@@ -142,6 +146,22 @@ impl RaftNode {
 
     pub async fn leader_id(&self) -> Option<String> {
         self.raft_state.lock().await.leader_id.clone()
+    }
+
+    /// Get all vectors from the replicated state.
+    pub async fn all_vectors(&self) -> Vec<(u64, Vec<f32>)> {
+        let state = self.state.read().await;
+        state
+            .vectors
+            .iter()
+            .map(|(id, bytes)| {
+                let vec: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                (*id, vec)
+            })
+            .collect()
     }
 
     pub async fn is_leader(&self) -> bool {
@@ -231,6 +251,9 @@ impl RaftNode {
             drop(state);
             drop(log);
 
+            // Notify the index about the committed command.
+            self.notify_index(&cmd);
+
             let mut rs = self.raft_state.lock().await;
             rs.commit_index = index;
             rs.last_applied = index;
@@ -266,19 +289,31 @@ impl RaftNode {
             self.node_id, term, self.partition_id
         );
 
-        // For simplicity: self-elect in a single-node setup.
-        // Multi-node: send RequestVote RPCs to all peers.
+        // Single-node: self-elect immediately.
+        // Multi-node: stay as Candidate — the server layer collects votes.
         if self.peers.is_empty() {
             raft_state.role = RaftRole::Leader;
             raft_state.leader_id = Some(self.node_id.clone());
             info!("Node {} elected as leader for term {}", self.node_id, term);
-            Ok(())
         } else {
-            // In multi-node, we'd need votes from majority.
-            // Here we just become candidate (incomplete — need gRPC calls).
-            warn!("Multi-node election not fully implemented — staying as candidate");
-            Ok(())
+            info!(
+                "Node {} became candidate for term {} (partition {}), awaiting votes",
+                self.node_id, term, self.partition_id
+            );
         }
+        Ok(())
+    }
+
+    /// Transition from Candidate to Leader after winning an election.
+    /// Called by the server layer after collecting majority votes.
+    pub async fn become_leader(&self) {
+        let mut rs = self.raft_state.lock().await;
+        rs.role = RaftRole::Leader;
+        rs.leader_id = Some(self.node_id.clone());
+        info!(
+            "Node {} became leader for term {} (partition {})",
+            self.node_id, rs.current_term, self.partition_id
+        );
     }
 
     /// Handle an AppendEntries RPC from a leader.
@@ -449,9 +484,30 @@ impl RaftNode {
         for entry in log.iter() {
             if entry.index <= index && entry.index > state.last_applied {
                 entry.command.apply(&mut state);
+                self.notify_index(&entry.command);
                 state.last_applied = entry.index;
             }
         }
+    }
+
+    /// Notify the index handle about a committed command.
+    fn notify_index(&self, cmd: &RaftCommand) {
+        if let Some(ref handle) = self.index_handle {
+            match cmd {
+                RaftCommand::Insert { id, vector, .. } => {
+                    handle.buffer_insert(*id, vector.clone());
+                }
+                RaftCommand::Delete { ids } => {
+                    handle.buffer_delete(ids);
+                }
+                RaftCommand::NoOp => {}
+            }
+        }
+    }
+
+    /// Set the index buffer handle after construction.
+    pub fn set_index_handle(&mut self, handle: Arc<dyn IndexBufferHandle>) {
+        self.index_handle = Some(handle);
     }
 }
 

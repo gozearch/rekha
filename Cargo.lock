@@ -1488,6 +1488,7 @@ dependencies = [
  "clap",
  "rekha-client",
  "rekha-core",
+ "rekha-server",
  "serde_json",
  "tokio",
  "tracing",

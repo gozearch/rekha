@@ -1,19 +1,19 @@
-use rekha_core::{
-    Coordinator as CoordinatorTrait, NodeInfo, NodeStatus, Payload, RekhaError, SearchParams,
-    VectorStoreBackend,
-};
+use rekha_core::{NodeInfo, NodeStatus, Payload, RekhaError, SearchParams, VectorStoreBackend};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::coordinator::Coordinator;
 use crate::proto::{
-    self, rekha_server::Rekha, AppendEntriesRequest, DeleteRequest, DeleteResponse, FetchRequest,
-    FetchResponse, HandshakeRequest, HandshakeResponse, HeartbeatRequest, HeartbeatResponse,
-    InsertBatchResponse, InsertRequest, InsertResponse, RaftAck, RaftSnapshotChunk,
-    RaftVoteRequest, RaftVoteResponse, ScoredPoint, SearchRequest, SearchResponse, TransferRequest,
-    TransferResponse,
+    self, rekha_server::Rekha, AppendEntriesRequest, CollectionExistsRequest,
+    CollectionExistsResponse, CreateCollectionRequest, CreateCollectionResponse, DeleteRequest,
+    DeleteResponse, DropCollectionRequest, DropCollectionResponse, FetchRequest, FetchResponse,
+    HandshakeRequest, HandshakeResponse, HeartbeatRequest, HeartbeatResponse, InsertBatchResponse,
+    InsertRequest, InsertResponse, ListCollectionsRequest, ListCollectionsResponse, RaftAck,
+    RaftSnapshotChunk, RaftVoteRequest, RaftVoteResponse, ScoredPoint, SearchRequest,
+    SearchResponse, TransferRequest, TransferResponse,
 };
+use rekha_core::RaftError;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// gRPC service implementation for the Rekha distributed vector database.
@@ -61,13 +61,25 @@ impl Rekha for RekhaService {
             data: p.data,
         });
 
-        self.coordinator
-            .insert(req.id, req.vector, payload)
-            .await
-            .map_err(Self::map_error)?;
+        let result = self.coordinator.insert(req.id, req.vector, payload).await;
+        if let Err(ref e) = result {
+            if let RekhaError::Consensus(RaftError::NotLeader {
+                leader_hint: Some(leader_id),
+            }) = e
+            {
+                let addr = self.coordinator.peer_address(leader_id).await;
+                let detail = match addr {
+                    Some(a) => format!("not leader, try {leader_id}@{a}"),
+                    None => format!("not leader, try {leader_id}"),
+                };
+                return Err(Status::failed_precondition(detail));
+            }
+            return Err(Self::map_error(e.clone()));
+        }
+        let actual_id = result.unwrap();
 
         Ok(Response::new(InsertResponse {
-            id: req.id,
+            id: actual_id,
             success: true,
             error: String::new(),
         }))
@@ -92,7 +104,7 @@ impl Rekha for RekhaService {
             });
 
             match self.coordinator.insert(item.id, item.vector, payload).await {
-                Ok(()) => count += 1,
+                Ok(_actual_id) => count += 1,
                 Err(e) => errors.push(format!("id {}: {}", item.id, e)),
             }
         }
@@ -173,6 +185,7 @@ impl Rekha for RekhaService {
             beam_width: params.beam_width as usize,
             include_payloads: params.include_payloads,
             partition_hint: params.partition_hint,
+            local_only: req.local_only,
         };
 
         match self
@@ -222,6 +235,7 @@ impl Rekha for RekhaService {
             beam_width: params.beam_width as usize,
             include_payloads: params.include_payloads,
             partition_hint: params.partition_hint,
+            local_only: req.local_only,
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
@@ -229,7 +243,7 @@ impl Rekha for RekhaService {
 
         tokio::spawn(async move {
             match coordinator
-                .search(req.query_vector, req.top_k as usize, search_params)
+                .search(req.query_vector, req.top_k as usize, search_params.clone())
                 .await
             {
                 Ok((results, _stats)) => {
@@ -313,7 +327,7 @@ impl Rekha for RekhaService {
         // Register/update the sender.
         let peer_info = NodeInfo {
             node_id: req.node_id.clone(),
-            address: String::new(), // heartbeat doesn't carry address; use stored or skip
+            address: req.address.clone(),
             partition_id: 0,
             dim_groups: Vec::new(),
             is_leader: false,
@@ -403,13 +417,12 @@ impl Rekha for RekhaService {
     ) -> Result<Response<RaftVoteResponse>, Status> {
         let req = request.into_inner();
 
-        // The vote request doesn't carry partition_id in the proto message.
-        // For now, use partition 0 (single-partition assumption).
-        // In a multi-partition setup, the partition_id would need to be in the message.
         let raft_node = self
             .coordinator
-            .raft_node(0)
-            .ok_or_else(|| Status::not_found("no raft node for partition 0"))?;
+            .raft_node(req.partition_id)
+            .ok_or_else(|| {
+                Status::not_found(format!("no raft node for partition {}", req.partition_id))
+            })?;
 
         match raft_node
             .handle_request_vote(
@@ -435,6 +448,42 @@ impl Rekha for RekhaService {
             commit_index: 0,
             error: String::new(),
         }))
+    }
+
+    // ── Collection Management ──────────────────────────────────
+
+    async fn create_collection(
+        &self,
+        _request: Request<CreateCollectionRequest>,
+    ) -> Result<Response<CreateCollectionResponse>, Status> {
+        Err(Status::unimplemented(
+            "create_collection not yet implemented",
+        ))
+    }
+
+    async fn drop_collection(
+        &self,
+        _request: Request<DropCollectionRequest>,
+    ) -> Result<Response<DropCollectionResponse>, Status> {
+        Err(Status::unimplemented("drop_collection not yet implemented"))
+    }
+
+    async fn list_collections(
+        &self,
+        _request: Request<ListCollectionsRequest>,
+    ) -> Result<Response<ListCollectionsResponse>, Status> {
+        Err(Status::unimplemented(
+            "list_collections not yet implemented",
+        ))
+    }
+
+    async fn collection_exists(
+        &self,
+        _request: Request<CollectionExistsRequest>,
+    ) -> Result<Response<CollectionExistsResponse>, Status> {
+        Err(Status::unimplemented(
+            "collection_exists not yet implemented",
+        ))
     }
 }
 
@@ -560,6 +609,7 @@ mod tests {
                 content_type: "raw".into(),
                 data: vec![0, 1, 2],
             }),
+            collection_name: String::new(),
         };
         let proto_cmd = crate::proto::RaftCommand {
             cmd: Some(crate::proto::raft_command::Cmd::Insert(insert)),
@@ -581,7 +631,10 @@ mod tests {
 
     #[test]
     fn test_proto_raft_command_delete() {
-        let delete = crate::proto::DeleteRequest { ids: vec![1, 2, 3] };
+        let delete = crate::proto::DeleteRequest {
+            ids: vec![1, 2, 3],
+            collection_name: String::new(),
+        };
         let proto_cmd = crate::proto::RaftCommand {
             cmd: Some(crate::proto::raft_command::Cmd::Delete(delete)),
         };
@@ -619,6 +672,7 @@ mod tests {
                 content_type: "raw".into(),
                 data: vec![], // empty payload should become None
             }),
+            collection_name: String::new(),
         };
         let proto_cmd = crate::proto::RaftCommand {
             cmd: Some(crate::proto::raft_command::Cmd::Insert(insert)),

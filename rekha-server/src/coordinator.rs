@@ -1,7 +1,6 @@
-use async_trait::async_trait;
 use rekha_core::{
-    ClusterTopology, Coordinator as CoordinatorTrait, DistanceMetric, NodeInfo, NodeStatus,
-    Payload, RekhaError, ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
+    ClusterTopology, DistanceMetric, IndexBufferHandle, NodeInfo, NodeStatus, Payload, RekhaError,
+    ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
 };
 use rekha_index::RekhaIndex;
 use rekha_partition::PartitionManager;
@@ -11,6 +10,7 @@ use rekha_storage::RocksVectorStore;
 use dashmap::DashMap;
 use rekha_client::RekhaClient as PeerRekhaClient;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -35,10 +35,11 @@ struct PeerClient {
     client: PeerRekhaClient,
     last_used: Instant,
     error_count: u64,
+    collection_name: String,
 }
 
 impl PeerClient {
-    async fn connect(info: &NodeInfo) -> Result<Self, RekhaError> {
+    async fn connect(info: &NodeInfo, collection_name: &str) -> Result<Self, RekhaError> {
         let seeds = vec![info.address.clone()];
         let client = PeerRekhaClient::connect(&seeds).await?;
         Ok(Self {
@@ -46,6 +47,7 @@ impl PeerClient {
             client,
             last_used: Instant::now(),
             error_count: 0,
+            collection_name: collection_name.to_string(),
         })
     }
 
@@ -57,7 +59,7 @@ impl PeerClient {
     ) -> Result<(Vec<ScoredPoint>, SearchStats), RekhaError> {
         self.last_used = Instant::now();
         self.client
-            .search_with_params(query.to_vec(), k, params.clone())
+            .search_with_params(query.to_vec(), &self.collection_name, k, params.clone())
             .await
     }
 }
@@ -65,12 +67,14 @@ impl PeerClient {
 /// Pool of gRPC clients to known peer nodes.
 pub(crate) struct PeerPool {
     clients: HashMap<String, PeerClient>,
+    collection_name: String,
 }
 
 impl PeerPool {
-    pub fn new() -> Self {
+    pub fn new(collection_name: &str) -> Self {
         Self {
             clients: HashMap::new(),
+            collection_name: collection_name.to_string(),
         }
     }
 
@@ -85,7 +89,7 @@ impl PeerPool {
         // Connect to new or reconnecting peers.
         for info in peers {
             if !self.clients.contains_key(&info.node_id) {
-                match PeerClient::connect(info).await {
+                match PeerClient::connect(info, &self.collection_name).await {
                     Ok(client) => {
                         info!("Connected to peer {} at {}", info.node_id, info.address);
                         self.clients.insert(info.node_id.clone(), client);
@@ -106,6 +110,8 @@ impl PeerPool {
         k: usize,
         params: &SearchParams,
     ) -> (Vec<ScoredPoint>, SearchStats) {
+        let mut peer_params = params.clone();
+        peer_params.local_only = true;
         let mut all_candidates: Vec<ScoredPoint> = Vec::new();
         let mut stats = SearchStats::default();
         let mut nodes_contacted = 0u32;
@@ -113,7 +119,7 @@ impl PeerPool {
         let node_ids: Vec<String> = self.clients.keys().cloned().collect();
         for node_id in &node_ids {
             if let Some(client) = self.clients.get_mut(node_id) {
-                match client.try_search(query, k, params).await {
+                match client.try_search(query, k, &peer_params).await {
                     Ok((candidates, _peer_stats)) => {
                         nodes_contacted += 1;
                         all_candidates.extend(candidates);
@@ -177,6 +183,9 @@ pub struct Coordinator {
     peers: Arc<RwLock<HashMap<String, PeerState>>>,
     /// gRPC client pool for peer nodes.
     peer_pool: Arc<RwLock<PeerPool>>,
+    /// Auto-incrementing ID counter. Initialized from max stored ID + 1.
+    /// When the client sends id=0, we replace it with next_auto_id.fetch_add(1).
+    next_auto_id: AtomicU64,
 }
 
 impl Coordinator {
@@ -186,6 +195,7 @@ impl Coordinator {
         store: Arc<RocksVectorStore>,
         partition_manager: Arc<RwLock<PartitionManager>>,
     ) -> Self {
+        let starting_id = Self::starting_auto_id(&store);
         Self {
             config,
             index: Arc::new(RwLock::new(None)),
@@ -199,21 +209,104 @@ impl Coordinator {
             })),
             initialized: Arc::new(RwLock::new(false)),
             peers: Arc::new(RwLock::new(HashMap::new())),
-            peer_pool: Arc::new(RwLock::new(PeerPool::new())),
+            peer_pool: Arc::new(RwLock::new(PeerPool::new("default"))),
+            next_auto_id: AtomicU64::new(starting_id),
+        }
+    }
+
+    /// Compute the starting auto-ID by scanning all stored IDs and taking max+1.
+    fn starting_auto_id(store: &RocksVectorStore) -> u64 {
+        match store.iter_ids() {
+            Ok(ids) => ids.iter().max().copied().unwrap_or(0) + 1,
+            Err(_) => 1,
         }
     }
 
     /// Initialize the coordinator with an index.
     pub async fn initialize(&self, index: RekhaIndex) {
-        let mut idx = self.index.write().await;
-        *idx = Some(index);
+        {
+            let mut idx = self.index.write().await;
+            *idx = Some(index);
+        }
         *self.initialized.write().await = true;
+
+        // Rehydrate insert buffer from Raft state (crash recovery).
+        let _ = self.recover_index_buffer().await;
+
+        // Spawn background flush loop.
+        self.spawn_flush_loop();
         info!("Coordinator initialized");
+    }
+
+    /// Recover the insert buffer from Raft-replicated state after restart.
+    async fn recover_index_buffer(&self) -> Result<(), RekhaError> {
+        let mut idx = self.index.write().await;
+        let index = idx.as_mut().ok_or_else(|| RekhaError::Internal {
+            detail: "index not initialized for recovery".into(),
+        })?;
+
+        let mut recovered = 0usize;
+        for item in self.raft_nodes.iter() {
+            let raft_node = item.value();
+            let state = raft_node.read_state().await;
+            for (id, bytes) in state.vectors.iter() {
+                if index.graph_contains_id(*id) {
+                    continue; // Already in the graph
+                }
+                let vec: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                index.buffer_insert(*id, vec);
+                recovered += 1;
+            }
+        }
+
+        if recovered > 0 {
+            info!("Recovered {recovered} vectors into insert buffer from Raft state");
+            // Flush immediately if buffer exceeds threshold
+            if index.should_flush() {
+                index.flush_buffer()?;
+                info!("Immediate flush after recovery ({recovered} vectors)");
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn a background task that periodically flushes the insert buffer.
+    fn spawn_flush_loop(&self) {
+        let flush_ms = self.config.index.insert_buffer_flush_interval_ms;
+        let index = self.index.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(flush_ms));
+            loop {
+                interval.tick().await;
+                let mut idx = index.write().await;
+                if let Some(ref mut idx) = *idx {
+                    if idx.should_flush() || idx.buffer_len() > 0 {
+                        let buf_len = idx.buffer_len();
+                        if let Err(e) = idx.flush_buffer() {
+                            tracing::warn!("Buffer flush failed: {e} (buffer: {buf_len} vectors)");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Check if initialized.
     pub async fn is_initialized(&self) -> bool {
         *self.initialized.read().await
+    }
+
+    /// Look up a peer's address by node ID.
+    pub async fn peer_address(&self, node_id: &str) -> Option<String> {
+        self.peers
+            .read()
+            .await
+            .get(node_id)
+            .map(|p| p.info.address.clone())
     }
 
     /// Get node info for this node.
@@ -358,9 +451,26 @@ impl Coordinator {
     }
 }
 
-#[async_trait]
-impl CoordinatorTrait for Coordinator {
-    async fn search(
+impl IndexBufferHandle for Coordinator {
+    fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
+        if let Ok(idx) = self.index.try_read() {
+            if let Some(ref idx) = *idx {
+                idx.buffer_insert(id, vector);
+            }
+        }
+    }
+
+    fn buffer_delete(&self, ids: &[u64]) {
+        if let Ok(idx) = self.index.try_read() {
+            if let Some(ref idx) = *idx {
+                idx.buffer_delete(ids);
+            }
+        }
+    }
+}
+
+impl Coordinator {
+    pub async fn search(
         &self,
         query: Vec<f32>,
         k: usize,
@@ -424,10 +534,12 @@ impl CoordinatorTrait for Coordinator {
             }
         }
 
-        // Phase 2: Fan out to peer nodes if available.
-        let peer_count = {
-            let pool = self.peer_pool.read().await;
-            if !pool.is_empty() {
+        // Phase 2: Fan out to peer nodes if available (skip for local-only searches).
+        let peer_count = if params.local_only {
+            0
+        } else {
+            let has_peers = { !self.peer_pool.read().await.is_empty() };
+            if has_peers {
                 let mut pool = self.peer_pool.write().await;
                 let (peer_results, peer_stats) = pool.search_fan_out(&query, k, &params).await;
                 stats.nodes_contacted = local_groups + peer_stats.nodes_contacted;
@@ -463,12 +575,18 @@ impl CoordinatorTrait for Coordinator {
         Ok((candidates, stats))
     }
 
-    async fn insert(
+    pub async fn insert(
         &self,
         id: u64,
         vector: Vec<f32>,
         payload: Option<Payload>,
-    ) -> Result<(), RekhaError> {
+    ) -> Result<u64, RekhaError> {
+        let id = if id == 0 {
+            self.next_auto_id.fetch_add(1, Ordering::SeqCst)
+        } else {
+            id
+        };
+
         // Route through Raft if a Raft node exists for partition 0.
         if let Some(raft_node) = self.raft_node(0) {
             let cmd = rekha_raft::state::RaftCommand::Insert {
@@ -476,7 +594,8 @@ impl CoordinatorTrait for Coordinator {
                 vector,
                 payload: payload.map(|p| p.data),
             };
-            return raft_node.propose(cmd).await;
+            raft_node.propose(cmd).await?;
+            return Ok(id);
         }
 
         // Fallback: direct store write (single-node / uninitialized).
@@ -484,16 +603,22 @@ impl CoordinatorTrait for Coordinator {
         if let Some(ref p) = payload {
             self.store.put_payload(id, &p.data)?;
         }
-        Ok(())
+        Ok(id)
     }
 
-    async fn topology(&self) -> Result<ClusterTopology, RekhaError> {
+    pub async fn topology(&self) -> Result<ClusterTopology, RekhaError> {
         let topo = self.topology.read().await;
         Ok(topo.clone())
     }
 
-    async fn node_info(&self, _node_id: &str) -> Result<NodeInfo, RekhaError> {
+    pub async fn node_info(&self, _node_id: &str) -> Result<NodeInfo, RekhaError> {
         Ok(self.local_node_info())
+    }
+
+    pub async fn build_index(&self) -> Result<(), RekhaError> {
+        Err(RekhaError::Unavailable {
+            detail: "build_index is deprecated; index builds automatically".into(),
+        })
     }
 }
 
@@ -843,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_pool_new_empty() {
-        let pool = PeerPool::new();
+        let pool = PeerPool::new("default");
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
     }

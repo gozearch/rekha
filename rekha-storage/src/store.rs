@@ -15,9 +15,14 @@ const CF_RAFT_LOG: &str = "raft_log";
 /// - `payloads`: user payloads (JSON/text) indexed by ID
 /// - `metadata`: cluster config, PQ centroids, index stats
 /// - `raft_log`: Raft WAL entries for replication
+///
+/// Supports optional key namespacing: when `namespace` is set, all keys are
+/// prefixed with `{namespace}\0` to isolate data for different collections
+/// within the same RocksDB instance.
 #[derive(Clone)]
 pub struct RocksVectorStore {
     db: Arc<DBWithThreadMode<MultiThreaded>>,
+    namespace: Option<String>,
     max_payload_size: usize,
 }
 
@@ -48,8 +53,29 @@ impl RocksVectorStore {
 
         Ok(Self {
             db: Arc::new(db),
+            namespace: None,
             max_payload_size: 1024 * 1024,
         })
+    }
+
+    /// Create a store from an existing RocksDB handle with an optional namespace.
+    pub fn from_db(db: Arc<DBWithThreadMode<MultiThreaded>>, namespace: Option<String>) -> Self {
+        Self {
+            db,
+            namespace,
+            max_payload_size: 1024 * 1024,
+        }
+    }
+
+    /// Set the namespace prefix for key isolation.
+    pub fn with_namespace(mut self, namespace: String) -> Self {
+        self.namespace = Some(namespace);
+        self
+    }
+
+    /// Get the namespace, if any.
+    pub fn get_namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
     }
 
     /// Configure the maximum allowed payload size.
@@ -63,15 +89,36 @@ impl RocksVectorStore {
         &self.db
     }
 
-    /// Encode a u64 ID into a big-endian key for sorted iteration.
-    fn encode_key(id: u64) -> Vec<u8> {
-        id.to_be_bytes().to_vec()
+    /// Encode a u64 ID into a big-endian key, optionally prefixed with namespace.
+    fn encode_key(&self, id: u64) -> Vec<u8> {
+        let ns = self.namespace.as_deref();
+        if let Some(ns) = ns {
+            let mut key = Vec::with_capacity(ns.len() + 1 + 8);
+            key.extend_from_slice(ns.as_bytes());
+            key.push(0);
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        } else {
+            id.to_be_bytes().to_vec()
+        }
     }
 
-    /// Decode a big-endian key back into a u64 ID.
-    fn decode_key(key: &[u8]) -> Option<u64> {
-        if key.len() == 8 {
-            Some(u64::from_be_bytes(key.try_into().ok()?))
+    /// Get the namespace prefix bytes (for iteration seek), if namespaced.
+    fn namespace_prefix(&self) -> Option<Vec<u8>> {
+        self.namespace.as_ref().map(|ns| {
+            let mut prefix = Vec::with_capacity(ns.len() + 2);
+            prefix.extend_from_slice(ns.as_bytes());
+            prefix.push(0);
+            prefix
+        })
+    }
+
+    /// Decode a key back into a u64 ID, handling optional namespace prefix.
+    fn decode_id(key: &[u8]) -> Option<u64> {
+        // Last 8 bytes are always the u64 BE id
+        if key.len() >= 8 {
+            let id_bytes = &key[key.len() - 8..];
+            Some(u64::from_be_bytes(id_bytes.try_into().ok()?))
         } else {
             None
         }
@@ -84,9 +131,49 @@ impl Drop for RocksVectorStore {
     }
 }
 
+impl RocksVectorStore {
+    /// Delete all keys within the current namespace across all column families.
+    pub fn delete_all_in_namespace(&self) -> Result<u64, RekhaError> {
+        let prefix = self
+            .namespace_prefix()
+            .ok_or_else(|| RekhaError::Internal {
+                detail: "delete_all_in_namespace requires a namespace".into(),
+            })?;
+        let mut count = 0u64;
+        for cf_name in &[CF_VECTORS, CF_PAYLOADS] {
+            let cf = self
+                .db
+                .cf_handle(cf_name)
+                .ok_or_else(|| StorageError::ColumnFamily {
+                    name: cf_name.to_string(),
+                    source: "handle not found".into(),
+                })?;
+            let mut batch = rocksdb::WriteBatch::default();
+            let iter = self.db.iterator_cf(
+                &cf,
+                IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            );
+            for result in iter {
+                let (key, _) = result.map_err(|e| RekhaError::Internal {
+                    detail: format!("db iteration error: {e}"),
+                })?;
+                if key.len() < prefix.len() || key[..prefix.len()] != prefix[..] {
+                    break;
+                }
+                batch.delete_cf(&cf, &key);
+                count += 1;
+            }
+            self.db.write(batch).map_err(|e| RekhaError::Internal {
+                detail: format!("failed to delete namespace keys: {e}"),
+            })?;
+        }
+        Ok(count)
+    }
+}
+
 impl VectorStoreBackend for RocksVectorStore {
     fn put_vector(&self, id: u64, data: &[f32]) -> Result<(), RekhaError> {
-        let key = Self::encode_key(id);
+        let key = self.encode_key(id);
         let value = vector_to_bytes(data);
         let cf = self
             .db
@@ -104,7 +191,7 @@ impl VectorStoreBackend for RocksVectorStore {
     }
 
     fn get_vector(&self, id: u64) -> Result<Option<Vec<f32>>, RekhaError> {
-        let key = Self::encode_key(id);
+        let key = self.encode_key(id);
         let cf = self
             .db
             .cf_handle(CF_VECTORS)
@@ -131,7 +218,7 @@ impl VectorStoreBackend for RocksVectorStore {
             }
             .into());
         }
-        let key = Self::encode_key(id);
+        let key = self.encode_key(id);
         let cf = self
             .db
             .cf_handle(CF_PAYLOADS)
@@ -148,7 +235,7 @@ impl VectorStoreBackend for RocksVectorStore {
     }
 
     fn get_payload(&self, id: u64) -> Result<Option<Vec<u8>>, RekhaError> {
-        let key = Self::encode_key(id);
+        let key = self.encode_key(id);
         let cf = self
             .db
             .cf_handle(CF_PAYLOADS)
@@ -189,7 +276,7 @@ impl VectorStoreBackend for RocksVectorStore {
 
         let mut batch = rocksdb::WriteBatch::default();
         for id in ids {
-            let key = Self::encode_key(*id);
+            let key = self.encode_key(*id);
             batch.delete_cf(&cf_vec, &key);
             batch.delete_cf(&cf_pay, &key);
         }
@@ -209,12 +296,26 @@ impl VectorStoreBackend for RocksVectorStore {
                 source: "handle not found".into(),
             })?;
         let mut ids = Vec::new();
-        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+
+        let prefix = self.namespace_prefix();
+        let iter_mode = match &prefix {
+            Some(p) => IteratorMode::From(p, rocksdb::Direction::Forward),
+            None => IteratorMode::Start,
+        };
+        let prefix_len = prefix.as_ref().map(|p| p.len());
+
+        let iter = self.db.iterator_cf(&cf, iter_mode);
         for result in iter {
             let (key, _) = result.map_err(|e| RekhaError::Internal {
                 detail: format!("db iteration error: {e}"),
             })?;
-            if let Some(id) = Self::decode_key(&key) {
+            // If namespaced, skip keys that don't match the prefix.
+            if let Some(plen) = prefix_len {
+                if key.len() < plen || &key[..plen] != prefix.as_ref().unwrap() {
+                    break;
+                }
+            }
+            if let Some(id) = Self::decode_id(&key) {
                 ids.push(id);
             }
         }

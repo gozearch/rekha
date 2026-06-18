@@ -17,6 +17,7 @@ use crate::proto::{
 /// Features:
 /// - Auto-discovers cluster topology from any seed node
 /// - Automatic retry with exponential backoff and jitter on all operations
+/// - Automatic leader redirect — inserts/searches are retried on the correct leader
 /// - Connection pooling for hot connections
 /// - Streaming for bulk operations
 /// - All operations return `Result<T, RekhaError>` — no panics
@@ -27,11 +28,11 @@ use crate::proto::{
 /// # async fn example() -> Result<(), rekha_core::RekhaError> {
 /// let client = rekha_client::RekhaClient::connect(&["localhost:50051".to_string()]).await?;
 ///
-/// // Insert a vector with payload
-/// client.insert(42, vec![0.1, 0.2, 0.3], Some("hello world".into())).await?;
+/// // Insert a vector with payload (returns actual ID — auto-generated if id=0)
+/// let actual_id = client.insert(42, vec![0.1, 0.2, 0.3], "default", Some("hello world".into())).await?;
 ///
 /// // Search for nearest neighbors
-/// let results = client.search(vec![0.1, 0.2, 0.3], 10).await?;
+/// let results = client.search(vec![0.1, 0.2, 0.3], "default", 10).await?;
 /// for r in results {
 ///     println!("id={}, score={}", r.id, r.score);
 /// }
@@ -41,7 +42,7 @@ use crate::proto::{
 #[derive(Debug)]
 pub struct RekhaClient {
     /// gRPC channel (connection pool handled by Tonic).
-    channel: Channel,
+    channel: Arc<RwLock<Channel>>,
     #[allow(dead_code)]
     topology: Arc<RwLock<Option<ClusterTopology>>>,
     /// Client configuration.
@@ -129,7 +130,7 @@ impl RekhaClient {
                 Ok(channel) => {
                     info!("Connected to Rekha cluster via {scheme}://{seed}");
                     return Ok(Self {
-                        channel,
+                        channel: Arc::new(RwLock::new(channel)),
                         topology: Arc::new(RwLock::new(None)),
                         config,
                     });
@@ -186,45 +187,107 @@ impl RekhaClient {
         })
     }
 
+    /// Build a new channel to the given address.
+    async fn build_channel(&self, addr: &str) -> Result<Channel, RekhaError> {
+        let scheme = if self.config.use_tls { "https" } else { "http" };
+        let uri = format!("{scheme}://{addr}");
+        Endpoint::from_shared(uri)
+            .map_err(|e| RekhaError::InvalidArgument(format!("invalid address {addr}: {e}")))?
+            .connect_timeout(self.config.connect_timeout)
+            .timeout(self.config.request_timeout)
+            .connect()
+            .await
+            .map_err(|e| RekhaError::Unavailable {
+                detail: format!("failed to connect to {addr}: {e}"),
+            })
+    }
+
     /// Insert a vector with optional payload.
+    /// Automatically follows leader redirects.
     pub async fn insert(
         &self,
         id: u64,
         vector: Vec<f32>,
+        collection_name: &str,
         payload: Option<Vec<u8>>,
-    ) -> Result<(), RekhaError> {
-        let channel = self.channel.clone();
-        self.with_retry("insert", move || {
-            let request = tonic::Request::new(InsertRequest {
-                id,
-                vector: vector.clone(),
-                payload: payload.clone().map(|data| proto::Payload {
-                    content_type: "raw".into(),
-                    data,
-                }),
-            });
-            let mut client = GrpcClient::new(channel.clone());
-            async move {
-                let response = client.insert(request).await?;
-                let resp = response.into_inner();
-                if resp.success {
-                    Ok(())
-                } else {
-                    Err(tonic::Status::internal(resp.error))
+    ) -> Result<u64, RekhaError> {
+        let max_attempts = self.config.max_retries + 1;
+        let mut last_err = None;
+
+        for _ in 0..max_attempts {
+            let ch = self.channel.read().await.clone();
+            let v = vector.clone();
+            let p = payload.clone();
+            let result = self
+                .with_retry("insert", move || {
+                    let request = tonic::Request::new(InsertRequest {
+                        id,
+                        vector: v.clone(),
+                        collection_name: collection_name.to_string(),
+                        payload: p.clone().map(|data| proto::Payload {
+                            content_type: "raw".into(),
+                            data,
+                        }),
+                    });
+                    let mut client = GrpcClient::new(ch.clone());
+                    async move {
+                        let response = client.insert(request).await?;
+                        let resp = response.into_inner();
+                        if resp.success {
+                            Ok(resp.id)
+                        } else {
+                            Err(tonic::Status::internal(resp.error))
+                        }
+                    }
+                })
+                .await;
+
+            match result {
+                Ok(actual_id) => return Ok(actual_id),
+                Err(RekhaError::Unavailable { detail }) => {
+                    // Check if this is a leader redirect embedded in the detail string.
+                    // The detail format is: "insert failed after N retries: status: FailedPrecondition, message: \"not leader, try node-2@addr\""
+                    if let Some(addr) = detail
+                        .split("not leader, try ")
+                        .nth(1)
+                        .and_then(|s| s.split('@').nth(1))
+                        .and_then(|s| s.split(&[' ', '"', ')'][..]).next())
+                        .filter(|s| !s.is_empty())
+                    {
+                        match self.build_channel(addr).await {
+                            Ok(ch) => {
+                                *self.channel.write().await = ch;
+                                last_err = None;
+                                continue;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                continue;
+                            }
+                        }
+                    }
+                    last_err = Some(RekhaError::Unavailable { detail });
                 }
+                Err(e) => return Err(e),
             }
-        })
-        .await
+        }
+
+        Err(last_err.unwrap_or_else(|| RekhaError::Unavailable {
+            detail: "insert failed: max retries exceeded".into(),
+        }))
     }
 
     /// Search for the top-k approximate nearest neighbors.
     pub async fn search(
         &self,
         query: Vec<f32>,
+        collection_name: &str,
         top_k: usize,
     ) -> Result<Vec<ScoredPoint>, RekhaError> {
         let params = SearchParams::default();
-        let result = self.search_with_params(query, top_k, params).await?;
+        let result = self
+            .search_with_params(query, collection_name, top_k, params)
+            .await?;
         Ok(result.0)
     }
 
@@ -232,13 +295,17 @@ impl RekhaClient {
     pub async fn search_with_params(
         &self,
         query: Vec<f32>,
+        collection_name: &str,
         top_k: usize,
         params: SearchParams,
     ) -> Result<(Vec<ScoredPoint>, SearchStats), RekhaError> {
-        let channel = self.channel.clone();
+        let channel = self.channel.read().await.clone();
+        let local_only = params.local_only;
+        let collection_name = collection_name.to_string();
         self.with_retry("search", move || {
             let request = tonic::Request::new(SearchRequest {
                 query_vector: query.clone(),
+                collection_name: collection_name.clone(),
                 top_k: top_k as u32,
                 params: Some(proto::SearchParams {
                     ef_search: params.ef_search as u32,
@@ -246,6 +313,7 @@ impl RekhaClient {
                     include_payloads: params.include_payloads,
                     partition_hint: params.partition_hint,
                 }),
+                local_only,
             });
             let mut client = GrpcClient::new(channel.clone());
             async move {
@@ -286,11 +354,15 @@ impl RekhaClient {
     }
 
     /// Delete vectors by ID.
-    pub async fn delete(&self, ids: &[u64]) -> Result<u64, RekhaError> {
-        let channel = self.channel.clone();
+    pub async fn delete(&self, collection_name: &str, ids: &[u64]) -> Result<u64, RekhaError> {
+        let channel = self.channel.read().await.clone();
         let ids = ids.to_vec();
+        let collection_name = collection_name.to_string();
         self.with_retry("delete", move || {
-            let request = tonic::Request::new(proto::DeleteRequest { ids: ids.clone() });
+            let request = tonic::Request::new(proto::DeleteRequest {
+                ids: ids.clone(),
+                collection_name: collection_name.clone(),
+            });
             let mut client = GrpcClient::new(channel.clone());
             async move {
                 client
@@ -305,14 +377,17 @@ impl RekhaClient {
     /// Fetch vectors and their payloads by ID.
     pub async fn fetch(
         &self,
+        collection_name: &str,
         ids: &[u64],
         include_payloads: bool,
     ) -> Result<Vec<ScoredPoint>, RekhaError> {
-        let channel = self.channel.clone();
+        let channel = self.channel.read().await.clone();
         let ids = ids.to_vec();
+        let collection_name = collection_name.to_string();
         self.with_retry("fetch", move || {
             let request = tonic::Request::new(FetchRequest {
                 ids: ids.clone(),
+                collection_name: collection_name.clone(),
                 include_payloads,
             });
             let mut client = GrpcClient::new(channel.clone());
@@ -380,8 +455,10 @@ mod tests {
             .contains("at least one seed node"));
     }
 
-    fn make_channel() -> tonic::transport::Channel {
-        tonic::transport::Endpoint::from_static("http://localhost:1").connect_lazy()
+    fn make_channel() -> Arc<RwLock<tonic::transport::Channel>> {
+        Arc::new(RwLock::new(
+            tonic::transport::Endpoint::from_static("http://localhost:1").connect_lazy(),
+        ))
     }
 
     fn make_client() -> RekhaClient {
@@ -443,5 +520,37 @@ mod tests {
         let client = make_client();
         let result = client.cluster_info().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_channel_invalid_address() {
+        let client = make_client();
+        // build_channel with invalid URI should return InvalidArgument
+        let result = client.build_channel("").await;
+        assert!(result.is_err());
+        match result {
+            Err(RekhaError::InvalidArgument(_)) => {}
+            _ => panic!("expected InvalidArgument"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_config_invalid_seed() {
+        // A seed with invalid URI characters should fail
+        let seeds = vec!["not a valid uri!".to_string()];
+        let result = RekhaClient::connect(&seeds).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_config_no_connectable_seed() {
+        // Seeds that look valid but nothing is listening
+        let seeds = vec!["127.0.0.1:1".to_string()];
+        let result = RekhaClient::connect(&seeds).await;
+        assert!(result.is_err());
+        match result {
+            Err(RekhaError::Unavailable { .. }) => {}
+            _ => panic!("expected Unavailable"),
+        }
     }
 }

@@ -1,6 +1,5 @@
 use crate::error::RekhaError;
-use crate::types::{NodeInfo, SearchParams, SearchStats};
-use async_trait::async_trait;
+use crate::types::SearchParams;
 
 /// The core vector index trait.
 /// Implementations: VamanaGraph, (future) HNSW, Flat.
@@ -61,30 +60,14 @@ pub trait PartitionStrategy: Send + Sync {
     fn num_vector_shards(&self) -> u64;
 }
 
-/// The distributed coordinator — routes queries and manages cluster state.
-#[async_trait]
-pub trait Coordinator: Send + Sync {
-    /// Execute a search across all relevant partitions and merge results.
-    async fn search(
-        &self,
-        query: Vec<f32>,
-        k: usize,
-        params: SearchParams,
-    ) -> Result<(Vec<crate::ScoredPoint>, SearchStats), RekhaError>;
-
-    /// Insert a vector into the appropriate partition.
-    async fn insert(
-        &self,
-        id: u64,
-        vector: Vec<f32>,
-        payload: Option<crate::Payload>,
-    ) -> Result<(), RekhaError>;
-
-    /// Get cluster topology.
-    async fn topology(&self) -> Result<crate::ClusterTopology, RekhaError>;
-
-    /// Get health info for a specific node.
-    async fn node_info(&self, node_id: &str) -> Result<NodeInfo, RekhaError>;
+/// A handle for pushing recent inserts to an index buffer.
+/// Used by RaftNode to notify the index about committed inserts.
+/// Avoids circular dependency between rekha-raft and rekha-index.
+pub trait IndexBufferHandle: Send + Sync {
+    /// Push a committed insert to the index buffer for immediate searchability.
+    fn buffer_insert(&self, id: u64, vector: Vec<f32>);
+    /// Mark committed deletes in the index buffer.
+    fn buffer_delete(&self, ids: &[u64]);
 }
 
 /// Storage backend trait for persisting vectors and metadata.
@@ -101,4 +84,94 @@ pub trait VectorStoreBackend: Send + Sync {
     fn delete(&self, ids: &[u64]) -> Result<u64, RekhaError>;
     /// Iterate over all vector IDs.
     fn iter_ids(&self) -> Result<Vec<u64>, RekhaError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestIndex;
+
+    impl VectorIndex for TestIndex {
+        fn insert(&self, _id: u64, _vector: &[f32]) -> Result<(), RekhaError> {
+            Ok(())
+        }
+        fn insert_batch(&self, _vectors: &[(u64, &[f32])]) -> Result<(), RekhaError> {
+            Ok(())
+        }
+        fn delete(&self, _ids: &[u64]) -> Result<(), RekhaError> {
+            Ok(())
+        }
+        fn search(
+            &self,
+            _query: &[f32],
+            _k: usize,
+            _params: &SearchParams,
+        ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+            Ok((vec![], vec![]))
+        }
+        fn search_dim_range(
+            &self,
+            _query: &[f32],
+            _k: usize,
+            _dim_start: usize,
+            _dim_end: usize,
+            _params: &SearchParams,
+        ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+            Ok((vec![], vec![]))
+        }
+        fn len(&self) -> usize {
+            0
+        }
+        fn memory_usage(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn test_vector_index_is_empty_default() {
+        let idx = TestIndex;
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_vector_index_is_empty_returns_false_when_non_empty() {
+        struct NonEmpty;
+        impl VectorIndex for NonEmpty {
+            fn insert(&self, _id: u64, _vector: &[f32]) -> Result<(), RekhaError> {
+                Ok(())
+            }
+            fn insert_batch(&self, _vectors: &[(u64, &[f32])]) -> Result<(), RekhaError> {
+                Ok(())
+            }
+            fn delete(&self, _ids: &[u64]) -> Result<(), RekhaError> {
+                Ok(())
+            }
+            fn search(
+                &self,
+                _query: &[f32],
+                _k: usize,
+                _params: &SearchParams,
+            ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+                Ok((vec![], vec![]))
+            }
+            fn search_dim_range(
+                &self,
+                _query: &[f32],
+                _k: usize,
+                _dim_start: usize,
+                _dim_end: usize,
+                _params: &SearchParams,
+            ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+                Ok((vec![], vec![]))
+            }
+            fn len(&self) -> usize {
+                5
+            }
+            fn memory_usage(&self) -> usize {
+                0
+            }
+        }
+        assert!(!NonEmpty.is_empty());
+    }
 }

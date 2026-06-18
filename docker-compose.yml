@@ -1,0 +1,63 @@
+services:
+  node-1:
+    build:
+      context: .
+    container_name: rekha-node-1
+    ports:
+      - "50051:50051"
+    volumes:
+      - rekha-data-1:/data
+      - ./docker/node-1.yaml:/etc/rekha/config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "rekha health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - rekha-net
+
+  node-2:
+    build:
+      context: .
+    container_name: rekha-node-2
+    ports:
+      - "50052:50051"
+    volumes:
+      - rekha-data-2:/data
+      - ./docker/node-2.yaml:/etc/rekha/config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "rekha health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - rekha-net
+
+  node-3:
+    build:
+      context: .
+    container_name: rekha-node-3
+    ports:
+      - "50053:50051"
+    volumes:
+      - rekha-data-3:/data
+      - ./docker/node-3.yaml:/etc/rekha/config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "rekha health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - rekha-net
+
+volumes:
+  rekha-data-1:
+  rekha-data-2:
+  rekha-data-3:
+
+networks:
+  rekha-net:
+    driver: bridge

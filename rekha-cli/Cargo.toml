@@ -3,9 +3,14 @@ name = "rekha-cli"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "rekha"
+path = "src/main.rs"
+
 [dependencies]
 rekha-core = { path = "../rekha-core" }
 rekha-client = { path = "../rekha-client" }
+rekha-server = { path = "../rekha-server" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"

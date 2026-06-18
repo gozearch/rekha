@@ -44,6 +44,8 @@ impl ServerConfig {
                 pq_num_sub_vectors: 64,
                 pq_num_centroids: 256,
                 re_rank_k: 256,
+                insert_buffer_capacity: 10_000,
+                insert_buffer_flush_interval_ms: 1000,
             },
             raft: RaftConfig {
                 heartbeat_interval_ms: 100,
@@ -104,12 +106,27 @@ pub struct PartitionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexConfig {
+    #[serde(rename = "type")]
     pub index_type: String,
     pub graph_degree: usize,
     pub search_list_size: usize,
     pub pq_num_sub_vectors: usize,
     pub pq_num_centroids: usize,
     pub re_rank_k: usize,
+    /// Max vectors in the insert buffer before forced flush.
+    #[serde(default = "default_buffer_capacity")]
+    pub insert_buffer_capacity: usize,
+    /// How often to flush the insert buffer (milliseconds).
+    #[serde(default = "default_flush_interval_ms")]
+    pub insert_buffer_flush_interval_ms: u64,
+}
+
+fn default_buffer_capacity() -> usize {
+    10_000
+}
+
+fn default_flush_interval_ms() -> u64 {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

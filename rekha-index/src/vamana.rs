@@ -221,6 +221,11 @@ impl VamanaGraph {
         self.built
     }
 
+    /// Check if a vector ID exists in the current graph.
+    pub fn contains_id(&self, id: u64) -> bool {
+        self.id_to_pos.contains_key(&id)
+    }
+
     // ── Internal helpers ──────────────────────────────────────
 
     /// Find the medoid: the point closest (in sum of distances) to all others.

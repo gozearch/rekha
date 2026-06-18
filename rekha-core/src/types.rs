@@ -150,6 +150,7 @@ pub struct SearchParams {
     pub beam_width: usize,
     pub include_payloads: bool,
     pub partition_hint: Option<u64>,
+    pub local_only: bool,
 }
 
 impl Default for SearchParams {
@@ -159,8 +160,50 @@ impl Default for SearchParams {
             beam_width: 4,
             include_payloads: true,
             partition_hint: None,
+            local_only: false,
         }
     }
+}
+
+/// Configuration for a named collection (index/table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionConfig {
+    pub dim: u32,
+    pub num_vector_shards: u64,
+    pub replication_factor: u64,
+    pub num_dim_groups: u32,
+    pub dim_group_size: u32,
+    pub graph_degree: u32,
+    pub search_list_size: u32,
+    pub pq_num_sub_vectors: u32,
+    pub pq_num_centroids: u32,
+    pub re_rank_k: u32,
+}
+
+impl Default for CollectionConfig {
+    fn default() -> Self {
+        Self {
+            dim: 256,
+            num_vector_shards: 6,
+            replication_factor: 3,
+            num_dim_groups: 1,
+            dim_group_size: 256,
+            graph_degree: 64,
+            search_list_size: 128,
+            pq_num_sub_vectors: 64,
+            pq_num_centroids: 256,
+            re_rank_k: 256,
+        }
+    }
+}
+
+/// Info about a named collection returned by list/describe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionInfo {
+    pub name: String,
+    pub config: CollectionConfig,
+    pub vector_count: u64,
+    pub index_ready: bool,
 }
 
 /// Statistics about a search operation.

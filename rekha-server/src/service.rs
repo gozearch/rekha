@@ -818,14 +818,18 @@ mod tests {
 
     static NEXT_SVC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    fn svc_dir(id: u64) -> String {
+        format!("/tmp/rekha_svc_{pid}_{id}", pid = std::process::id())
+    }
+
     fn make_service() -> RekhaService {
         let id = NEXT_SVC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let config = crate::config::ServerConfig::dev_default(
-            "test-node",
-            &format!("/tmp/svc_handler_{id}"),
-        );
+        let dir = svc_dir(id);
+        let config =
+            crate::config::ServerConfig::dev_default("test-node", &format!("{dir}/config"));
+        let _ = std::fs::remove_dir_all(&dir);
         let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open(format!("/tmp/svc_handler_db_{id}")).unwrap(),
+            rekha_storage::RocksVectorStore::open(format!("{dir}/db")).unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),

@@ -97,25 +97,34 @@ class TestRekhaClient:
 
     def test_insert_ok(self) -> None:
         stub = FakeStub({
-            "Insert": lambda request, timeout: FakeResponse(success=True, error=""),
+            "Insert": lambda request, timeout: FakeResponse(success=True, error="", id=0),
         })
         client = make_client(stub)
-        client.insert(42, [0.1, 0.2, 0.3])
+        result = client.insert([0.1, 0.2, 0.3], "default", id=42)
+        assert result == 0
+
+    def test_insert_default_id(self) -> None:
+        stub = FakeStub({
+            "Insert": lambda request, timeout: FakeResponse(success=True, error="", id=0),
+        })
+        client = make_client(stub)
+        result = client.insert([0.1, 0.2, 0.3], "default")
+        assert result == 0
 
     def test_insert_with_payload(self) -> None:
         stub = FakeStub({
-            "Insert": lambda request, timeout: FakeResponse(success=True, error=""),
+            "Insert": lambda request, timeout: FakeResponse(success=True, error="", id=0),
         })
         client = make_client(stub)
-        client.insert(42, [0.1, 0.2, 0.3], payload=b'{"k":"v"}')
+        client.insert([0.1, 0.2, 0.3], "default", payload=b'{"k":"v"}')
 
     def test_insert_retry_then_succeed(self) -> None:
         stub = FakeStub({
-            "Insert": lambda request, timeout: FakeResponse(success=True, error=""),
+            "Insert": lambda request, timeout: FakeResponse(success=True, error="", id=0),
         })
         stub.set_fails("Insert", 1)
         client = make_client(stub)
-        client.insert(42, [0.1, 0.2, 0.3])
+        client.insert([0.1, 0.2, 0.3], "default")
         assert stub._call_counts.get("Insert", 0) == 2
 
     def test_search_ok(self) -> None:
@@ -127,7 +136,7 @@ class TestRekhaClient:
             ),
         })
         client = make_client(stub)
-        results = client.search([0.1, 0.2, 0.3], 10)
+        results = client.search([0.1, 0.2, 0.3], 10, "default")
         assert len(results) == 1
         assert results[0].id == 1
         assert results[0].score == 0.5
@@ -142,7 +151,7 @@ class TestRekhaClient:
         })
         client = make_client(stub)
         results, stats = client.search_with_params(
-            [0.1, 0.2, 0.3], 10, SearchParams(ef_search=200)
+            [0.1, 0.2, 0.3], 10, "default", SearchParams(ef_search=200)
         )
         assert len(results) == 1
         assert stats.total_ms == 1.5
@@ -153,7 +162,7 @@ class TestRekhaClient:
             "Delete": lambda request, timeout: FakeResponse(deleted_count=3),
         })
         client = make_client(stub)
-        count = client.delete([1, 2, 3])
+        count = client.delete([1, 2, 3], "default")
         assert count == 3
 
     def test_fetch_ok(self) -> None:
@@ -162,7 +171,7 @@ class TestRekhaClient:
             "Fetch": lambda request, timeout: FakeResponse(points=[point]),
         })
         client = make_client(stub)
-        results = client.fetch([1], include_payloads=True)
+        results = client.fetch([1], "default", include_payloads=True)
         assert len(results) == 1
         assert results[0].id == 1
 
@@ -173,7 +182,7 @@ class TestRekhaClient:
             "Fetch": lambda request, timeout: FakeResponse(points=[point]),
         })
         client = make_client(stub)
-        results = client.fetch([1], include_payloads=True)
+        results = client.fetch([1], "default", include_payloads=True)
         assert len(results) == 1
         assert results[0].payload is not None
         assert results[0].payload.data == b'{"k":"v"}'
@@ -206,7 +215,7 @@ class TestRekhaClient:
         stub.set_fails("Search", 99)
         client = make_client(stub)
         with pytest.raises(RekhaRequestError):
-            client.search([0.1], 5)
+            client.search([0.1], 5, "default")
 
     def test_default_config(self) -> None:
         client = RekhaClient.__new__(RekhaClient)
@@ -230,7 +239,7 @@ class TestRekhaClient:
         })
         client = make_client(stub)
         results, _ = client.search_with_params(
-            [0.1, 0.2, 0.3], 10, SearchParams(include_payloads=True)
+            [0.1, 0.2, 0.3], 10, "default", SearchParams(include_payloads=True)
         )
         assert results[0].payload is not None
         assert results[0].payload.data == b'{"k":"v"}'

@@ -1316,7 +1316,7 @@ mod tests {
 
         // Create a ReplicatedState with pre-populated vectors
         let mut state = rekha_raft::ReplicatedState::new(0);
-        let vec_bytes: Vec<u8> = vec![1.0f32, 2.0f32, 3.0f32]
+        let vec_bytes: Vec<u8> = [1.0f32, 2.0f32, 3.0f32]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
@@ -1334,7 +1334,7 @@ mod tests {
         coord.register_raft_node(0, node);
 
         // Initialize coordinator with an empty built index
-        let mut index = rekha_index::RekhaIndex::new(
+        let index = rekha_index::RekhaIndex::new(
             8,
             4,
             16,
@@ -1367,13 +1367,13 @@ mod tests {
         .unwrap();
         coord.initialize(index).await;
 
-        let (results, stats) = coord
+        let (results, _stats) = coord
             .search(vec![0.0; 8], 5, SearchParams::default())
             .await
             .unwrap();
         assert!(results.is_empty());
         // Each dim group search should have failed, generating warnings
-        assert!(stats.warnings.is_empty() || stats.warnings.len() > 0);
+        // (warnings presence varies; just verify search doesn't crash)
     }
 
     #[tokio::test]

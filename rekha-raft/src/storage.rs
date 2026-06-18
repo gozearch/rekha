@@ -510,4 +510,52 @@ mod tests {
         assert_eq!(log_store.last_log_index(0).unwrap(), 1);
         assert_eq!(log_store.last_log_index(1).unwrap(), 1);
     }
+
+    #[test]
+    fn test_namespace_prefix_with_ns() {
+        let ns = Some("test_collection".to_string());
+        let prefix = super::namespace_prefix(&ns);
+        let expected = b"test_collection\0";
+        assert_eq!(prefix, expected);
+    }
+
+    #[test]
+    fn test_namespace_prefix_none() {
+        let ns: Option<String> = None;
+        let prefix = super::namespace_prefix(&ns);
+        assert!(prefix.is_empty());
+    }
+
+    #[test]
+    fn test_with_namespace_isolation() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CNT: AtomicU64 = AtomicU64::new(0);
+        let n = CNT.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("rekha_raft_ns_test_{}", n));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = std::sync::Arc::new(rekha_storage::RocksVectorStore::open(&dir).unwrap());
+
+        let ns_store = RaftLogStore::with_namespace(store.clone(), "col1".into());
+        let ns_store2 = RaftLogStore::with_namespace(store.clone(), "col2".into());
+
+        let entry = RaftLogEntry {
+            term: 1,
+            index: 1,
+            command: RaftCommand::NoOp,
+        };
+        ns_store.store_entry(0, &entry).unwrap();
+        ns_store2.store_entry(0, &entry).unwrap();
+
+        // Each namespace should have 1 entry
+        assert_eq!(ns_store.entry_count(0).unwrap(), 1);
+        assert_eq!(ns_store2.entry_count(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_truncate_entries_empty() {
+        let (log_store, _store) = RaftLogStore::test_store();
+        // Truncating from index 1 on an empty partition should succeed
+        log_store.truncate_entries(0, 1).unwrap();
+        assert_eq!(log_store.entry_count(0).unwrap(), 0);
+    }
 }

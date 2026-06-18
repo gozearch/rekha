@@ -507,4 +507,12 @@ mod tests {
         assert_eq!(server.config.cluster.node_id, "test-node");
         assert_eq!(server.config.partition.num_dim_groups, 4);
     }
+
+    #[tokio::test]
+    async fn test_from_config_invalid_path() {
+        // Using a path in a nonexistent directory should cause an error.
+        let config = ServerConfig::dev_default("test-node", "/nonexistent_dir_xyz/data");
+        let result = ServerInstance::from_config(config).await;
+        assert!(result.is_err());
+    }
 }

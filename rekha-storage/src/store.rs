@@ -524,4 +524,143 @@ mod tests {
         let v = store.get_vector(42).unwrap().unwrap();
         assert!((v[0] - 1.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_from_db_and_namespace_helpers() {
+        let dir = std::env::temp_dir().join("rekha_test_from_db");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let db = store.db().clone();
+
+        // Create from_db without namespace
+        let store2 = RocksVectorStore::from_db(db.clone(), None);
+        assert!(store2.get_namespace().is_none());
+
+        // Create from_db with namespace
+        let store3 = RocksVectorStore::from_db(db.clone(), Some("ns1".into()));
+        assert_eq!(store3.get_namespace(), Some("ns1"));
+
+        // with_namespace builder
+        let store4 = store.clone().with_namespace("ns2".into());
+        assert_eq!(store4.get_namespace(), Some("ns2"));
+    }
+
+    #[test]
+    fn test_encode_key_roundtrip() {
+        let dir = std::env::temp_dir().join("rekha_test_encode");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+
+        // Non-namespaced
+        let key = store.encode_key(42);
+        assert_eq!(key.len(), 8);
+        assert_eq!(key, 42u64.to_be_bytes());
+        assert_eq!(RocksVectorStore::decode_id(&key), Some(42));
+
+        // Namespaced
+        let store_ns = store.clone().with_namespace("col".into());
+        let key_ns = store_ns.encode_key(42);
+        assert_eq!(key_ns.len(), 12); // "col" + null + 8 bytes u64
+        assert_eq!(&key_ns[..4], &b"col\0"[..]);
+        assert_eq!(&key_ns[4..], &42u64.to_be_bytes());
+        assert_eq!(RocksVectorStore::decode_id(&key_ns), Some(42));
+
+        // decode_id with short key
+        assert_eq!(RocksVectorStore::decode_id(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn test_namespace_prefix() {
+        let dir = std::env::temp_dir().join("rekha_test_ns_prefix");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+
+        // Non-namespaced -> None
+        let prefix = store.namespace_prefix();
+        assert!(prefix.is_none());
+
+        // Namespaced -> Some prefix
+        let store_ns = store.clone().with_namespace("col".into());
+        let prefix = store_ns.namespace_prefix();
+        assert_eq!(prefix, Some(b"col\0".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_empty_ids() {
+        let dir = std::env::temp_dir().join("rekha_test_delete_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let deleted = store.delete(&[]).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_delete_all_in_namespace() {
+        let dir = std::env::temp_dir().join("rekha_test_del_ns");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+
+        // delete_all requires namespace - should error without one
+        let result = store.delete_all_in_namespace();
+        assert!(result.is_err());
+
+        // With namespace: insert data, then delete all
+        let store_ns = store.with_namespace("col".into());
+        store_ns.put_vector(1, &[1.0]).unwrap();
+        store_ns.put_vector(2, &[2.0]).unwrap();
+        store_ns.put_payload(1, b"p1").unwrap();
+
+        let count = store_ns.delete_all_in_namespace().unwrap();
+        // vectors CF: 2 entries, payloads CF: 1 entry = 3 total
+        assert_eq!(count, 3);
+
+        assert!(store_ns.get_vector(1).unwrap().is_none());
+        assert!(store_ns.get_vector(2).unwrap().is_none());
+        assert!(store_ns.get_payload(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_db_accessor() {
+        let dir = std::env::temp_dir().join("rekha_test_db_accessor");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let db = store.db();
+        // db is an Arc - just verify it's valid by using it
+        let cf = db.cf_handle("vectors").unwrap();
+        let _ = cf;
+    }
+
+    #[test]
+    fn test_open_invalid_path() {
+        let dir = std::env::temp_dir().join("rekha_test_invalid_open");
+        // Create a file at that path to prevent DB creation
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(&dir, "not a rocksdb").unwrap();
+        let result = RocksVectorStore::open(&dir);
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_iter_ids_with_namespace() {
+        let dir = std::env::temp_dir().join("rekha_test_iter_ns");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let store_ns = store.clone().with_namespace("col".into());
+
+        // Insert into both namespaced and non-namespaced stores
+        store.put_vector(10, &[0.1]).unwrap();
+        store_ns.put_vector(20, &[0.2]).unwrap();
+        store_ns.put_vector(30, &[0.3]).unwrap();
+
+        // Non-namespaced iter should see all
+        let mut all = store.iter_ids().unwrap();
+        all.sort();
+        assert_eq!(all, vec![10, 20, 30]);
+
+        // Namespaced iter should only see its own
+        let mut ns_ids = store_ns.iter_ids().unwrap();
+        ns_ids.sort();
+        assert_eq!(ns_ids, vec![20, 30]);
+    }
 }

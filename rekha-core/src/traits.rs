@@ -85,3 +85,93 @@ pub trait VectorStoreBackend: Send + Sync {
     /// Iterate over all vector IDs.
     fn iter_ids(&self) -> Result<Vec<u64>, RekhaError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestIndex;
+
+    impl VectorIndex for TestIndex {
+        fn insert(&self, _id: u64, _vector: &[f32]) -> Result<(), RekhaError> {
+            Ok(())
+        }
+        fn insert_batch(&self, _vectors: &[(u64, &[f32])]) -> Result<(), RekhaError> {
+            Ok(())
+        }
+        fn delete(&self, _ids: &[u64]) -> Result<(), RekhaError> {
+            Ok(())
+        }
+        fn search(
+            &self,
+            _query: &[f32],
+            _k: usize,
+            _params: &SearchParams,
+        ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+            Ok((vec![], vec![]))
+        }
+        fn search_dim_range(
+            &self,
+            _query: &[f32],
+            _k: usize,
+            _dim_start: usize,
+            _dim_end: usize,
+            _params: &SearchParams,
+        ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+            Ok((vec![], vec![]))
+        }
+        fn len(&self) -> usize {
+            0
+        }
+        fn memory_usage(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn test_vector_index_is_empty_default() {
+        let idx = TestIndex;
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_vector_index_is_empty_returns_false_when_non_empty() {
+        struct NonEmpty;
+        impl VectorIndex for NonEmpty {
+            fn insert(&self, _id: u64, _vector: &[f32]) -> Result<(), RekhaError> {
+                Ok(())
+            }
+            fn insert_batch(&self, _vectors: &[(u64, &[f32])]) -> Result<(), RekhaError> {
+                Ok(())
+            }
+            fn delete(&self, _ids: &[u64]) -> Result<(), RekhaError> {
+                Ok(())
+            }
+            fn search(
+                &self,
+                _query: &[f32],
+                _k: usize,
+                _params: &SearchParams,
+            ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+                Ok((vec![], vec![]))
+            }
+            fn search_dim_range(
+                &self,
+                _query: &[f32],
+                _k: usize,
+                _dim_start: usize,
+                _dim_end: usize,
+                _params: &SearchParams,
+            ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+                Ok((vec![], vec![]))
+            }
+            fn len(&self) -> usize {
+                5
+            }
+            fn memory_usage(&self) -> usize {
+                0
+            }
+        }
+        assert!(!NonEmpty.is_empty());
+    }
+}

@@ -976,4 +976,282 @@ mod tests {
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
     }
+
+    #[tokio::test]
+    async fn test_starting_auto_id_empty_store() {
+        let store = temp_store();
+        let id = Coordinator::starting_auto_id(&store);
+        assert_eq!(id, 1); // empty store -> 0 + 1
+    }
+
+    #[tokio::test]
+    async fn test_starting_auto_id_with_existing() {
+        let store = temp_store();
+        store.put_vector(10, &[1.0]).unwrap();
+        store.put_vector(5, &[2.0]).unwrap();
+        store.put_vector(100, &[3.0]).unwrap();
+        let id = Coordinator::starting_auto_id(&store);
+        assert_eq!(id, 101); // max=100, +1=101
+    }
+
+    #[tokio::test]
+    async fn test_peer_address_known() {
+        let coord = test_coordinator();
+        let info = NodeInfo {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![],
+            is_leader: false,
+            raft_term: 1,
+            commit_index: 0,
+            storage_bytes: 0,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        coord.register_peer(info).await;
+        let addr = coord.peer_address("peer-1").await;
+        assert_eq!(addr, Some("10.0.0.2:50051".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_peer_address_unknown() {
+        let coord = test_coordinator();
+        let addr = coord.peer_address("nonexistent").await;
+        assert!(addr.is_none());
+    }
+
+    #[test]
+    fn test_accessors() {
+        let config = ServerConfig::dev_default("test-node", "/tmp/acc_test");
+        let store = temp_store();
+        let pm = Arc::new(RwLock::new(rekha_partition::PartitionManager::new(
+            HashMap::new(),
+            4,
+            768,
+        )));
+        let coord = Coordinator::new(config, store, pm);
+
+        assert_eq!(coord.cluster_id(), "rekha-dev");
+        assert_eq!(coord.node_id(), "test-node");
+        assert_eq!(coord.bind_addr(), "0.0.0.0:50051");
+        assert_eq!(coord.seed_nodes(), &["127.0.0.1:50051"]);
+        assert_eq!(coord.config_ref().cluster.node_id, "test-node");
+    }
+
+    #[tokio::test]
+    async fn test_sync_topology() {
+        let coord = test_coordinator();
+        // Register a peer then sync
+        let info = NodeInfo {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![],
+            is_leader: false,
+            raft_term: 1,
+            commit_index: 0,
+            storage_bytes: 0,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        coord.register_peer(info).await;
+        coord.sync_topology().await;
+        let topo = coord.topology().await.unwrap();
+        assert!(topo.nodes.contains_key("test-node"));
+        assert!(topo.nodes.contains_key("peer-1"));
+    }
+
+    #[tokio::test]
+    async fn test_check_peer_health_no_peers() {
+        let coord = test_coordinator();
+        // Should not panic with no peers
+        coord.check_peer_health().await;
+        let healthy = coord.healthy_peers().await;
+        assert!(healthy.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_index_buffer_handle_not_initialized() {
+        let coord = test_coordinator();
+        // buffer_insert and buffer_delete should be no-ops when index is None
+        coord.buffer_insert(1, vec![1.0, 2.0]);
+        coord.buffer_delete(&[1]);
+        // No panic = success
+    }
+
+    #[tokio::test]
+    async fn test_index_buffer_handle_with_initialized_index() {
+        let coord = test_coordinator();
+        let store = temp_store();
+        let mut index = rekha_index::RekhaIndex::new(
+            8,
+            4,
+            16,
+            4,
+            (*store).clone(),
+            rekha_core::DistanceMetric::L2,
+        )
+        .unwrap();
+        for i in 0..10 {
+            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+            index.add_vector_for_test(i, v);
+        }
+        index.build().unwrap();
+        coord.initialize(index).await;
+
+        coord.buffer_insert(20, vec![0.0; 8]);
+        coord.buffer_delete(&[1]);
+        // No panic = success; buffer operations went through
+    }
+
+    #[tokio::test]
+    async fn test_build_index_deprecated() {
+        let coord = test_coordinator();
+        let result = coord.build_index().await;
+        assert!(result.is_err());
+        match result {
+            Err(RekhaError::Unavailable { .. }) => {}
+            _ => panic!("expected Unavailable error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_local_only() {
+        let coord = test_coordinator();
+        let store = temp_store();
+        let mut index = rekha_index::RekhaIndex::new(
+            8,
+            4,
+            16,
+            4,
+            (*store).clone(),
+            rekha_core::DistanceMetric::L2,
+        )
+        .unwrap();
+        for i in 0..10 {
+            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+            index.add_vector_for_test(i, v);
+        }
+        index.build().unwrap();
+        coord.initialize(index).await;
+
+        let params = SearchParams {
+            local_only: true,
+            ..Default::default()
+        };
+        let (results, stats) = coord.search(vec![0.0; 8], 5, params).await.unwrap();
+        assert!(!results.is_empty());
+        // local_only=true skips peer fan-out; vectors_scanned should be > 0
+        assert!(stats.vectors_scanned > 0);
+    }
+
+    #[tokio::test]
+    async fn test_insert_auto_id() {
+        let coord = test_coordinator();
+        // id=0 triggers auto-generation
+        let id = coord.insert(0, vec![0.1, 0.2], None).await.unwrap();
+        assert_eq!(id, 1);
+        // Next auto-id should be 2
+        let id2 = coord.insert(0, vec![0.3, 0.4], None).await.unwrap();
+        assert_eq!(id2, 2);
+    }
+
+    #[tokio::test]
+    async fn test_insert_fallback_direct_store() {
+        // When no raft node exists for partition 0, insert falls through to
+        // direct store write (single-node / uninitialized path).
+        let coord = test_coordinator();
+        // coord has no raft nodes registered — insert will use the fallback path
+        let id = coord.insert(0, vec![0.5, 0.6], None).await.unwrap();
+        let v = coord.store().get_vector(id).unwrap().unwrap();
+        assert!((v[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_insert_fallback_with_payload() {
+        let coord = test_coordinator();
+        let payload = Payload::from_text("fallback data");
+        let id = coord.insert(0, vec![0.7], Some(payload)).await.unwrap();
+        let stored = coord.store().get_payload(id).unwrap().unwrap();
+        assert_eq!(stored, b"fallback data");
+    }
+
+    #[tokio::test]
+    async fn test_check_peer_health_timeout_transition() {
+        let coord = test_coordinator();
+        // Register a peer with a very old last_seen (Instant::now() - 20s).
+        let info = NodeInfo {
+            node_id: "old-peer".into(),
+            address: "10.0.0.3:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![],
+            is_leader: false,
+            raft_term: 1,
+            commit_index: 0,
+            storage_bytes: 0,
+            status: NodeStatus::Healthy,
+            last_heartbeat: 0,
+        };
+        // Insert directly into peers map with an old timestamp
+        {
+            let mut peers = coord.peers.write().await;
+            peers.insert(
+                "old-peer".into(),
+                PeerState {
+                    info,
+                    last_seen: Instant::now() - Duration::from_secs(20),
+                },
+            );
+        }
+        coord.check_peer_health().await;
+        let healthy = coord.healthy_peers().await;
+        assert!(healthy.is_empty()); // old-peer should be marked Unreachable
+    }
+
+    #[tokio::test]
+    async fn test_check_peer_health_recovery() {
+        let coord = test_coordinator();
+        // Start with a peer that's Unreachable (last_seen fresh but status=Unreachable)
+        let info = NodeInfo {
+            node_id: "recovering-peer".into(),
+            address: "10.0.0.4:50051".into(),
+            partition_id: 0,
+            dim_groups: vec![],
+            is_leader: false,
+            raft_term: 1,
+            commit_index: 0,
+            storage_bytes: 0,
+            status: NodeStatus::Unreachable,
+            last_heartbeat: 0,
+        };
+        {
+            let mut peers = coord.peers.write().await;
+            peers.insert(
+                "recovering-peer".into(),
+                PeerState {
+                    info,
+                    last_seen: Instant::now(), // fresh
+                },
+            );
+        }
+        coord.check_peer_health().await;
+        let healthy = coord.healthy_peers().await;
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].node_id, "recovering-peer");
+    }
+
+    #[tokio::test]
+    async fn test_recover_index_buffer_no_index() {
+        let coord = test_coordinator();
+        // recover_index_buffer with no index should return error
+        let result = coord.recover_index_buffer().await;
+        assert!(result.is_err());
+        match result {
+            Err(RekhaError::Internal { detail }) => {
+                assert!(detail.contains("not initialized for recovery"));
+            }
+            _ => panic!("expected Internal error"),
+        }
+    }
 }

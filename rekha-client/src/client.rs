@@ -521,4 +521,36 @@ mod tests {
         let result = client.cluster_info().await;
         assert!(result.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_build_channel_invalid_address() {
+        let client = make_client();
+        // build_channel with invalid URI should return InvalidArgument
+        let result = client.build_channel("").await;
+        assert!(result.is_err());
+        match result {
+            Err(RekhaError::InvalidArgument(_)) => {}
+            _ => panic!("expected InvalidArgument"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_config_invalid_seed() {
+        // A seed with invalid URI characters should fail
+        let seeds = vec!["not a valid uri!".to_string()];
+        let result = RekhaClient::connect(&seeds).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_config_no_connectable_seed() {
+        // Seeds that look valid but nothing is listening
+        let seeds = vec!["127.0.0.1:1".to_string()];
+        let result = RekhaClient::connect(&seeds).await;
+        assert!(result.is_err());
+        match result {
+            Err(RekhaError::Unavailable { .. }) => {}
+            _ => panic!("expected Unavailable"),
+        }
+    }
 }

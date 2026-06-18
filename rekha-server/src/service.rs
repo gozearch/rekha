@@ -685,4 +685,134 @@ mod tests {
             _ => panic!("expected Insert variant"),
         }
     }
+
+    #[test]
+    fn test_new_service() {
+        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/rekha_svc_test");
+        let store = std::sync::Arc::new(
+            rekha_storage::RocksVectorStore::open("/tmp/rekha_svc_test_db").unwrap(),
+        );
+        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let service = RekhaService::new(coord);
+        // service is initialized; verify by checking it doesn't panic
+        let _ = service;
+    }
+
+    #[test]
+    fn test_map_error_consensus_non_leader() {
+        let err = RekhaError::Consensus(rekha_core::RaftError::LogCompaction {
+            detail: "test".into(),
+        });
+        let status = RekhaService::map_error(err);
+        assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn test_insert_payload_content_types() {
+        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/svc_ct_test");
+        let store = std::sync::Arc::new(
+            rekha_storage::RocksVectorStore::open("/tmp/svc_ct_test_db").unwrap(),
+        );
+        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let service = RekhaService::new(coord);
+
+        // Test "json" content type
+        let req = tonic::Request::new(InsertRequest {
+            id: 0,
+            vector: vec![0.1],
+            payload: Some(crate::proto::Payload {
+                content_type: "json".into(),
+                data: br#"{"key":"value"}"#.to_vec(),
+            }),
+            collection_name: "default".into(),
+        });
+        let resp = service.insert(req).await.unwrap();
+        assert!(resp.into_inner().success);
+
+        // Test "text" content type
+        let req = tonic::Request::new(InsertRequest {
+            id: 0,
+            vector: vec![0.2],
+            payload: Some(crate::proto::Payload {
+                content_type: "text".into(),
+                data: b"hello".to_vec(),
+            }),
+            collection_name: "default".into(),
+        });
+        let resp = service.insert(req).await.unwrap();
+        assert!(resp.into_inner().success);
+
+        // Test unknown content type (maps to Raw)
+        let req = tonic::Request::new(InsertRequest {
+            id: 0,
+            vector: vec![0.3],
+            payload: Some(crate::proto::Payload {
+                content_type: "protobuf".into(),
+                data: vec![0, 1, 2],
+            }),
+            collection_name: "default".into(),
+        });
+        let resp = service.insert(req).await.unwrap();
+        assert!(resp.into_inner().success);
+
+        // Test no payload (None path)
+        let req = tonic::Request::new(InsertRequest {
+            id: 0,
+            vector: vec![0.4],
+            payload: None,
+            collection_name: "default".into(),
+        });
+        let resp = service.insert(req).await.unwrap();
+        assert!(resp.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn test_search_before_init_returns_error() {
+        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/svc_search_err");
+        let store = std::sync::Arc::new(
+            rekha_storage::RocksVectorStore::open("/tmp/svc_search_err_db").unwrap(),
+        );
+        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let service = RekhaService::new(coord);
+
+        let req = tonic::Request::new(SearchRequest {
+            query_vector: vec![0.0; 8],
+            top_k: 5,
+            collection_name: "default".into(),
+            local_only: false,
+            params: None,
+        });
+        let result = service.search(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_empty_ids() {
+        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/svc_del_test");
+        let store = std::sync::Arc::new(
+            rekha_storage::RocksVectorStore::open("/tmp/svc_del_test_db").unwrap(),
+        );
+        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let service = RekhaService::new(coord);
+
+        let req = tonic::Request::new(DeleteRequest {
+            ids: vec![],
+            collection_name: "default".into(),
+        });
+        let resp = service.delete(req).await.unwrap();
+        assert_eq!(resp.into_inner().deleted_count, 0);
+    }
 }

@@ -768,4 +768,58 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert!(buf.is_empty());
     }
+
+    #[test]
+    fn test_with_buffer_config() {
+        let store = test_store();
+        let idx =
+            RekhaIndex::with_buffer_config(8, 4, 16, 4, store, DistanceMetric::L2, 5, 500).unwrap();
+        assert_eq!(idx.dim, 8);
+        assert_eq!(idx.buffer_capacity, 5);
+        assert_eq!(idx.flush_interval_ms, 500);
+    }
+
+    #[test]
+    fn test_should_flush() {
+        let store = test_store();
+        // Use a tiny buffer capacity so we can trigger should_flush
+        let idx =
+            RekhaIndex::with_buffer_config(8, 4, 16, 4, store, DistanceMetric::L2, 2, 500).unwrap();
+        assert!(!idx.should_flush());
+        idx.buffer_insert(1, vec![0.0; 8]);
+        assert!(!idx.should_flush()); // 1 < capacity 2
+        idx.buffer_insert(2, vec![1.0; 8]);
+        assert!(idx.should_flush()); // 2 >= capacity 2
+    }
+
+    #[test]
+    fn test_flush_buffer_empty() {
+        let store = test_store();
+        let mut idx = RekhaIndex::new(8, 4, 16, 4, store, DistanceMetric::L2).unwrap();
+        // Build an index with some vectors
+        for i in 0..10 {
+            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+            idx.add_vector_for_test(i, v);
+        }
+        idx.build().unwrap();
+        // Flush with no pending buffer entries should succeed as no-op
+        assert_eq!(idx.buffer_len(), 0);
+        idx.flush_buffer().unwrap();
+        assert!(idx.is_ready());
+    }
+
+    #[test]
+    fn test_contains_id() {
+        let store = test_store();
+        let mut idx = RekhaIndex::new(8, 4, 16, 4, store, DistanceMetric::L2).unwrap();
+        // Before build, no vectors exist
+        // After build, check contains
+        for i in 0..5 {
+            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+            idx.add_vector_for_test(i, v);
+        }
+        idx.build().unwrap();
+        assert!(idx.graph_contains_id(0));
+        assert!(!idx.graph_contains_id(999));
+    }
 }

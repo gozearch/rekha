@@ -815,4 +815,290 @@ mod tests {
         let resp = service.delete(req).await.unwrap();
         assert_eq!(resp.into_inner().deleted_count, 0);
     }
+
+    static NEXT_SVC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn make_service() -> RekhaService {
+        let id = NEXT_SVC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let config = crate::config::ServerConfig::dev_default(
+            "test-node",
+            &format!("/tmp/svc_handler_{id}"),
+        );
+        let store = std::sync::Arc::new(
+            rekha_storage::RocksVectorStore::open(format!("/tmp/svc_handler_db_{id}")).unwrap(),
+        );
+        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
+            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
+        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        RekhaService::new(coord)
+    }
+
+    #[tokio::test]
+    async fn test_handshake_handler() {
+        let service = make_service();
+        let req = tonic::Request::new(HandshakeRequest {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+        });
+        let resp = service.handshake(req).await.unwrap();
+        let inner = resp.into_inner();
+        assert_eq!(inner.cluster_id, "rekha-dev");
+        // The requester should be excluded from peers list
+        assert!(inner.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handshake_with_known_peers() {
+        let service = make_service();
+        // Register a peer first
+        let peer = tonic::Request::new(HandshakeRequest {
+            node_id: "peer-1".into(),
+            address: "10.0.0.2:50051".into(),
+        });
+        service.handshake(peer).await.unwrap();
+
+        // Now a second node handshakes — should see peer-1 in the response
+        let req = tonic::Request::new(HandshakeRequest {
+            node_id: "peer-2".into(),
+            address: "10.0.0.3:50051".into(),
+        });
+        let resp = service.handshake(req).await.unwrap();
+        let peers = resp.into_inner().peers;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, "peer-1");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_handler() {
+        let service = make_service();
+        let req = tonic::Request::new(HeartbeatRequest {
+            node_id: "heartbeat-node".into(),
+            address: "10.0.0.5:50051".into(),
+            raft_term: 3,
+            commit_index: 10,
+            storage_bytes: 1024,
+        });
+        let resp = service.heartbeat(req).await.unwrap();
+        let inner = resp.into_inner();
+        assert!(inner.success);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_handler() {
+        let service = make_service();
+        // Insert a vector into the service's store
+        service
+            .coordinator
+            .store()
+            .put_vector(1, &[1.0, 2.0, 3.0])
+            .unwrap();
+        service
+            .coordinator
+            .store()
+            .put_payload(1, b"fetch-payload")
+            .unwrap();
+
+        let req = tonic::Request::new(FetchRequest {
+            ids: vec![1],
+            collection_name: "default".into(),
+            include_payloads: true,
+        });
+        let resp = service.fetch(req).await.unwrap();
+        let inner = resp.into_inner();
+        assert_eq!(inner.vectors.len(), 1);
+        assert_eq!(inner.vectors[0].id, 1);
+        assert_eq!(inner.points.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_handler_missing_id() {
+        let service = make_service();
+        // Fetch a non-existent ID should succeed with empty vectors
+        let req = tonic::Request::new(FetchRequest {
+            ids: vec![999],
+            collection_name: "default".into(),
+            include_payloads: false,
+        });
+        let resp = service.fetch(req).await.unwrap();
+        let inner = resp.into_inner();
+        assert!(inner.vectors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_collection_stub() {
+        let service = make_service();
+        let req = tonic::Request::new(CreateCollectionRequest {
+            name: "test".into(),
+            config: Some(crate::proto::CollectionConfig {
+                dim: 8,
+                num_vector_shards: 1,
+                replication_factor: 1,
+                num_dim_groups: 1,
+                dim_group_size: 8,
+                graph_degree: 32,
+                search_list_size: 100,
+                pq_num_sub_vectors: 4,
+                pq_num_centroids: 256,
+                re_rank_k: 200,
+            }),
+        });
+        let result = service.create_collection(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn test_drop_collection_stub() {
+        let service = make_service();
+        let req = tonic::Request::new(DropCollectionRequest {
+            name: "test".into(),
+        });
+        let result = service.drop_collection(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn test_list_collections_stub() {
+        let service = make_service();
+        let req = tonic::Request::new(ListCollectionsRequest {});
+        let result = service.list_collections(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn test_collection_exists_stub() {
+        let service = make_service();
+        let req = tonic::Request::new(CollectionExistsRequest {
+            name: "test".into(),
+        });
+        let result = service.collection_exists(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_stub() {
+        let service = make_service();
+        let req = tonic::Request::new(TransferRequest {
+            partition_id: 0,
+            target_node: "".into(),
+            vector_ids: vec![],
+        });
+        let resp = service.transfer_shard(req).await.unwrap();
+        let inner = resp.into_inner();
+        assert!(!inner.success);
+    }
+
+    #[tokio::test]
+    async fn test_raft_append_entries_no_node() {
+        let service = make_service();
+        let req = tonic::Request::new(AppendEntriesRequest {
+            collection_name: "default".into(),
+            partition_id: 0,
+            leader_term: 1,
+            leader_id: "leader".into(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        });
+        let result = service.raft_append_entries(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_raft_request_vote_no_node() {
+        let service = make_service();
+        let req = tonic::Request::new(RaftVoteRequest {
+            collection_name: "default".into(),
+            term: 1,
+            candidate_id: "candidate".into(),
+            last_log_index: 0,
+            last_log_term: 0,
+            partition_id: 0,
+        });
+        let result = service.raft_request_vote(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_raft_append_entries_with_node() {
+        let service = make_service();
+        // Register a Raft node on the coordinator
+        use rekha_raft::{RaftNode, ReplicatedState};
+        let state = ReplicatedState::new(0);
+        let raft_log_store = service.coordinator.raft_log_store();
+        let node = std::sync::Arc::new(RaftNode::with_store(
+            "test-node".into(),
+            0,
+            vec![],
+            state,
+            Some(raft_log_store),
+            None,
+        ));
+        node.start_election().await.unwrap();
+        service.coordinator.register_raft_node(0, node);
+
+        let req = tonic::Request::new(AppendEntriesRequest {
+            collection_name: "default".into(),
+            partition_id: 0,
+            leader_term: 2,
+            leader_id: "new-leader".into(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![crate::proto::RaftEntry {
+                term: 2,
+                index: 1,
+                command: Some(crate::proto::RaftCommand {
+                    cmd: Some(crate::proto::raft_command::Cmd::Insert(
+                        crate::proto::InsertRequest {
+                            id: 0,
+                            vector: vec![1.0],
+                            payload: None,
+                            collection_name: "default".into(),
+                        },
+                    )),
+                }),
+            }],
+            leader_commit: 1,
+        });
+        let resp = service.raft_append_entries(req).await.unwrap();
+        let ack = resp.into_inner();
+        assert!(ack.success);
+    }
+
+    #[tokio::test]
+    async fn test_raft_request_vote_with_node() {
+        let service = make_service();
+        use rekha_raft::{RaftNode, ReplicatedState};
+        let state = ReplicatedState::new(0);
+        let raft_log_store = service.coordinator.raft_log_store();
+        let node = std::sync::Arc::new(RaftNode::with_store(
+            "test-node".into(),
+            0,
+            vec![],
+            state,
+            Some(raft_log_store),
+            None,
+        ));
+        service.coordinator.register_raft_node(0, node);
+
+        let req = tonic::Request::new(RaftVoteRequest {
+            collection_name: "default".into(),
+            term: 1,
+            candidate_id: "candidate".into(),
+            last_log_index: 0,
+            last_log_term: 0,
+            partition_id: 0,
+        });
+        let resp = service.raft_request_vote(req).await.unwrap();
+        let vote_resp = resp.into_inner();
+        // Follower should grant vote to candidate with higher term
+        assert!(vote_resp.vote_granted);
+    }
 }

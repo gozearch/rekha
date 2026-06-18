@@ -558,4 +558,42 @@ mod tests {
         log_store.truncate_entries(0, 1).unwrap();
         assert_eq!(log_store.entry_count(0).unwrap(), 0);
     }
+
+    #[test]
+    fn test_truncate_entries_start_beyond_len() {
+        let (log_store, _store) = RaftLogStore::test_store();
+        let entries: Vec<RaftLogEntry> = (1..=3)
+            .map(|i| RaftLogEntry {
+                term: 1,
+                index: i,
+                command: RaftCommand::NoOp,
+            })
+            .collect();
+        log_store.store_entries(0, &entries).unwrap();
+        // Truncate from index 10 (beyond existing) should be a no-op
+        log_store.truncate_entries(0, 10).unwrap();
+        assert_eq!(log_store.entry_count(0).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_load_entries_empty_partition() {
+        let (log_store, _store) = RaftLogStore::test_store();
+        let entries = log_store.load_entries(0, 1).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_entry_count_multiple_partitions() {
+        let (log_store, _store) = RaftLogStore::test_store();
+        for i in 1..=3 {
+            let entry = RaftLogEntry {
+                term: 1,
+                index: i,
+                command: RaftCommand::NoOp,
+            };
+            log_store.store_entry(0, &entry).unwrap();
+        }
+        assert_eq!(log_store.entry_count(0).unwrap(), 3);
+        assert_eq!(log_store.entry_count(1).unwrap(), 0);
+    }
 }

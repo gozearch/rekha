@@ -822,4 +822,138 @@ mod tests {
         assert!(idx.graph_contains_id(0));
         assert!(!idx.graph_contains_id(999));
     }
+
+    #[test]
+    fn test_is_pq_trained() {
+        let store = test_store();
+        let mut idx = RekhaIndex::new(8, 4, 16, 4, store, DistanceMetric::L2).unwrap();
+        assert!(!idx.is_pq_trained());
+        for i in 0..10 {
+            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+            idx.add_vector_for_test(i, v);
+        }
+        idx.build().unwrap();
+        assert!(idx.is_pq_trained());
+    }
+
+    #[test]
+    fn test_vector_by_id_indexed() {
+        let store = test_store();
+        let mut idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        for i in 0..3 {
+            idx.add_vector_for_test(i, vec![i as f32; 4]);
+        }
+        idx.build().unwrap();
+        let result = idx.vector_by_id(0);
+        assert!(result.is_some());
+        let (vec, is_indexed) = result.unwrap();
+        assert!(is_indexed);
+        assert!((vec[0] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_vector_by_id_buffer() {
+        let store = test_store();
+        let idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        idx.buffer_insert(42, vec![1.0; 4]);
+        let result = idx.vector_by_id(42);
+        assert!(result.is_some());
+        let (_vec, is_indexed) = result.unwrap();
+        assert!(!is_indexed); // from buffer, not indexed
+    }
+
+    #[test]
+    fn test_vector_by_id_deleted_in_buffer() {
+        let store = test_store();
+        let idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        idx.buffer_insert(42, vec![1.0; 4]);
+        idx.delete(&[42]).unwrap(); // marks deleted in buffer
+        let result = idx.vector_by_id(42);
+        assert!(result.is_none()); // deleted, so should not be returned
+    }
+
+    #[test]
+    fn test_vector_by_id_not_found() {
+        let store = test_store();
+        let idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        let result = idx.vector_by_id(999);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_vectors_from_store() {
+        let store = test_store();
+        // Pre-populate the store directly
+        store.put_vector(1, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        store.put_vector(2, &[5.0, 6.0, 7.0, 8.0]).unwrap();
+
+        let mut idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        idx.load_vectors_from_store().unwrap();
+        assert_eq!(idx.vectors.len(), 2);
+        assert_eq!(idx.vectors[0].0, 1);
+        assert_eq!(idx.vectors[1].0, 2);
+    }
+
+    #[test]
+    fn test_search_buffer_only_no_indexed_vectors() {
+        let store = test_store();
+        let idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        // Don't build — only buffer entries
+        idx.buffer_insert(1, vec![0.0; 4]);
+        idx.buffer_insert(2, vec![1.0, 1.0, 1.0, 1.0]);
+        let (ids, _dists) = idx.search(&[0.0; 4], 5, &SearchParams::default()).unwrap();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn test_search_dim_range_buffer_only() {
+        let store = test_store();
+        let idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        idx.buffer_insert(1, vec![0.0; 4]);
+        idx.buffer_insert(2, vec![1.0; 4]);
+        let (ids, _dists) = idx
+            .search_dim_range(&[0.0; 4], 3, 0, 4, &SearchParams::default())
+            .unwrap();
+        // Buffer-only search in dim range should still work
+        assert!(!ids.is_empty());
+    }
+
+    #[test]
+    fn test_search_dim_range_with_deleted_buffer() {
+        let store = test_store();
+        let mut idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        for i in 0..5 {
+            idx.add_vector_for_test(i, vec![i as f32; 4]);
+        }
+        idx.build().unwrap();
+
+        // Add buffer entries, then delete some
+        idx.buffer_insert(10, vec![10.0; 4]);
+        idx.buffer_insert(11, vec![11.0; 4]);
+        idx.delete(&[10]).unwrap();
+
+        let (ids, _dists) = idx
+            .search_dim_range(&[0.0; 4], 3, 0, 4, &SearchParams::default())
+            .unwrap();
+        assert!(!ids.is_empty());
+        // Deleted buffer entry (10) should not appear
+        assert!(!ids.contains(&10));
+    }
+
+    #[test]
+    fn test_search_dim_range_with_deleted_indexed() {
+        let store = test_store();
+        let mut idx = RekhaIndex::new(4, 2, 8, 2, store, DistanceMetric::L2).unwrap();
+        for i in 0..5 {
+            idx.add_vector_for_test(i, vec![i as f32; 4]);
+        }
+        idx.build().unwrap();
+
+        // Add buffer entry with same ID as an indexed vector → should skip duplicate
+        idx.buffer_insert(0, vec![0.0; 4]);
+        let (ids, _dists) = idx
+            .search_dim_range(&[0.0; 4], 3, 0, 4, &SearchParams::default())
+            .unwrap();
+        assert!(!ids.is_empty());
+    }
 }

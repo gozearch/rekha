@@ -642,6 +642,58 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_mixed_found_missing() {
+        let dir = std::env::temp_dir().join("rekha_test_del_mixed");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        store.put_vector(1, &[1.0]).unwrap();
+        store.put_vector(3, &[3.0]).unwrap();
+        let count = store.delete(&[1, 2, 3, 4]).unwrap();
+        // delete returns ids.len (batch count), not actual deleted count
+        assert_eq!(count, 4);
+        assert!(store.get_vector(1).unwrap().is_none());
+        assert!(store.get_vector(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_with_payload_removes_vector() {
+        let dir = std::env::temp_dir().join("rekha_test_del_payload");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        store.put_vector(42, &[1.0]).unwrap();
+        store.put_payload(42, b"data").unwrap();
+        let count = store.delete(&[42]).unwrap();
+        assert_eq!(count, 1); // ids.len = 1
+        assert!(store.get_vector(42).unwrap().is_none());
+        assert!(store.get_payload(42).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_put_get_roundtrip_namespace() {
+        let dir = std::env::temp_dir().join("rekha_test_ns_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let store_ns = store.clone().with_namespace("col".into());
+        store_ns.put_vector(1, &[9.0, 8.0]).unwrap();
+        let v = store_ns.get_vector(1).unwrap().unwrap();
+        assert!((v[0] - 9.0).abs() < 1e-6);
+        assert!((v[1] - 8.0).abs() < 1e-6);
+        // Non-namespaced store should not see it
+        assert!(store.get_vector(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_put_payload_namespace_isolation() {
+        let dir = std::env::temp_dir().join("rekha_test_payload_ns");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let store_ns = store.clone().with_namespace("col".into());
+        store_ns.put_payload(5, b"ns-payload").unwrap();
+        assert_eq!(store_ns.get_payload(5).unwrap().unwrap(), b"ns-payload");
+        assert!(store.get_payload(5).unwrap().is_none());
+    }
+
+    #[test]
     fn test_iter_ids_with_namespace() {
         let dir = std::env::temp_dir().join("rekha_test_iter_ns");
         let _ = std::fs::remove_dir_all(&dir);

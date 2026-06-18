@@ -951,7 +951,7 @@ mod tests {
         .unwrap();
         // Add vectors where one is an exact match for the query
         for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i as f32 * 10.0 + d as f32)).collect();
+            let v: Vec<f32> = (0..8).map(|d| i as f32 * 10.0 + d as f32).collect();
             index.add_vector_for_test(i, v);
         }
         index.build().unwrap();

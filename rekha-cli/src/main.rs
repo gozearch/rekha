@@ -209,8 +209,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_insert_with_payload() {
-        let cli =
-            Cli::try_parse_from(["rekha", "insert", "--payload", "{\"k\":\"v\"}"]).unwrap();
+        let cli = Cli::try_parse_from(["rekha", "insert", "--payload", "{\"k\":\"v\"}"]).unwrap();
         match cli.command {
             Commands::Insert {
                 payload,
@@ -338,8 +337,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_collection_exists() {
-        let cli =
-            Cli::try_parse_from(["rekha", "collection-exists", "-c", "test_col"]).unwrap();
+        let cli = Cli::try_parse_from(["rekha", "collection-exists", "-c", "test_col"]).unwrap();
         match cli.command {
             Commands::CollectionExists { collection } => {
                 assert_eq!(collection, "test_col");

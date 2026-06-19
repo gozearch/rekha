@@ -278,11 +278,17 @@ impl RaftNode {
         let majority = group_size / 2 + 1;
         let mut acks = 1u64; // self-vote
 
+        // Use current commit_index (before this entry) for leader_commit.
+        // Followers will apply up to this value; once quorum is confirmed
+        // below, the leader advances commit_index and future heartbeats
+        // will carry the updated value.
+        let prev_commit_index = self.raft_state.lock().await.commit_index;
+
         if n_peers > 0 {
             if let Some(ref network) = self.network {
                 let peer_ids: Vec<String> = self.peers.clone();
                 let partition_id = self.partition_id;
-                let leader_commit = entry.index;
+                let leader_commit = prev_commit_index;
 
                 let mut handles = Vec::with_capacity(n_peers);
                 for peer_id in peer_ids {
@@ -393,12 +399,32 @@ impl RaftNode {
 
     /// Transition from Candidate to Leader after winning an election.
     /// Called by the server layer after collecting majority votes.
+    /// Replays all log entries that were committed but not yet applied
+    /// to ensure the new leader's state machine is up to date.
     pub async fn become_leader(&self) {
+        let (last_log_index, prev_applied) = {
+            let mut rs = self.raft_state.lock().await;
+            rs.role = RaftRole::Leader;
+            rs.leader_id = Some(self.node_id.clone());
+            let last_idx = self.log.lock().await.len() as u64;
+            (last_idx, rs.last_applied)
+        };
+
+        // Replay entries that were appended by the old leader but not yet
+        // applied (because leader_commit lagged behind the latest entry).
+        let replayed = if last_log_index > prev_applied {
+            self.apply_up_to(last_log_index).await;
+            last_log_index - prev_applied
+        } else {
+            0
+        };
+
         let mut rs = self.raft_state.lock().await;
-        rs.role = RaftRole::Leader;
-        rs.leader_id = Some(self.node_id.clone());
+        rs.commit_index = last_log_index;
+        rs.last_applied = last_log_index;
+
         info!(
-            "Node {} became leader for term {} (partition {})",
+            "Node {} became leader for term {} (partition {}), replayed {replayed} entries (total {last_log_index})",
             self.node_id, rs.current_term, self.partition_id
         );
     }

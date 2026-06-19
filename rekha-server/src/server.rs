@@ -4,7 +4,7 @@ use rekha_storage::RocksVectorStore;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Identity, Server};
@@ -14,6 +14,7 @@ use crate::config::ServerConfig;
 use crate::coordinator::Coordinator;
 use crate::proto::rekha_server::RekhaServer as RekhaGrpcServer;
 use crate::proto::{HeartbeatRequest, RaftVoteRequest};
+use crate::raft_network::GrpcRaftNetwork;
 use crate::service::RekhaService;
 
 /// The Rekha distributed vector database server.
@@ -68,6 +69,7 @@ impl ServerInstance {
 
         // Create Raft nodes for each assigned vector shard.
         let raft_log_store = coordinator.raft_log_store();
+        let raft_network = Arc::new(GrpcRaftNetwork::new());
         let shards: Vec<u64> = if config.cluster.assigned_shards.is_empty() {
             (0..config.partition.num_vector_shards).collect()
         } else {
@@ -82,9 +84,6 @@ impl ServerInstance {
                 .seed_nodes
                 .iter()
                 .filter(|s| {
-                    // Filter self: seed addresses use {node_id}:port convention (Docker).
-                    // For dev/local setups, seed may use IP — if it differs from bind_addr
-                    // we still include it (harmless — vote request connects to same server).
                     !s.starts_with(node_id)
                 })
                 .cloned()
@@ -96,7 +95,7 @@ impl ServerInstance {
                 state,
                 Some(raft_log_store.clone()),
                 Some(coordinator.clone() as Arc<dyn rekha_core::IndexBufferHandle>),
-                None,
+                Some(raft_network.clone() as Arc<dyn rekha_raft::RaftPeerNetwork>),
             ));
             coordinator.register_raft_node(shard, raft_node);
         }
@@ -146,52 +145,90 @@ impl ServerInstance {
 
         tokio::spawn(async move {
             let mut health_tick = 0u64;
+            // Seed address -> (next allowed attempt, consecutive failures)
+            let mut backoff: std::collections::HashMap<String, (Instant, u64)> =
+                std::collections::HashMap::new();
+
             loop {
                 tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
 
-                // Send heartbeat to each seed node.
                 for seed in &seed_nodes {
                     if seed.starts_with(&node_id) {
-                        continue; // skip self
+                        continue;
                     }
+
+                    let now = Instant::now();
+                    // Backoff: skip entirely within the backoff window.
+                    if let Some(&(next_at, _)) = backoff.get(seed.as_str()) {
+                        if now < next_at {
+                            continue;
+                        }
+                    }
+
                     let endpoint = format!("http://{}", seed);
-                    match tonic::transport::Channel::from_shared(endpoint) {
-                        Ok(ch) => match ch.connect().await {
-                            Ok(ch) => {
-                                let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
-                                // Get raft status for this node.
-                                let (raft_term, commit_idx) =
-                                    if let Some(raft_node) = coordinator.raft_node(0) {
-                                        (
-                                            raft_node.current_term().await,
-                                            raft_node.commit_index().await,
-                                        )
+                    let ch = match tonic::transport::Channel::from_shared(endpoint.clone()) {
+                        Ok(e) => {
+                            match e.connect_timeout(Duration::from_secs(2)).connect().await {
+                                Ok(ch) => ch,
+                                Err(e) => {
+                                    let entry_ref = backoff
+                                        .entry(seed.clone())
+                                        .or_insert((now, 0));
+                                    entry_ref.1 += 1;
+                                    let delay = std::cmp::min(
+                                        heartbeat_ms * (1u64 << std::cmp::min(entry_ref.1, 10)),
+                                        60_000,
+                                    );
+                                    entry_ref.0 = now + Duration::from_millis(delay);
+                                    if entry_ref.1 == 1 {
+                                        warn!("Cannot connect to seed node {}: {}", seed, e);
                                     } else {
-                                        (0, 0)
-                                    };
-                                let req = tonic::Request::new(HeartbeatRequest {
-                                    node_id: node_id.clone(),
-                                    address: my_addr.clone(),
-                                    raft_term,
-                                    commit_index: commit_idx,
-                                    storage_bytes: 0,
-                                });
-                                match client.heartbeat(req).await {
-                                    Ok(resp) => {
-                                        let _resp = resp.into_inner();
+                                        info!(
+                                            "Seed {} unreachable (attempt {}, retry in {}ms)",
+                                            seed, entry_ref.1, delay
+                                        );
                                     }
-                                    Err(e) => {
-                                        warn!("Heartbeat to {} failed: {}", seed, e);
-                                    }
+                                    continue;
                                 }
                             }
-                            Err(e) => {
-                                warn!("Cannot connect to seed node {}: {}", seed, e);
-                            }
-                        },
+                        }
                         Err(e) => {
                             warn!("Invalid seed URI {}: {}", seed, e);
+                            continue;
                         }
+                    };
+
+                    // Connection succeeded — reset backoff.
+                    backoff.remove(seed.as_str());
+
+                    let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
+                    let (raft_term, commit_idx) =
+                        if let Some(raft_node) = coordinator.raft_node(0) {
+                            (
+                                raft_node.current_term().await,
+                                raft_node.commit_index().await,
+                            )
+                        } else {
+                            (0, 0)
+                        };
+                    let req = tonic::Request::new(HeartbeatRequest {
+                        node_id: node_id.clone(),
+                        address: my_addr.clone(),
+                        raft_term,
+                        commit_index: commit_idx,
+                        storage_bytes: 0,
+                    });
+                    if let Err(e) = client.heartbeat(req).await {
+                        let entry_ref = backoff
+                            .entry(seed.clone())
+                            .or_insert((now, 0));
+                        entry_ref.1 += 1;
+                        let delay = std::cmp::min(
+                            heartbeat_ms * (1u64 << std::cmp::min(entry_ref.1, 10)),
+                            60_000,
+                        );
+                        entry_ref.0 = now + Duration::from_millis(delay);
+                        warn!("Heartbeat to {} failed: {}", seed, e);
                     }
                 }
 

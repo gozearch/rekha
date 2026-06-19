@@ -2,46 +2,33 @@ use async_trait::async_trait;
 use rekha_core::RekhaError;
 use rekha_raft::{RaftCommand, RaftLogEntry, RaftPeerNetwork};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// Resolves peer node IDs to gRPC addresses.
-pub trait PeerAddressResolver: Send + Sync {
-    fn resolve(&self, peer_id: &str) -> Option<String>;
-}
-
 /// A gRPC-based Raft network that sends AppendEntries and RequestVote to peers.
+///
+/// Peer addresses are used directly (RaftNode.peers stores addresses like
+/// `"node-2:50051"`, not logical node IDs). Connections are cached.
 pub struct GrpcRaftNetwork {
-    resolver: Arc<dyn PeerAddressResolver>,
-    /// Cache of gRPC channels: peer_id -> Channel.
     channels: RwLock<HashMap<String, tonic::transport::Channel>>,
 }
 
 impl GrpcRaftNetwork {
-    pub fn new(resolver: Arc<dyn PeerAddressResolver>) -> Self {
+    pub fn new() -> Self {
         Self {
-            resolver,
             channels: RwLock::new(HashMap::new()),
         }
     }
 
     async fn get_client(
         &self,
-        peer_id: &str,
+        addr: &str,
     ) -> Result<crate::proto::rekha_client::RekhaClient<tonic::transport::Channel>, RekhaError>
     {
-        let addr = self
-            .resolver
-            .resolve(peer_id)
-            .ok_or_else(|| RekhaError::Internal {
-                detail: format!("unknown peer: {peer_id}"),
-            })?;
-
         // Check channel cache.
         {
             let cache = self.channels.read().await;
-            if let Some(ch) = cache.get(peer_id) {
+            if let Some(ch) = cache.get(addr) {
                 let client = crate::proto::rekha_client::RekhaClient::new(ch.clone());
                 return Ok(client);
             }
@@ -57,16 +44,22 @@ impl GrpcRaftNetwork {
             .connect()
             .await
             .map_err(|e| RekhaError::Internal {
-                detail: format!("cannot connect to peer {peer_id}: {e}"),
+                detail: format!("cannot connect to peer {addr}: {e}"),
             })?;
 
         {
             let mut cache = self.channels.write().await;
-            cache.insert(peer_id.to_string(), ch.clone());
+            cache.insert(addr.to_string(), ch.clone());
         }
 
         let client = crate::proto::rekha_client::RekhaClient::new(ch);
         Ok(client)
+    }
+}
+
+impl Default for GrpcRaftNetwork {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -108,7 +101,7 @@ fn raft_entry_to_proto(entry: &RaftLogEntry) -> crate::proto::RaftEntry {
 impl RaftPeerNetwork for GrpcRaftNetwork {
     async fn append_entries(
         &self,
-        peer_id: &str,
+        peer_addr: &str,
         partition_id: u64,
         leader_term: u64,
         leader_id: &str,
@@ -117,7 +110,7 @@ impl RaftPeerNetwork for GrpcRaftNetwork {
         entries: Vec<RaftLogEntry>,
         leader_commit: u64,
     ) -> Result<(bool, u64), RekhaError> {
-        let mut client = self.get_client(peer_id).await?;
+        let mut client = self.get_client(peer_addr).await?;
 
         let proto_entries: Vec<crate::proto::RaftEntry> =
             entries.iter().map(raft_entry_to_proto).collect();
@@ -146,14 +139,14 @@ impl RaftPeerNetwork for GrpcRaftNetwork {
 
     async fn request_vote(
         &self,
-        peer_id: &str,
+        peer_addr: &str,
         partition_id: u64,
         term: u64,
         candidate_id: &str,
         last_log_index: u64,
         last_log_term: u64,
     ) -> Result<(bool, u64), RekhaError> {
-        let mut client = self.get_client(peer_id).await?;
+        let mut client = self.get_client(peer_addr).await?;
 
         let req = tonic::Request::new(crate::proto::RaftVoteRequest {
             collection_name: "default".into(),

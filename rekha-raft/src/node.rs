@@ -607,12 +607,18 @@ impl RaftNode {
     fn notify_index(&self, cmd: &RaftCommand) {
         if let Some(ref handle) = self.index_handle {
             match cmd {
-                RaftCommand::Insert { id, vector, .. } => {
-                    handle.buffer_insert(*id, vector.clone());
+                RaftCommand::Insert {
+                    id,
+                    vector,
+                    payload,
+                    ..
+                } => {
+                    handle.buffer_insert(*id, vector.clone(), payload.clone());
                 }
-                RaftCommand::Delete { ids } => {
+                RaftCommand::Delete { ids, .. } => {
                     handle.buffer_delete(ids);
                 }
+                RaftCommand::CreateCollection { .. } | RaftCommand::DropCollection { .. } => {}
                 RaftCommand::NoOp => {}
             }
         }
@@ -765,6 +771,7 @@ mod tests {
         node.start_election().await.unwrap();
 
         let cmd = RaftCommand::Insert {
+            collection_name: "default".to_string(),
             id: 42,
             vector: vec![1.0, 2.0, 3.0],
             payload: None,
@@ -825,6 +832,7 @@ mod tests {
             term: 1,
             index: 1,
             command: RaftCommand::Insert {
+                collection_name: "default".to_string(),
                 id: 10,
                 vector: vec![1.0],
                 payload: None,
@@ -902,6 +910,7 @@ mod tests {
 
         for i in 0..5 {
             let cmd = RaftCommand::Insert {
+                collection_name: "default".to_string(),
                 id: i,
                 vector: vec![i as f32],
                 payload: None,
@@ -1100,6 +1109,7 @@ mod tests {
         node.start_election().await.unwrap();
         for i in 0..3 {
             node.propose(RaftCommand::Insert {
+                collection_name: "default".to_string(),
                 id: i,
                 vector: vec![i as f32],
                 payload: None,
@@ -1136,6 +1146,7 @@ mod tests {
         node.start_election().await.unwrap();
 
         node.propose(RaftCommand::Insert {
+            collection_name: "default".to_string(),
             id: 42,
             vector: vec![1.0, 2.0],
             payload: Some(b"test-payload".to_vec()),
@@ -1153,6 +1164,7 @@ mod tests {
         node.start_election().await.unwrap();
         for i in 0..5 {
             node.propose(RaftCommand::Insert {
+                collection_name: "default".to_string(),
                 id: i,
                 vector: vec![i as f32],
                 payload: None,
@@ -1180,6 +1192,7 @@ mod tests {
         let node = test_node();
         node.start_election().await.unwrap();
         node.propose(RaftCommand::Insert {
+            collection_name: "default".to_string(),
             id: 10,
             vector: vec![1.0, 2.0, 3.0],
             payload: None,

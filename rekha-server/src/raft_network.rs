@@ -66,6 +66,7 @@ impl Default for GrpcRaftNetwork {
 fn raft_entry_to_proto(entry: &RaftLogEntry) -> crate::proto::RaftEntry {
     let cmd = match &entry.command {
         RaftCommand::Insert {
+            collection_name,
             id,
             vector,
             payload,
@@ -77,16 +78,21 @@ fn raft_entry_to_proto(entry: &RaftLogEntry) -> crate::proto::RaftEntry {
                     content_type: "raw".into(),
                     data,
                 }),
-                collection_name: String::new(),
+                collection_name: collection_name.clone(),
             },
         )),
-        RaftCommand::Delete { ids } => Some(crate::proto::raft_command::Cmd::Delete(
+        RaftCommand::Delete {
+            collection_name,
+            ids,
+        } => Some(crate::proto::raft_command::Cmd::Delete(
             crate::proto::DeleteRequest {
                 ids: ids.clone(),
-                collection_name: String::new(),
+                collection_name: collection_name.clone(),
             },
         )),
-        RaftCommand::NoOp => None,
+        RaftCommand::CreateCollection { .. }
+        | RaftCommand::DropCollection { .. }
+        | RaftCommand::NoOp => None,
     };
 
     crate::proto::RaftEntry {

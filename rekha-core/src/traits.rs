@@ -59,7 +59,8 @@ pub trait PartitionStrategy: Send + Sync {
 /// Avoids circular dependency between rekha-raft and rekha-index.
 pub trait IndexBufferHandle: Send + Sync {
     /// Push a committed insert to the index buffer for immediate searchability.
-    fn buffer_insert(&self, id: u64, vector: Vec<f32>);
+    /// Persists both vector and payload atomically.
+    fn buffer_insert(&self, id: u64, vector: Vec<f32>, payload: Option<Vec<u8>>);
     /// Mark committed deletes in the index buffer.
     fn buffer_delete(&self, ids: &[u64]);
 }

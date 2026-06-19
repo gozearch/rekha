@@ -200,6 +200,18 @@ pub struct CollectionInfo {
     pub index_ready: bool,
 }
 
+/// Metadata stored for each collection in the metadata Raft group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionMetadata {
+    pub name: String,
+    pub dim: usize,
+    pub config: CollectionConfig,
+    pub created_at: u64,
+}
+
+/// Reserved partition ID for the metadata Raft group.
+pub const METADATA_PARTITION_ID: u64 = u64::MAX;
+
 /// Statistics about a search operation.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchStats {

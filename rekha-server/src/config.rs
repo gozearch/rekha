@@ -74,7 +74,7 @@ impl ServerConfig {
         Self {
             cluster: ClusterConfig {
                 node_id: node_id.to_string(),
-                seed_nodes: vec![format!("127.0.0.1:50051")],
+                seed_nodes: vec![format!("{node_id}:50051")],
                 bind_addr: "0.0.0.0:50051".into(),
                 data_dir: data_dir.into(),
                 assigned_shards: vec![],

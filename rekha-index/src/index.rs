@@ -456,7 +456,7 @@ impl VectorIndex for RekhaIndex {
 }
 
 impl IndexBufferHandle for RekhaIndex {
-    fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
+    fn buffer_insert(&self, id: u64, vector: Vec<f32>, _payload: Option<Vec<u8>>) {
         if let Ok(mut buf) = self.insert_buffer.write() {
             buf.push(id, vector);
         }
@@ -470,6 +470,14 @@ impl IndexBufferHandle for RekhaIndex {
 }
 
 impl RekhaIndex {
+    /// Push a vector into the insert buffer for immediate searchability.
+    /// This is the internal buffer method (not the IndexBufferHandle trait).
+    pub fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
+        if let Ok(mut buf) = self.insert_buffer.write() {
+            buf.push(id, vector);
+        }
+    }
+
     #[allow(dead_code)]
     fn vector_by_id(&self, id: u64) -> Option<(Vec<f32>, bool)> {
         // Check indexed vectors first

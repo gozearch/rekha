@@ -54,9 +54,9 @@ enum Commands {
         /// Collection name
         #[arg(short, long, default_value = "default")]
         collection: String,
-        /// Optional configuration (JSON or YAML string)
-        #[arg(long)]
-        config: Option<String>,
+        /// Vector dimension
+        #[arg(short, long, default_value_t = 256)]
+        dim: u32,
     },
     /// Drop (delete) a collection
     DropCollection {
@@ -91,21 +91,6 @@ async fn main() -> anyhow::Result<()> {
                 .run()
                 .await
                 .map_err(|e| anyhow::anyhow!("Server error: {e}"))?;
-        }
-        Commands::CreateCollection { collection, config } => {
-            let _ = (collection, config);
-            println!("not implemented yet");
-        }
-        Commands::DropCollection { collection } => {
-            let _ = collection;
-            println!("not implemented yet");
-        }
-        Commands::ListCollections => {
-            println!("not implemented yet");
-        }
-        Commands::CollectionExists { collection } => {
-            let _ = collection;
-            println!("not implemented yet");
         }
         _ => {
             let client = RekhaClient::connect(&[cli.address])
@@ -165,11 +150,29 @@ async fn main() -> anyhow::Result<()> {
                     println!("Health check...");
                     println!("OK");
                 }
+                Commands::CreateCollection { collection, dim } => {
+                    client.create_collection(&collection, dim).await?;
+                    println!("Created collection '{collection}' (dim={dim})");
+                }
+                Commands::DropCollection { collection } => {
+                    client.drop_collection(&collection).await?;
+                    println!("Dropped collection '{collection}'");
+                }
+                Commands::ListCollections => {
+                    let cols = client.list_collections().await?;
+                    if cols.is_empty() {
+                        println!("No collections");
+                    } else {
+                        println!("Collections:");
+                        for name in cols {
+                            println!("  - {name}");
+                        }
+                    }
+                }
+                Commands::CollectionExists { collection: _ } => {
+                    println!("Check exists not implemented in client");
+                }
                 Commands::Server { .. } => unreachable!(),
-                Commands::CreateCollection { .. } => unreachable!(),
-                Commands::DropCollection { .. } => unreachable!(),
-                Commands::ListCollections => unreachable!(),
-                Commands::CollectionExists { .. } => unreachable!(),
             }
         }
     }
@@ -290,29 +293,29 @@ mod tests {
     fn test_cli_parse_create_collection() {
         let cli = Cli::try_parse_from(["rekha", "create-collection", "-c", "new_col"]).unwrap();
         match cli.command {
-            Commands::CreateCollection { collection, config } => {
+            Commands::CreateCollection { collection, dim } => {
                 assert_eq!(collection, "new_col");
-                assert!(config.is_none());
+                assert_eq!(dim, 256);
             }
             _ => panic!("expected CreateCollection command"),
         }
     }
 
     #[test]
-    fn test_cli_parse_create_collection_with_config() {
+    fn test_cli_parse_create_collection_with_dim() {
         let cli = Cli::try_parse_from([
             "rekha",
             "create-collection",
             "-c",
             "new_col",
-            "--config",
-            "{\"dim\":128}",
+            "-d",
+            "768",
         ])
         .unwrap();
         match cli.command {
-            Commands::CreateCollection { collection, config } => {
+            Commands::CreateCollection { collection, dim } => {
                 assert_eq!(collection, "new_col");
-                assert_eq!(config, Some("{\"dim\":128}".into()));
+                assert_eq!(dim, 768);
             }
             _ => panic!("expected CreateCollection command"),
         }

@@ -408,6 +408,79 @@ impl RekhaClient {
         .await
     }
 
+    /// Create a new collection.
+    pub async fn create_collection(&self, name: &str, dim: u32) -> Result<(), RekhaError> {
+        let channel = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("create_collection", move || {
+            let request = tonic::Request::new(crate::proto::CreateCollectionRequest {
+                name: name.clone(),
+                config: Some(crate::proto::CollectionConfig {
+                    dim,
+                    num_vector_shards: 0,
+                    replication_factor: 0,
+                    num_dim_groups: 0,
+                    dim_group_size: 0,
+                    graph_degree: 0,
+                    search_list_size: 0,
+                    pq_num_sub_vectors: 0,
+                    pq_num_centroids: 0,
+                    re_rank_k: 0,
+                }),
+            });
+            let mut client = GrpcClient::new(channel.clone());
+            async move {
+                let resp = client.create_collection(request).await?;
+                if resp.into_inner().success {
+                    Ok(())
+                } else {
+                    Err(tonic::Status::internal("create_collection failed"))
+                }
+            }
+        })
+        .await
+    }
+
+    /// Drop a collection.
+    pub async fn drop_collection(&self, name: &str) -> Result<(), RekhaError> {
+        let channel = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("drop_collection", move || {
+            let request = tonic::Request::new(crate::proto::DropCollectionRequest {
+                name: name.clone(),
+            });
+            let mut client = GrpcClient::new(channel.clone());
+            async move {
+                let resp = client.drop_collection(request).await?;
+                if resp.into_inner().success {
+                    Ok(())
+                } else {
+                    Err(tonic::Status::internal("drop_collection failed"))
+                }
+            }
+        })
+        .await
+    }
+
+    /// List all collections.
+    pub async fn list_collections(&self) -> Result<Vec<String>, RekhaError> {
+        let channel = self.channel.read().await.clone();
+        self.with_retry("list_collections", move || {
+            let request = tonic::Request::new(crate::proto::ListCollectionsRequest {});
+            let mut client = GrpcClient::new(channel.clone());
+            async move {
+                let resp = client.list_collections(request).await?;
+                Ok(resp
+                    .into_inner()
+                    .collections
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect())
+            }
+        })
+        .await
+    }
+
     /// Get cluster topology information.
     pub async fn cluster_info(&self) -> Result<(), RekhaError> {
         Ok(())

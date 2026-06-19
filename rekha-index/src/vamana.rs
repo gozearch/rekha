@@ -355,15 +355,15 @@ impl VamanaGraph {
     }
 }
 
-    /// Min-heap node for search priority queue.
-    /// Smaller distances are higher priority (reversed Ord for BinaryHeap).
-    #[derive(Debug, Clone)]
-    struct SearchNode {
-        dist: f32,
-        #[allow(dead_code)]
-        id: u64,
-        pos: usize,
-    }
+/// Min-heap node for search priority queue.
+/// Smaller distances are higher priority (reversed Ord for BinaryHeap).
+#[derive(Debug, Clone)]
+struct SearchNode {
+    dist: f32,
+    #[allow(dead_code)]
+    id: u64,
+    pos: usize,
+}
 
 impl PartialEq for SearchNode {
     fn eq(&self, other: &Self) -> bool {

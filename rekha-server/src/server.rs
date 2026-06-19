@@ -1,5 +1,6 @@
 use rekha_index::RekhaIndex;
 use rekha_partition::PartitionManager;
+use rekha_raft::RaftLogStore;
 use rekha_storage::RocksVectorStore;
 
 use std::collections::HashMap;
@@ -67,51 +68,56 @@ impl ServerInstance {
             partition_manager,
         ));
 
-        // Create Raft nodes for each assigned vector shard.
-        let raft_log_store = coordinator.raft_log_store();
-        let raft_network = Arc::new(GrpcRaftNetwork::new());
-        let shards: Vec<u64> = if config.cluster.assigned_shards.is_empty() {
-            (0..config.partition.num_vector_shards).collect()
-        } else {
-            config.cluster.assigned_shards.clone()
-        };
-        let num_assigned_shards = shards.len();
-        for shard in shards {
-            let state = rekha_raft::ReplicatedState::new(shard);
-            let node_id = &config.cluster.node_id;
-            let peers: Vec<String> = config
+        // Create metadata Raft node (partition_id = METADATA_PARTITION_ID).
+        {
+            let meta_state = rekha_raft::ReplicatedState::new(rekha_core::METADATA_PARTITION_ID);
+            let meta_peers: Vec<String> = config
                 .cluster
                 .seed_nodes
                 .iter()
-                .filter(|s| {
-                    !s.starts_with(node_id)
-                })
+                .filter(|s| !s.starts_with(&config.cluster.node_id))
                 .cloned()
                 .collect();
-            let raft_node = Arc::new(rekha_raft::RaftNode::with_store(
+            let meta_log_store = RaftLogStore::new(store.clone());
+            let meta_network = Arc::new(GrpcRaftNetwork::new());
+            let is_meta_single = meta_peers.is_empty();
+            let meta_raft = Arc::new(rekha_raft::RaftNode::with_store(
                 config.cluster.node_id.clone(),
-                shard,
-                peers,
-                state,
-                Some(raft_log_store.clone()),
-                Some(coordinator.clone() as Arc<dyn rekha_core::IndexBufferHandle>),
-                Some(raft_network.clone() as Arc<dyn rekha_raft::RaftPeerNetwork>),
+                rekha_core::METADATA_PARTITION_ID,
+                meta_peers,
+                meta_state,
+                Some(meta_log_store),
+                None,
+                Some(meta_network.clone() as Arc<dyn rekha_raft::RaftPeerNetwork>),
             ));
-            coordinator.register_raft_node(shard, raft_node);
+            // Self-elect metadata Raft in single-node mode.
+            if is_meta_single {
+                meta_raft.start_election().await.unwrap_or_else(|e| {
+                    warn!("Failed to self-elect metadata Raft: {e}");
+                });
+            }
+            coordinator.set_metadata_raft(meta_raft).await;
+            info!("Metadata Raft node created");
         }
-        info!("Created {} Raft nodes for partitions", num_assigned_shards);
 
-        // Create an empty (unbuilt) index and initialize the coordinator.
-        let dim = config.partition.dim_group_size * config.partition.num_dim_groups as usize;
-        let index = RekhaIndex::new(
-            dim,
-            config.index.pq_num_sub_vectors,
-            config.index.pq_num_centroids,
-            config.index.graph_degree,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )?;
-        coordinator.initialize(index).await;
+        // Create the "default" collection.
+        let default_dim =
+            config.partition.dim_group_size * config.partition.num_dim_groups as usize;
+        coordinator
+            .create_collection("default", default_dim)
+            .await?;
+        info!("Default collection created (dim={default_dim})");
+
+        // Self-elect data Raft nodes with no peers.
+        for entry in coordinator.raft_nodes.iter() {
+            if entry.value().peers().is_empty() {
+                entry.value().start_election().await.unwrap_or_else(|e| {
+                    warn!("Failed to self-elect Raft node {}: {e}", entry.key());
+                });
+            }
+        }
+
+        coordinator.initialize().await;
 
         Ok(Self {
             config,
@@ -119,9 +125,10 @@ impl ServerInstance {
         })
     }
 
-    /// Set the index on the coordinator.
+    /// Set the index on the coordinator (deprecated — index is now per-collection).
+    #[allow(unused_variables)]
     pub async fn with_index(self, index: RekhaIndex) -> Self {
-        self.coordinator.initialize(index).await;
+        info!("with_index is deprecated in multi-collection mode — use create_collection instead");
         self
     }
 
@@ -167,31 +174,27 @@ impl ServerInstance {
 
                     let endpoint = format!("http://{}", seed);
                     let ch = match tonic::transport::Channel::from_shared(endpoint.clone()) {
-                        Ok(e) => {
-                            match e.connect_timeout(Duration::from_secs(2)).connect().await {
-                                Ok(ch) => ch,
-                                Err(e) => {
-                                    let entry_ref = backoff
-                                        .entry(seed.clone())
-                                        .or_insert((now, 0));
-                                    entry_ref.1 += 1;
-                                    let delay = std::cmp::min(
-                                        heartbeat_ms * (1u64 << std::cmp::min(entry_ref.1, 10)),
-                                        60_000,
+                        Ok(e) => match e.connect_timeout(Duration::from_secs(2)).connect().await {
+                            Ok(ch) => ch,
+                            Err(e) => {
+                                let entry_ref = backoff.entry(seed.clone()).or_insert((now, 0));
+                                entry_ref.1 += 1;
+                                let delay = std::cmp::min(
+                                    heartbeat_ms * (1u64 << std::cmp::min(entry_ref.1, 10)),
+                                    60_000,
+                                );
+                                entry_ref.0 = now + Duration::from_millis(delay);
+                                if entry_ref.1 == 1 {
+                                    warn!("Cannot connect to seed node {}: {}", seed, e);
+                                } else {
+                                    info!(
+                                        "Seed {} unreachable (attempt {}, retry in {}ms)",
+                                        seed, entry_ref.1, delay
                                     );
-                                    entry_ref.0 = now + Duration::from_millis(delay);
-                                    if entry_ref.1 == 1 {
-                                        warn!("Cannot connect to seed node {}: {}", seed, e);
-                                    } else {
-                                        info!(
-                                            "Seed {} unreachable (attempt {}, retry in {}ms)",
-                                            seed, entry_ref.1, delay
-                                        );
-                                    }
-                                    continue;
                                 }
+                                continue;
                             }
-                        }
+                        },
                         Err(e) => {
                             warn!("Invalid seed URI {}: {}", seed, e);
                             continue;
@@ -202,15 +205,15 @@ impl ServerInstance {
                     backoff.remove(seed.as_str());
 
                     let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
-                    let (raft_term, commit_idx) =
-                        if let Some(raft_node) = coordinator.raft_node(0) {
-                            (
-                                raft_node.current_term().await,
-                                raft_node.commit_index().await,
-                            )
-                        } else {
-                            (0, 0)
-                        };
+                    let (raft_term, commit_idx) = if let Some(raft_node) = coordinator.raft_node(0)
+                    {
+                        (
+                            raft_node.current_term().await,
+                            raft_node.commit_index().await,
+                        )
+                    } else {
+                        (0, 0)
+                    };
                     let req = tonic::Request::new(HeartbeatRequest {
                         node_id: node_id.clone(),
                         address: my_addr.clone(),
@@ -219,9 +222,7 @@ impl ServerInstance {
                         storage_bytes: 0,
                     });
                     if let Err(e) = client.heartbeat(req).await {
-                        let entry_ref = backoff
-                            .entry(seed.clone())
-                            .or_insert((now, 0));
+                        let entry_ref = backoff.entry(seed.clone()).or_insert((now, 0));
                         entry_ref.1 += 1;
                         let delay = std::cmp::min(
                             heartbeat_ms * (1u64 << std::cmp::min(entry_ref.1, 10)),

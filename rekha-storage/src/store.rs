@@ -1,4 +1,4 @@
-use rekha_core::{RekhaError, StorageError, VectorStoreBackend};
+use rekha_core::{CollectionMeta, RekhaError, StorageError, VectorStoreBackend};
 use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded, Options};
 use std::path::Path;
 use std::sync::Arc;
@@ -132,6 +132,108 @@ impl Drop for RocksVectorStore {
 }
 
 impl RocksVectorStore {
+    /// Store collection metadata in the `metadata` column family.
+    /// Key: `b"collection:{name}"`, value: bincode(CollectionMeta).
+    pub fn store_collection_meta(&self, meta: &CollectionMeta) -> Result<(), RekhaError> {
+        let key = Self::collection_meta_key(&meta.name);
+        let value = bincode::serialize(meta).map_err(|e| RekhaError::Internal {
+            detail: format!("failed to serialize collection meta: {e}"),
+        })?;
+        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
+            StorageError::ColumnFamily {
+                name: CF_METADATA.into(),
+                source: "handle not found".into(),
+            }
+        })?;
+        self.db.put_cf(&cf, key, value).map_err(|e| {
+            StorageError::Write {
+                source: e.to_string(),
+            }
+            .into()
+        })
+    }
+
+    /// Load collection metadata by name.
+    pub fn load_collection_meta(&self, name: &str) -> Result<Option<CollectionMeta>, RekhaError> {
+        let key = Self::collection_meta_key(name);
+        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
+            StorageError::ColumnFamily {
+                name: CF_METADATA.into(),
+                source: "handle not found".into(),
+            }
+        })?;
+        match self.db.get_cf(&cf, key) {
+            Ok(Some(bytes)) => {
+                let meta: CollectionMeta = bincode::deserialize(&bytes).map_err(|e| {
+                    RekhaError::Internal {
+                        detail: format!("failed to deserialize collection meta: {e}"),
+                    }
+                })?;
+                Ok(Some(meta))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(StorageError::Read {
+                key: name.as_bytes().to_vec(),
+                source: e.to_string(),
+            }
+            .into()),
+        }
+    }
+
+    /// List all collection names by scanning the metadata CF with prefix `collection:`.
+    pub fn list_collections(&self) -> Result<Vec<CollectionMeta>, RekhaError> {
+        let prefix = b"collection:";
+        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
+            StorageError::ColumnFamily {
+                name: CF_METADATA.into(),
+                source: "handle not found".into(),
+            }
+        })?;
+        let mut collections = Vec::new();
+        let iter = self.db.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(
+                prefix,
+                rocksdb::Direction::Forward,
+            ),
+        );
+        for result in iter {
+            let (key, value) = result.map_err(|e| RekhaError::Internal {
+                detail: format!("db iteration error: {e}"),
+            })?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if let Ok(meta) = bincode::deserialize::<CollectionMeta>(&value) {
+                collections.push(meta);
+            }
+        }
+        Ok(collections)
+    }
+
+    /// Delete collection metadata by name.
+    pub fn delete_collection_meta(&self, name: &str) -> Result<(), RekhaError> {
+        let key = Self::collection_meta_key(name);
+        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
+            StorageError::ColumnFamily {
+                name: CF_METADATA.into(),
+                source: "handle not found".into(),
+            }
+        })?;
+        self.db.delete_cf(&cf, key).map_err(|e| {
+            StorageError::Write {
+                source: e.to_string(),
+            }
+            .into()
+        })
+    }
+
+    fn collection_meta_key(name: &str) -> Vec<u8> {
+        let mut key = b"collection:".to_vec();
+        key.extend_from_slice(name.as_bytes());
+        key
+    }
+
     /// Delete all keys within the current namespace across all column families.
     pub fn delete_all_in_namespace(&self) -> Result<u64, RekhaError> {
         let prefix = self
@@ -343,6 +445,7 @@ fn bytes_to_vector(bytes: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rekha_core::{CollectionConfig, CollectionMeta, DistanceMetric};
 
     #[test]
     fn vector_roundtrip() {
@@ -714,5 +817,86 @@ mod tests {
         let mut ns_ids = store_ns.iter_ids().unwrap();
         ns_ids.sort();
         assert_eq!(ns_ids, vec![20, 30]);
+    }
+
+    #[test]
+    fn test_store_collection_meta() {
+        let dir = std::env::temp_dir().join("rekha_test_col_meta");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+
+        let meta = CollectionMeta {
+            name: "test_col".into(),
+            config: CollectionConfig {
+                dim: 128,
+                ..Default::default()
+            },
+            vector_count: 0,
+            index_ready: false,
+            created_at_secs: 1000,
+        };
+        store.store_collection_meta(&meta).unwrap();
+        let loaded = store.load_collection_meta("test_col").unwrap().unwrap();
+        assert_eq!(loaded.name, "test_col");
+        assert_eq!(loaded.config.dim, 128);
+        assert_eq!(loaded.vector_count, 0);
+    }
+
+    #[test]
+    fn test_load_collection_meta_missing() {
+        let dir = std::env::temp_dir().join("rekha_test_col_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+        let loaded = store.load_collection_meta("nonexistent").unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_list_collections() {
+        let dir = std::env::temp_dir().join("rekha_test_list_col");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+
+        let meta1 = CollectionMeta {
+            name: "col_a".into(),
+            config: CollectionConfig::default(),
+            vector_count: 0,
+            index_ready: false,
+            created_at_secs: 100,
+        };
+        let meta2 = CollectionMeta {
+            name: "col_b".into(),
+            config: CollectionConfig::default(),
+            vector_count: 10,
+            index_ready: true,
+            created_at_secs: 200,
+        };
+        store.store_collection_meta(&meta1).unwrap();
+        store.store_collection_meta(&meta2).unwrap();
+
+        let list = store.list_collections().unwrap();
+        assert_eq!(list.len(), 2);
+        let names: Vec<&str> = list.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"col_a"));
+        assert!(names.contains(&"col_b"));
+    }
+
+    #[test]
+    fn test_delete_collection_meta() {
+        let dir = std::env::temp_dir().join("rekha_test_del_col");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RocksVectorStore::open(&dir).unwrap();
+
+        let meta = CollectionMeta {
+            name: "to_delete".into(),
+            config: CollectionConfig::default(),
+            vector_count: 0,
+            index_ready: false,
+            created_at_secs: 0,
+        };
+        store.store_collection_meta(&meta).unwrap();
+        assert!(store.load_collection_meta("to_delete").unwrap().is_some());
+        store.delete_collection_meta("to_delete").unwrap();
+        assert!(store.load_collection_meta("to_delete").unwrap().is_none());
     }
 }

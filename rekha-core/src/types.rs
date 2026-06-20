@@ -178,6 +178,7 @@ pub struct CollectionConfig {
     pub pq_num_sub_vectors: u32,
     pub pq_num_centroids: u32,
     pub re_rank_k: u32,
+    pub distance_metric: DistanceMetric,
 }
 
 impl Default for CollectionConfig {
@@ -193,8 +194,19 @@ impl Default for CollectionConfig {
             pq_num_sub_vectors: 64,
             pq_num_centroids: 256,
             re_rank_k: 256,
+            distance_metric: DistanceMetric::L2,
         }
     }
+}
+
+/// Runtime metadata about a collection, persisted in the `metadata` CF.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionMeta {
+    pub name: String,
+    pub config: CollectionConfig,
+    pub vector_count: u64,
+    pub index_ready: bool,
+    pub created_at_secs: u64,
 }
 
 /// Info about a named collection returned by list/describe.

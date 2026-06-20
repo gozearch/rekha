@@ -8,8 +8,9 @@ use tracing::info;
 use tonic::transport::ClientTlsConfig;
 
 use crate::proto::{
-    self, rekha_client::RekhaClient as GrpcClient, FetchRequest, InsertRequest, SearchRequest,
-    SearchResponse,
+    self, rekha_client::RekhaClient as GrpcClient, CollectionExistsRequest,
+    CreateCollectionRequest, DropCollectionRequest, FetchRequest, HandshakeRequest,
+    InsertRequest, ListCollectionsRequest, SearchRequest, SearchResponse,
 };
 
 /// A user-friendly client for the Rekha distributed vector database.
@@ -411,6 +412,111 @@ impl RekhaClient {
     /// Get cluster topology information.
     pub async fn cluster_info(&self) -> Result<(), RekhaError> {
         Ok(())
+    }
+
+    /// Create a new collection.
+    pub async fn create_collection(&self, name: &str, dim: u32) -> Result<(), RekhaError> {
+        let channel = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("create_collection", move || {
+            let request = tonic::Request::new(CreateCollectionRequest {
+                name: name.clone(),
+                config: Some(crate::proto::CollectionConfig {
+                    dim,
+                    num_vector_shards: 1,
+                    replication_factor: 1,
+                    num_dim_groups: 1,
+                    dim_group_size: dim,
+                    graph_degree: 64,
+                    search_list_size: 128,
+                    pq_num_sub_vectors: std::cmp::min(64, dim),
+                    pq_num_centroids: 256,
+                    re_rank_k: 256,
+                }),
+            });
+            let mut client = GrpcClient::new(channel.clone());
+            async move {
+                let response = client.create_collection(request).await?;
+                let resp = response.into_inner();
+                if resp.success {
+                    Ok(())
+                } else {
+                    Err(tonic::Status::internal(resp.error))
+                }
+            }
+        })
+        .await
+    }
+
+    /// Delete a collection and all its data.
+    pub async fn drop_collection(&self, name: &str) -> Result<(), RekhaError> {
+        let channel = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("drop_collection", move || {
+            let request = tonic::Request::new(DropCollectionRequest { name: name.clone() });
+            let mut client = GrpcClient::new(channel.clone());
+            async move {
+                let response = client.drop_collection(request).await?;
+                let resp = response.into_inner();
+                if resp.success {
+                    Ok(())
+                } else {
+                    Err(tonic::Status::internal(resp.error))
+                }
+            }
+        })
+        .await
+    }
+
+    /// List all collections.
+    pub async fn list_collections(&self) -> Result<Vec<String>, RekhaError> {
+        let channel = self.channel.read().await.clone();
+        self.with_retry("list_collections", move || {
+            let request = tonic::Request::new(ListCollectionsRequest {});
+            let mut client = GrpcClient::new(channel.clone());
+            async move {
+                let response = client.list_collections(request).await?;
+                let resp = response.into_inner();
+                Ok(resp
+                    .collections
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect::<Vec<_>>())
+            }
+        })
+        .await
+    }
+
+    /// Check if a collection exists.
+    pub async fn collection_exists(&self, name: &str) -> Result<bool, RekhaError> {
+        let channel = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("collection_exists", move || {
+            let request = tonic::Request::new(CollectionExistsRequest { name: name.clone() });
+            let mut client = GrpcClient::new(channel.clone());
+            async move {
+                let response = client.collection_exists(request).await?;
+                Ok(response.into_inner().exists)
+            }
+        })
+        .await
+    }
+
+    /// Health check: verify the server is reachable via handshake.
+    pub async fn health_check(&self) -> Result<(), RekhaError> {
+        let channel = self.channel.read().await.clone();
+        self.with_retry("health_check", move || {
+            let request = tonic::Request::new(HandshakeRequest {
+                node_id: String::new(),
+                address: String::new(),
+            });
+            let mut client = GrpcClient::new(channel.clone());
+            async move {
+                client.handshake(request).await?;
+                Ok(())
+            }
+        })
+        .await
     }
 }
 

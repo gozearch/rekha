@@ -329,12 +329,13 @@ impl Coordinator {
                 Some(raft_log_store.clone()),
                 Some(handle.clone() as Arc<dyn IndexBufferHandle>),
             ));
+            // Start election for single-node (no peers → self-elects)
+            if peers.is_empty() {
+                let _ = raft_node.start_election().await;
+            }
             raft_nodes.insert(shard, raft_node);
         }
-        info!(
-            "Created {} Raft nodes for collection '{}'",
-            num_shards, name
-        );
+        info!("Created {} Raft nodes for collection '{}'", num_shards, name);
 
         let state = CollectionState {
             config: config.clone(),
@@ -409,14 +410,23 @@ impl Coordinator {
         }
         let dim_val = (self.config.partition.dim_group_size as usize)
             * (self.config.partition.num_dim_groups as usize);
+        let mut pq_m = std::cmp::min(self.config.index.pq_num_sub_vectors as u32, dim_val as u32);
+        // Ensure pq_m divides dim evenly (PQ requirement)
+        while pq_m > 1 && dim_val as u32 % pq_m != 0 {
+            pq_m -= 1;
+        }
         let config = CollectionConfig {
             dim: dim_val as u32,
             num_vector_shards: self.config.partition.num_vector_shards,
             replication_factor: self.config.partition.replication_factor as u64,
             num_dim_groups: self.config.partition.num_dim_groups,
             dim_group_size: self.config.partition.dim_group_size as u32,
+            graph_degree: self.config.index.graph_degree as u32,
+            search_list_size: self.config.index.search_list_size as u32,
+            pq_num_sub_vectors: pq_m,
+            pq_num_centroids: self.config.index.pq_num_centroids as u32,
+            re_rank_k: std::cmp::min(self.config.index.re_rank_k as u32, dim_val as u32),
             distance_metric: DistanceMetric::L2,
-            ..Default::default()
         };
         let meta = CollectionMeta {
             name: name.to_string(),
@@ -790,6 +800,7 @@ impl Coordinator {
         };
 
         let store = state.store.clone();
+        let index = state.index.clone();
         if let Some(raft_node) = state.raft_nodes.get(&0) {
             if raft_node.is_leader().await {
                 let cmd = rekha_raft::state::RaftCommand::Insert {
@@ -806,6 +817,11 @@ impl Coordinator {
         store.put_vector(id, &vector)?;
         if let Some(ref p) = payload {
             store.put_payload(id, &p.data)?;
+        }
+        // Also buffer into index for immediate searchability
+        let mut idx_guard = index.write().await;
+        if let Some(ref mut idx) = *idx_guard {
+            idx.buffer_insert(id, vector);
         }
         Ok(id)
     }

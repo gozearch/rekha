@@ -14,6 +14,15 @@ use crate::coordinator::{Coordinator, SystemRaftHandle, SYSTEM_PARTITION_ID};
 use crate::proto::rekha_server::RekhaServer as RekhaGrpcServer;
 use crate::proto::{AppendEntriesRequest, HeartbeatRequest, RaftVoteRequest};
 use crate::service::RekhaService;
+use tonic::transport::Channel;
+
+async fn connect_peer(addr: &str, timeout: Duration) -> Option<Channel> {
+    let uri = format!("http://{addr}");
+    match tonic::transport::Channel::from_shared(uri) {
+        Ok(e) => e.connect_timeout(timeout).connect().await.ok(),
+        Err(_) => None,
+    }
+}
 
 pub struct ServerInstance {
     config: ServerConfig,
@@ -277,17 +286,10 @@ impl ServerInstance {
                             let majority = group_size / 2 + 1;
 
                             for peer_addr in &peers {
-                                let endpoint = format!("http://{}", peer_addr);
-                                let ch = match tonic::transport::Channel::from_shared(endpoint) {
-                                    Ok(e) => match e
-                                        .connect_timeout(Duration::from_secs(2))
-                                        .connect()
-                                        .await
-                                    {
-                                        Ok(ch) => ch,
-                                        Err(_) => continue,
-                                    },
-                                    Err(_) => continue,
+                                let Some(ch) =
+                                    connect_peer(peer_addr, Duration::from_secs(2)).await
+                                else {
+                                    continue;
                                 };
                                 let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
                                 let req = tonic::Request::new(RaftVoteRequest {
@@ -344,15 +346,8 @@ impl ServerInstance {
                         let (entries, prev_log_index, prev_log_term) =
                             node.entries_for_peer(peer_addr).await;
 
-                        let endpoint = format!("http://{}", peer_addr);
-                        let ch = match tonic::transport::Channel::from_shared(endpoint) {
-                            Ok(e) => {
-                                match e.connect_timeout(Duration::from_secs(2)).connect().await {
-                                    Ok(ch) => ch,
-                                    Err(_) => continue,
-                                }
-                            }
-                            Err(_) => continue,
+                        let Some(ch) = connect_peer(peer_addr, Duration::from_secs(2)).await else {
+                            continue;
                         };
                         let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
 

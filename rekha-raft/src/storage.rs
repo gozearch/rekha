@@ -1,20 +1,10 @@
 use crate::node::RaftLogEntry;
+use rekha_core::RekhaError;
 use rekha_storage::RocksVectorStore;
-use rocksdb::DBWithThreadMode;
+use rocksdb::{BoundColumnFamily, DBWithThreadMode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Persistent Raft log storage backed by RocksDB.
-///
-/// Key layout within the `raft_log` column family:
-/// - Entry key:   `[namespace\0] [partition_id (8B BE)] [log_index (8B BE)]`
-/// - Entry value: `bincode(RaftLogEntry)`
-/// - State key:   `[namespace\0] [partition_id (8B BE)] [0xFF * 8]`
-/// - State value: `bincode { term: u64, voted_for: Option<String> }`
-///
-/// The `namespace` prefix isolates data for different collections within
-/// the same RocksDB instance. When `namespace` is `None`, the format is
-/// backward-compatible with single-collection keys.
 pub struct RaftLogStore {
     store: Arc<RocksVectorStore>,
     namespace: Option<String>,
@@ -62,6 +52,51 @@ fn entry_prefix(namespace: &Option<String>, partition_id: u64) -> Vec<u8> {
     key
 }
 
+impl RaftLogStore {
+    /// Access the raft_log column family handle.
+    fn raft_log_cf(&self) -> Result<Arc<BoundColumnFamily<'_>>, RekhaError> {
+        db(&self.store)
+            .cf_handle("raft_log")
+            .ok_or_else(|| RekhaError::Internal {
+                detail: "raft_log column family not found".into(),
+            })
+    }
+
+    /// Serialize a RaftLogEntry to bytes.
+    fn serialize_entry(entry: &RaftLogEntry) -> Result<Vec<u8>, RekhaError> {
+        bincode::serialize(entry).map_err(|e| RekhaError::Internal {
+            detail: format!("failed to serialize Raft entry: {e}"),
+        })
+    }
+
+    /// Find the last entry for a partition by reverse-iterating.
+    fn last_entry(&self, partition_id: u64) -> Result<Option<RaftLogEntry>, RekhaError> {
+        let cf = self.raft_log_cf()?;
+        let prefix = entry_prefix(&self.namespace, partition_id);
+        let mut start = prefix.clone();
+        start.extend_from_slice(&u64::MAX.to_be_bytes());
+        let iter = db(&self.store).iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Reverse),
+        );
+        for result in iter {
+            let (key, value) = result.map_err(|e| RekhaError::Internal {
+                detail: format!("db iteration error: {e}"),
+            })?;
+            if key.starts_with(&prefix) && key.len() == prefix.len() + 8 {
+                return Ok(Some(Self::deserialize_entry(&value)?));
+            }
+        }
+        Ok(None)
+    }
+
+    fn deserialize_entry(value: &[u8]) -> Result<RaftLogEntry, RekhaError> {
+        bincode::deserialize(value).map_err(|e| RekhaError::Internal {
+            detail: format!("failed to deserialize Raft entry: {e}"),
+        })
+    }
+}
+
 impl Clone for RaftLogStore {
     fn clone(&self) -> Self {
         Self {
@@ -79,7 +114,6 @@ impl RaftLogStore {
         }
     }
 
-    /// Create with a namespace prefix for collection isolation.
     pub fn with_namespace(store: Arc<RocksVectorStore>, namespace: String) -> Self {
         Self {
             store,
@@ -87,66 +121,42 @@ impl RaftLogStore {
         }
     }
 
-    /// Persist a single log entry.
-    pub fn store_entry(
-        &self,
-        partition_id: u64,
-        entry: &RaftLogEntry,
-    ) -> Result<(), rekha_core::RekhaError> {
+    pub fn store_entry(&self, partition_id: u64, entry: &RaftLogEntry) -> Result<(), RekhaError> {
         let key = entry_key(&self.namespace, partition_id, entry.index);
-        let value = bincode::serialize(entry).map_err(|e| rekha_core::RekhaError::Internal {
-            detail: format!("failed to serialize Raft entry: {e}"),
-        })?;
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
+        let value = Self::serialize_entry(entry)?;
+        let cf = self.raft_log_cf()?;
         db(&self.store)
             .put_cf(&cf, key, value)
-            .map_err(|e| rekha_core::RekhaError::Internal {
+            .map_err(|e| RekhaError::Internal {
                 detail: format!("failed to write Raft entry: {e}"),
             })
     }
 
-    /// Persist multiple log entries in a batch.
     pub fn store_entries(
         &self,
         partition_id: u64,
         entries: &[RaftLogEntry],
-    ) -> Result<(), rekha_core::RekhaError> {
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
+    ) -> Result<(), RekhaError> {
+        let cf = self.raft_log_cf()?;
         let mut batch = rocksdb::WriteBatch::default();
         for entry in entries {
             let key = entry_key(&self.namespace, partition_id, entry.index);
-            let value =
-                bincode::serialize(entry).map_err(|e| rekha_core::RekhaError::Internal {
-                    detail: format!("failed to serialize Raft entry: {e}"),
-                })?;
+            let value = Self::serialize_entry(entry)?;
             batch.put_cf(&cf, key, value);
         }
         db(&self.store)
             .write(batch)
-            .map_err(|e| rekha_core::RekhaError::Internal {
+            .map_err(|e| RekhaError::Internal {
                 detail: format!("failed to write Raft entries batch: {e}"),
             })
     }
 
-    /// Load all log entries for a partition, starting from `from_index`.
     pub fn load_entries(
         &self,
         partition_id: u64,
         from_index: u64,
-    ) -> Result<Vec<RaftLogEntry>, rekha_core::RekhaError> {
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
+    ) -> Result<Vec<RaftLogEntry>, RekhaError> {
+        let cf = self.raft_log_cf()?;
         let prefix = entry_prefix(&self.namespace, partition_id);
         let from_key = entry_key(&self.namespace, partition_id, from_index);
         let mut entries = Vec::new();
@@ -155,87 +165,27 @@ impl RaftLogStore {
             rocksdb::IteratorMode::From(&from_key, rocksdb::Direction::Forward),
         );
         for result in iter {
-            let (key, value) = result.map_err(|e| rekha_core::RekhaError::Internal {
+            let (key, value) = result.map_err(|e| RekhaError::Internal {
                 detail: format!("db iteration error: {e}"),
             })?;
             if !key.starts_with(&prefix) || key.len() != prefix.len() + 8 {
                 break;
             }
-            let entry: RaftLogEntry =
-                bincode::deserialize(&value).map_err(|e| rekha_core::RekhaError::Internal {
-                    detail: format!("failed to deserialize Raft entry: {e}"),
-                })?;
-            entries.push(entry);
+            entries.push(Self::deserialize_entry(&value)?);
         }
         Ok(entries)
     }
 
-    /// Load the last log index for a partition (0 if empty).
-    pub fn last_log_index(&self, partition_id: u64) -> Result<u64, rekha_core::RekhaError> {
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
-        let prefix = entry_prefix(&self.namespace, partition_id);
-        let mut start = prefix.clone();
-        start.extend_from_slice(&u64::MAX.to_be_bytes());
-        let iter = db(&self.store).iterator_cf(
-            &cf,
-            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Reverse),
-        );
-        for result in iter {
-            let (key, _value) = result.map_err(|e| rekha_core::RekhaError::Internal {
-                detail: format!("db iteration error: {e}"),
-            })?;
-            if key.starts_with(&prefix) && key.len() == prefix.len() + 8 {
-                let idx = u64::from_be_bytes(key[prefix.len()..].try_into().unwrap());
-                return Ok(idx);
-            }
-        }
-        Ok(0)
+    pub fn last_log_index(&self, partition_id: u64) -> Result<u64, RekhaError> {
+        Ok(self.last_entry(partition_id)?.map(|e| e.index).unwrap_or(0))
     }
 
-    /// Load the last log term for a partition (0 if empty).
-    pub fn last_log_term(&self, partition_id: u64) -> Result<u64, rekha_core::RekhaError> {
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
-        let prefix = entry_prefix(&self.namespace, partition_id);
-        let mut start = prefix.clone();
-        start.extend_from_slice(&u64::MAX.to_be_bytes());
-        let iter = db(&self.store).iterator_cf(
-            &cf,
-            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Reverse),
-        );
-        for result in iter {
-            let (key, value) = result.map_err(|e| rekha_core::RekhaError::Internal {
-                detail: format!("db iteration error: {e}"),
-            })?;
-            if key.starts_with(&prefix) && key.len() == prefix.len() + 8 {
-                let entry: RaftLogEntry =
-                    bincode::deserialize(&value).map_err(|e| rekha_core::RekhaError::Internal {
-                        detail: format!("failed to deserialize Raft entry: {e}"),
-                    })?;
-                return Ok(entry.term);
-            }
-        }
-        Ok(0)
+    pub fn last_log_term(&self, partition_id: u64) -> Result<u64, RekhaError> {
+        Ok(self.last_entry(partition_id)?.map(|e| e.term).unwrap_or(0))
     }
 
-    /// Delete log entries from `from_index` onward.
-    pub fn truncate_entries(
-        &self,
-        partition_id: u64,
-        from_index: u64,
-    ) -> Result<(), rekha_core::RekhaError> {
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
+    pub fn truncate_entries(&self, partition_id: u64, from_index: u64) -> Result<(), RekhaError> {
+        let cf = self.raft_log_cf()?;
         let prefix = entry_prefix(&self.namespace, partition_id);
         let from_key = entry_key(&self.namespace, partition_id, from_index);
         let mut batch = rocksdb::WriteBatch::default();
@@ -244,7 +194,7 @@ impl RaftLogStore {
             rocksdb::IteratorMode::From(&from_key, rocksdb::Direction::Forward),
         );
         for result in iter {
-            let (key, _value) = result.map_err(|e| rekha_core::RekhaError::Internal {
+            let (key, _value) = result.map_err(|e| RekhaError::Internal {
                 detail: format!("db iteration error: {e}"),
             })?;
             if !key.starts_with(&prefix) || key.len() != prefix.len() + 8 {
@@ -254,65 +204,51 @@ impl RaftLogStore {
         }
         db(&self.store)
             .write(batch)
-            .map_err(|e| rekha_core::RekhaError::Internal {
+            .map_err(|e| RekhaError::Internal {
                 detail: format!("failed to truncate Raft entries: {e}"),
             })
     }
 
-    /// Persist current term and voted_for for a partition.
     pub fn store_state(
         &self,
         partition_id: u64,
         term: u64,
         voted_for: Option<&str>,
-    ) -> Result<(), rekha_core::RekhaError> {
+    ) -> Result<(), RekhaError> {
         let key = state_key(&self.namespace, partition_id);
         let state = PersistedState {
             term,
             voted_for: voted_for.map(|s| s.to_string()),
         };
-        let value = bincode::serialize(&state).map_err(|e| rekha_core::RekhaError::Internal {
+        let value = bincode::serialize(&state).map_err(|e| RekhaError::Internal {
             detail: format!("failed to serialize Raft state: {e}"),
         })?;
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
+        let cf = self.raft_log_cf()?;
         db(&self.store)
             .put_cf(&cf, key, value)
-            .map_err(|e| rekha_core::RekhaError::Internal {
+            .map_err(|e| RekhaError::Internal {
                 detail: format!("failed to write Raft state: {e}"),
             })
     }
 
-    /// Load current term and voted_for for a partition.
-    pub fn load_state(
-        &self,
-        partition_id: u64,
-    ) -> Result<(u64, Option<String>), rekha_core::RekhaError> {
+    pub fn load_state(&self, partition_id: u64) -> Result<(u64, Option<String>), RekhaError> {
         let key = state_key(&self.namespace, partition_id);
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
+        let cf = self.raft_log_cf()?;
         match db(&self.store).get_cf(&cf, key) {
             Ok(Some(value)) => {
                 let state: PersistedState =
-                    bincode::deserialize(&value).map_err(|e| rekha_core::RekhaError::Internal {
+                    bincode::deserialize(&value).map_err(|e| RekhaError::Internal {
                         detail: format!("failed to deserialize Raft state: {e}"),
                     })?;
                 Ok((state.term, state.voted_for))
             }
             Ok(None) => Ok((0, None)),
-            Err(e) => Err(rekha_core::RekhaError::Internal {
+            Err(e) => Err(RekhaError::Internal {
                 detail: format!("failed to read Raft state: {e}"),
             }),
         }
     }
 
-    /// Helper: create a temp store for testing.
     #[cfg(test)]
     fn test_store() -> (Self, std::sync::Arc<rekha_storage::RocksVectorStore>) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -324,13 +260,8 @@ impl RaftLogStore {
         (Self::new(store.clone()), store)
     }
 
-    /// Get the number of log entries for a partition.
-    pub fn entry_count(&self, partition_id: u64) -> Result<u64, rekha_core::RekhaError> {
-        let cf = db(&self.store).cf_handle("raft_log").ok_or_else(|| {
-            rekha_core::RekhaError::Internal {
-                detail: "raft_log column family not found".into(),
-            }
-        })?;
+    pub fn entry_count(&self, partition_id: u64) -> Result<u64, RekhaError> {
+        let cf = self.raft_log_cf()?;
         let prefix = entry_prefix(&self.namespace, partition_id);
         let mut count = 0u64;
         let iter = db(&self.store).iterator_cf(
@@ -338,7 +269,7 @@ impl RaftLogStore {
             rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
         );
         for result in iter {
-            let (key, _) = result.map_err(|e| rekha_core::RekhaError::Internal {
+            let (key, _) = result.map_err(|e| RekhaError::Internal {
                 detail: format!("db iteration error: {e}"),
             })?;
             if !key.starts_with(&prefix) || key.len() != prefix.len() + 8 {
@@ -397,15 +328,14 @@ mod tests {
             .collect();
         log_store.store_entries(0, &entries).unwrap();
         let loaded = log_store.load_entries(0, 5).unwrap();
-        assert_eq!(loaded.len(), 6); // indices 5..=10
+        assert_eq!(loaded.len(), 6);
         assert_eq!(loaded[0].index, 5);
     }
 
     #[test]
     fn test_last_log_index_empty() {
         let (log_store, _store) = RaftLogStore::test_store();
-        let idx = log_store.last_log_index(0).unwrap();
-        assert_eq!(idx, 0);
+        assert_eq!(log_store.last_log_index(0).unwrap(), 0);
     }
 
     #[test]
@@ -419,15 +349,13 @@ mod tests {
             })
             .collect();
         log_store.store_entries(0, &entries).unwrap();
-        let idx = log_store.last_log_index(0).unwrap();
-        assert_eq!(idx, 3);
+        assert_eq!(log_store.last_log_index(0).unwrap(), 3);
     }
 
     #[test]
     fn test_last_log_term_empty() {
         let (log_store, _store) = RaftLogStore::test_store();
-        let term = log_store.last_log_term(0).unwrap();
-        assert_eq!(term, 0);
+        assert_eq!(log_store.last_log_term(0).unwrap(), 0);
     }
 
     #[test]
@@ -439,8 +367,7 @@ mod tests {
             command: RaftCommand::NoOp,
         };
         log_store.store_entry(0, &entry).unwrap();
-        let term = log_store.last_log_term(0).unwrap();
-        assert_eq!(term, 5);
+        assert_eq!(log_store.last_log_term(0).unwrap(), 5);
     }
 
     #[test]
@@ -456,7 +383,7 @@ mod tests {
         log_store.store_entries(0, &entries).unwrap();
         log_store.truncate_entries(0, 3).unwrap();
         let loaded = log_store.load_entries(0, 1).unwrap();
-        assert_eq!(loaded.len(), 2); // indices 1, 2 remain
+        assert_eq!(loaded.len(), 2);
     }
 
     #[test]
@@ -515,8 +442,7 @@ mod tests {
     fn test_namespace_prefix_with_ns() {
         let ns = Some("test_collection".to_string());
         let prefix = super::namespace_prefix(&ns);
-        let expected = b"test_collection\0";
-        assert_eq!(prefix, expected);
+        assert_eq!(prefix, b"test_collection\0");
     }
 
     #[test]
@@ -534,10 +460,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rekha_raft_ns_test_{}", n));
         let _ = std::fs::remove_dir_all(&dir);
         let store = std::sync::Arc::new(rekha_storage::RocksVectorStore::open(&dir).unwrap());
-
         let ns_store = RaftLogStore::with_namespace(store.clone(), "col1".into());
         let ns_store2 = RaftLogStore::with_namespace(store.clone(), "col2".into());
-
         let entry = RaftLogEntry {
             term: 1,
             index: 1,
@@ -545,8 +469,6 @@ mod tests {
         };
         ns_store.store_entry(0, &entry).unwrap();
         ns_store2.store_entry(0, &entry).unwrap();
-
-        // Each namespace should have 1 entry
         assert_eq!(ns_store.entry_count(0).unwrap(), 1);
         assert_eq!(ns_store2.entry_count(0).unwrap(), 1);
     }
@@ -554,7 +476,6 @@ mod tests {
     #[test]
     fn test_truncate_entries_empty() {
         let (log_store, _store) = RaftLogStore::test_store();
-        // Truncating from index 1 on an empty partition should succeed
         log_store.truncate_entries(0, 1).unwrap();
         assert_eq!(log_store.entry_count(0).unwrap(), 0);
     }
@@ -570,7 +491,6 @@ mod tests {
             })
             .collect();
         log_store.store_entries(0, &entries).unwrap();
-        // Truncate from index 10 (beyond existing) should be a no-op
         log_store.truncate_entries(0, 10).unwrap();
         assert_eq!(log_store.entry_count(0).unwrap(), 3);
     }

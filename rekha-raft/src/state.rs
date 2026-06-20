@@ -15,12 +15,6 @@ use std::collections::HashMap;
 pub struct ReplicatedState {
     /// Partition (vector shard) ID this state belongs to.
     pub partition_id: u64,
-    /// Current Raft term.
-    pub current_term: u64,
-    /// Voted for in current term.
-    pub voted_for: Option<String>,
-    /// Last committed index in the Raft log.
-    pub commit_index: u64,
     /// Last applied index in the Raft log.
     pub last_applied: u64,
     /// Vectors stored in this partition: map<ID, byte-encoded data>.
@@ -36,9 +30,6 @@ impl ReplicatedState {
     pub fn new(partition_id: u64) -> Self {
         Self {
             partition_id,
-            current_term: 0,
-            voted_for: None,
-            commit_index: 0,
             last_applied: 0,
             vectors: HashMap::new(),
             payloads: HashMap::new(),

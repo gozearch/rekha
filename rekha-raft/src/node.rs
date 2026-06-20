@@ -55,7 +55,6 @@ struct RaftInternalState {
     current_term: u64,
     voted_for: Option<String>,
     commit_index: u64,
-    last_applied: u64,
     role: RaftRole,
     leader_id: Option<String>,
     election_timeout_ms: u64,
@@ -114,7 +113,6 @@ impl RaftNode {
                 current_term,
                 voted_for,
                 commit_index: 0,
-                last_applied: 0,
                 role: RaftRole::Follower,
                 leader_id: None,
                 election_timeout_ms: 300,
@@ -270,11 +268,11 @@ impl RaftNode {
             // Single-node fast path: commit immediately.
             let mut state = self.state.write().await;
             cmd.apply(&mut state);
+            state.last_applied = index;
             drop(state);
             self.notify_index(&cmd);
             let mut rs = self.raft_state.lock().await;
             rs.commit_index = index;
-            rs.last_applied = index;
         }
         // Multi-node: entry is in WAL and in-memory log.
         // The heartbeat loop will push it to followers and advance commit_index.
@@ -489,7 +487,7 @@ impl RaftNode {
             role: format!("{:?}", rs.role),
             leader_id: rs.leader_id.clone(),
             commit_index: rs.commit_index,
-            last_applied: rs.last_applied,
+            last_applied: state.last_applied,
             log_size: self.log.lock().await.len(),
             vector_count: state.len(),
         }

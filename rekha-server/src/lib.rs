@@ -1,5 +1,6 @@
 pub mod config;
 pub mod coordinator;
+pub(crate) mod peer;
 pub mod server;
 pub mod service;
 

@@ -9,7 +9,6 @@ use rekha_raft::{RaftLogStore, RaftNode};
 use rekha_storage::RocksVectorStore;
 
 use dashmap::DashMap;
-use rekha_client::RekhaClient as PeerRekhaClient;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,132 +18,9 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::ServerConfig;
+use crate::peer::{PeerPool, PeerState};
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Clone)]
-pub(crate) struct PeerState {
-    pub info: NodeInfo,
-    pub last_seen: Instant,
-}
-
-struct PeerClient {
-    #[allow(dead_code)]
-    info: NodeInfo,
-    client: PeerRekhaClient,
-    last_used: Instant,
-    error_count: u64,
-    collection_name: String,
-}
-
-impl PeerClient {
-    async fn connect(info: &NodeInfo, collection_name: &str) -> Result<Self, RekhaError> {
-        let seeds = vec![info.address.clone()];
-        let client = PeerRekhaClient::connect(&seeds).await?;
-        Ok(Self {
-            info: info.clone(),
-            client,
-            last_used: Instant::now(),
-            error_count: 0,
-            collection_name: collection_name.to_string(),
-        })
-    }
-
-    async fn try_search(
-        &mut self,
-        query: &[f32],
-        k: usize,
-        params: &SearchParams,
-    ) -> Result<(Vec<ScoredPoint>, SearchStats), RekhaError> {
-        self.last_used = Instant::now();
-        self.client
-            .search_with_params(query.to_vec(), &self.collection_name, k, params.clone())
-            .await
-    }
-}
-
-pub(crate) struct PeerPool {
-    clients: HashMap<String, PeerClient>,
-    collection_name: String,
-}
-
-impl PeerPool {
-    pub fn new(collection_name: &str) -> Self {
-        Self {
-            clients: HashMap::new(),
-            collection_name: collection_name.to_string(),
-        }
-    }
-
-    pub async fn refresh(&mut self, peers: &[NodeInfo]) {
-        let active: std::collections::HashSet<String> =
-            peers.iter().map(|p| p.node_id.clone()).collect();
-        self.clients.retain(|node_id, _| active.contains(node_id));
-
-        for info in peers {
-            if !self.clients.contains_key(&info.node_id) {
-                match PeerClient::connect(info, &self.collection_name).await {
-                    Ok(client) => {
-                        info!("Connected to peer {} at {}", info.node_id, info.address);
-                        self.clients.insert(info.node_id.clone(), client);
-                    }
-                    Err(e) => {
-                        info!("Failed to connect to peer {}: {}", info.node_id, e);
-                    }
-                }
-            }
-        }
-    }
-
-    pub async fn search_fan_out(
-        &mut self,
-        query: &[f32],
-        k: usize,
-        params: &SearchParams,
-    ) -> (Vec<ScoredPoint>, SearchStats) {
-        let mut peer_params = params.clone();
-        peer_params.local_only = true;
-        let mut all_candidates: Vec<ScoredPoint> = Vec::new();
-        let mut stats = SearchStats::default();
-        let mut nodes_contacted = 0u32;
-
-        let node_ids: Vec<String> = self.clients.keys().cloned().collect();
-        for node_id in &node_ids {
-            if let Some(client) = self.clients.get_mut(node_id) {
-                match client.try_search(query, k, &peer_params).await {
-                    Ok((candidates, _peer_stats)) => {
-                        nodes_contacted += 1;
-                        all_candidates.extend(candidates);
-                        client.error_count = 0;
-                    }
-                    Err(_) => {
-                        if let Some(c) = self.clients.get_mut(node_id) {
-                            c.error_count += 1;
-                            if c.error_count >= 3 {
-                                info!("Dropping peer {} after 3 errors", node_id);
-                                self.clients.remove(node_id);
-                            }
-                        }
-                        stats.warnings.push(format!("peer {node_id} search failed"));
-                    }
-                }
-            }
-        }
-
-        all_candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
-        all_candidates.truncate(k * 2);
-        stats.nodes_contacted = nodes_contacted;
-        (all_candidates, stats)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.clients.len()
-    }
-}
 
 /// Per-collection state held by the coordinator.
 pub struct CollectionState {
@@ -224,7 +100,7 @@ impl IndexBufferHandle for SystemRaftHandle {
 pub const SYSTEM_PARTITION_ID: u64 = u64::MAX;
 
 pub struct Coordinator {
-    pub     config: ServerConfig,
+    pub config: ServerConfig,
     pub store: Arc<RocksVectorStore>,
     pub collections: Arc<DashMap<String, CollectionState>>,
     pub partition_manager: Arc<RwLock<PartitionManager>>,
@@ -260,16 +136,15 @@ impl Coordinator {
 
     /// Create a "default" collection for backward compat.
     /// Used when server starts with no explicit collections.
-    pub async fn create_default_collection(&self) -> Result<(), RekhaError> {
-        if self.collections.contains_key("default") {
-            return Ok(());
-        }
-        let meta = self.load_or_create_meta("default").await;
-        let config = meta.config.clone();
-        let namespaced_store = self.namespaced_store("default");
-        let raft_log_store = RaftLogStore::with_namespace(self.store.clone(), "default".into());
+    /// Build a CollectionState from config + meta (shared by create and initialize).
+    fn build_collection_state(
+        &self,
+        name: &str,
+        config: &CollectionConfig,
+        meta: CollectionMeta,
+    ) -> Result<CollectionState, RekhaError> {
+        let namespaced_store = self.namespaced_store(name);
         let dim = (config.dim_group_size as usize) * (config.num_dim_groups as usize);
-
         let index = RekhaIndex::new(
             dim,
             config.pq_num_sub_vectors as usize,
@@ -278,17 +153,23 @@ impl Coordinator {
             (*namespaced_store).clone(),
             config.distance_metric,
         )?;
-
-        let state = CollectionState {
+        Ok(CollectionState {
             config: config.clone(),
             meta,
-            store: namespaced_store.clone(),
+            store: namespaced_store,
             index: Arc::new(RwLock::new(Some(index))),
             raft_nodes: DashMap::new(),
-            raft_log_store: raft_log_store.clone(),
+            raft_log_store: RaftLogStore::with_namespace(self.store.clone(), name.into()),
             next_auto_id: AtomicU64::new(1),
-        };
+        })
+    }
 
+    pub async fn create_default_collection(&self) -> Result<(), RekhaError> {
+        if self.collections.contains_key("default") {
+            return Ok(());
+        }
+        let meta = self.load_or_create_meta("default").await;
+        let state = self.build_collection_state("default", &meta.config, meta.clone())?;
         self.collections.insert("default".into(), state);
         self.spawn_flush_loop("default");
         info!("Created default collection");
@@ -319,25 +200,13 @@ impl Coordinator {
         };
         self.store.store_collection_meta(&meta)?;
 
-        let namespaced_store = self.namespaced_store(name);
-        let raft_log_store = RaftLogStore::with_namespace(self.store.clone(), name.into());
-        let dim = (config.dim_group_size as usize) * (config.num_dim_groups as usize);
-
-        let index = RekhaIndex::new(
-            dim,
-            config.pq_num_sub_vectors as usize,
-            config.pq_num_centroids as usize,
-            config.graph_degree as usize,
-            (*namespaced_store).clone(),
-            config.distance_metric,
-        )?;
+        let state = self.build_collection_state(name, &config, meta)?;
 
         let handle = Arc::new(PerCollectionHandle {
             collection_name: name.to_string(),
             collections: self.collections.clone(),
         });
 
-        let num_shards = config.num_vector_shards;
         let node_id = &self.config.cluster.node_id;
         let peers: Vec<String> = self
             .config
@@ -348,37 +217,25 @@ impl Coordinator {
             .cloned()
             .collect();
 
-        let raft_nodes = DashMap::new();
-        for shard in 0..num_shards {
+        for shard in 0..config.num_vector_shards {
             let raft_state = rekha_raft::ReplicatedState::new(shard);
             let raft_node = Arc::new(RaftNode::with_store(
                 node_id.clone(),
                 shard,
                 peers.clone(),
                 raft_state,
-                Some(raft_log_store.clone()),
+                Some(state.raft_log_store.clone()),
                 Some(handle.clone() as Arc<dyn IndexBufferHandle>),
             ));
-            // Start election for single-node (no peers → self-elects)
             if peers.is_empty() {
                 let _ = raft_node.start_election().await;
             }
-            raft_nodes.insert(shard, raft_node);
+            state.raft_nodes.insert(shard, raft_node);
         }
         info!(
             "Created {} Raft nodes for collection '{}'",
-            num_shards, name
+            config.num_vector_shards, name
         );
-
-        let state = CollectionState {
-            config: config.clone(),
-            meta,
-            store: namespaced_store.clone(),
-            index: Arc::new(RwLock::new(Some(index))),
-            raft_nodes,
-            raft_log_store: raft_log_store.clone(),
-            next_auto_id: AtomicU64::new(1),
-        };
 
         self.collections.insert(name.to_string(), state);
         self.spawn_flush_loop(name);
@@ -441,8 +298,8 @@ impl Coordinator {
         if let Ok(Some(meta)) = self.store.load_collection_meta(name) {
             return meta;
         }
-        let dim_val = self.config.partition.dim_group_size
-            * self.config.partition.num_dim_groups as usize;
+        let dim_val =
+            self.config.partition.dim_group_size * self.config.partition.num_dim_groups as usize;
         let mut pq_m = std::cmp::min(self.config.index.pq_num_sub_vectors as u32, dim_val as u32);
         while pq_m > 1 && !(dim_val as u32).is_multiple_of(pq_m) {
             pq_m -= 1;
@@ -482,34 +339,24 @@ impl Coordinator {
                 continue;
             }
             let name = meta.name.clone();
-            let config = meta.config.clone();
-            let namespaced_store = self.namespaced_store(&name);
-            let raft_log_store = RaftLogStore::with_namespace(self.store.clone(), name.clone());
-            let dim = (config.dim_group_size as usize) * (config.num_dim_groups as usize);
-
-            let index = match RekhaIndex::new(
-                dim,
-                config.pq_num_sub_vectors as usize,
-                config.pq_num_centroids as usize,
-                config.graph_degree as usize,
-                (*namespaced_store).clone(),
-                config.distance_metric,
-            ) {
-                Ok(idx) => Arc::new(RwLock::new(Some(idx))),
+            let state = match self.build_collection_state(&name, &meta.config, meta.clone()) {
+                Ok(s) => s,
                 Err(e) => {
                     warn!("Failed to create index for collection '{name}': {e}");
-                    Arc::new(RwLock::new(None))
+                    let store = self.namespaced_store(&name);
+                    CollectionState {
+                        config: meta.config.clone(),
+                        meta: meta.clone(),
+                        store,
+                        index: Arc::new(RwLock::new(None)),
+                        raft_nodes: DashMap::new(),
+                        raft_log_store: RaftLogStore::with_namespace(
+                            self.store.clone(),
+                            name.clone(),
+                        ),
+                        next_auto_id: AtomicU64::new(1),
+                    }
                 }
-            };
-
-            let state = CollectionState {
-                config: config.clone(),
-                meta: meta.clone(),
-                store: namespaced_store.clone(),
-                index,
-                raft_nodes: DashMap::new(),
-                raft_log_store: raft_log_store.clone(),
-                next_auto_id: AtomicU64::new(1),
             };
 
             self.collections.insert(name.clone(), state);
@@ -920,42 +767,6 @@ impl Coordinator {
 
     pub async fn node_info(&self, _node_id: &str) -> Result<NodeInfo, RekhaError> {
         Ok(self.local_node_info())
-    }
-}
-
-impl IndexBufferHandle for Coordinator {
-    fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
-        if self.collections.is_empty() {
-            return;
-        }
-        for state in self.collections.iter() {
-            if let Ok(idx) = state.index.try_read() {
-                if let Some(ref idx) = *idx {
-                    idx.buffer_insert(id, vector.clone());
-                }
-            }
-        }
-    }
-
-    fn buffer_delete(&self, ids: &[u64]) {
-        if self.collections.is_empty() {
-            return;
-        }
-        for state in self.collections.iter() {
-            if let Ok(idx) = state.index.try_read() {
-                if let Some(ref idx) = *idx {
-                    idx.buffer_delete(ids);
-                }
-            }
-        }
-    }
-
-    fn notify_create_collection(&self, _name: &str, _config: &CollectionConfig) {
-        // Handled by SystemRaftHandle
-    }
-
-    fn notify_drop_collection(&self, _name: &str) {
-        // Handled by SystemRaftHandle
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::error::RekhaError;
-use crate::types::SearchParams;
+use crate::types::{CollectionConfig, SearchParams};
 
 /// The core vector index trait.
 /// Implementations: VamanaGraph, (future) HNSW, Flat.
@@ -68,6 +68,10 @@ pub trait IndexBufferHandle: Send + Sync {
     fn buffer_insert(&self, id: u64, vector: Vec<f32>);
     /// Mark committed deletes in the index buffer.
     fn buffer_delete(&self, ids: &[u64]);
+    /// Notify that a collection was created via Raft commit.
+    fn notify_create_collection(&self, name: &str, config: &CollectionConfig) {}
+    /// Notify that a collection was dropped via Raft commit.
+    fn notify_drop_collection(&self, name: &str) {}
 }
 
 /// Storage backend trait for persisting vectors and metadata.

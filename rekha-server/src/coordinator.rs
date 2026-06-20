@@ -184,7 +184,44 @@ impl IndexBufferHandle for PerCollectionHandle {
     }
 }
 
+/// Handle for the system Raft group. Materializes collections on commit.
+pub(crate) struct SystemRaftHandle {
+    pub(crate) coordinator: *const Coordinator,
+}
+
+unsafe impl Send for SystemRaftHandle {}
+unsafe impl Sync for SystemRaftHandle {}
+
+impl IndexBufferHandle for SystemRaftHandle {
+    fn buffer_insert(&self, _id: u64, _vector: Vec<f32>) {}
+
+    fn buffer_delete(&self, _ids: &[u64]) {}
+
+    fn notify_create_collection(&self, name: &str, config: &CollectionConfig) {
+        let coord = unsafe { &*self.coordinator };
+        let name = name.to_string();
+        let config = config.clone();
+        tokio::spawn(async move {
+            if coord.collections.contains_key(&name) {
+                return;
+            }
+            let _ = coord.create_collection(&name, config).await;
+        });
+    }
+
+    fn notify_drop_collection(&self, name: &str) {
+        let coord = unsafe { &*self.coordinator };
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let _ = coord.drop_collection(&name).await;
+        });
+    }
+}
+
 /// The distributed query coordinator, now collection-aware.
+/// System Raft partition ID used for collection metadata replication.
+pub const SYSTEM_PARTITION_ID: u64 = u64::MAX;
+
 pub struct Coordinator {
     pub config: ServerConfig,
     pub store: Arc<RocksVectorStore>,
@@ -195,6 +232,7 @@ pub struct Coordinator {
     peers: Arc<RwLock<HashMap<String, PeerState>>>,
     peer_pool: Arc<RwLock<PeerPool>>,
     next_auto_id: AtomicU64,
+    pub system_raft_node: Option<Arc<RaftNode>>,
 }
 
 impl Coordinator {
@@ -218,6 +256,7 @@ impl Coordinator {
             peers: Arc::new(RwLock::new(HashMap::new())),
             peer_pool: Arc::new(RwLock::new(PeerPool::new("default"))),
             next_auto_id: AtomicU64::new(starting_id),
+            system_raft_node: None,
         }
     }
 
@@ -891,6 +930,42 @@ impl IndexBufferHandle for Coordinator {
                 }
             }
         }
+    }
+
+    fn notify_create_collection(&self, _name: &str, _config: &CollectionConfig) {
+        // Handled by SystemRaftHandle
+    }
+
+    fn notify_drop_collection(&self, _name: &str) {
+        // Handled by SystemRaftHandle
+    }
+}
+
+impl Coordinator {
+    /// Returns all Raft nodes across all collections plus the system node.
+    /// Returns (collection_name_or_system, partition_id, Arc<RaftNode>).
+    pub fn all_raft_nodes(&self) -> Vec<(String, u64, Arc<RaftNode>)> {
+        let mut nodes = Vec::new();
+        for entry in self.collections.iter() {
+            let col_name = entry.key().clone();
+            for n in entry.raft_nodes.iter() {
+                nodes.push((col_name.clone(), *n.key(), n.value().clone()));
+            }
+        }
+        if let Some(ref sys) = self.system_raft_node {
+            nodes.push(("__system__".into(), SYSTEM_PARTITION_ID, sys.clone()));
+        }
+        nodes
+    }
+
+    /// Register the system Raft node for collection metadata replication.
+    pub fn register_system_raft_node(&mut self, node: Arc<RaftNode>) {
+        self.system_raft_node = Some(node);
+    }
+
+    /// Get the system Raft node.
+    pub fn system_raft_node(&self) -> Option<Arc<RaftNode>> {
+        self.system_raft_node.clone()
     }
 }
 

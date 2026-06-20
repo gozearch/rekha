@@ -1,6 +1,7 @@
 use crate::state::{RaftCommand, ReplicatedState};
 use crate::storage::RaftLogStore;
 use rekha_core::{IndexBufferHandle, RaftError, RekhaError};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -61,6 +62,10 @@ struct RaftInternalState {
     #[allow(dead_code)]
     heartbeat_ms: u64,
     last_activity: Instant,
+    /// Per-peer next log index to send (leader only).
+    next_index: HashMap<String, u64>,
+    /// Per-peer highest known replicated index (leader only).
+    match_index: HashMap<String, u64>,
 }
 
 impl RaftNode {
@@ -92,6 +97,13 @@ impl RaftNode {
             (0, None, Vec::new())
         };
 
+        let mut next_index = HashMap::new();
+        let mut match_index = HashMap::new();
+        for p in &peers {
+            next_index.insert(p.clone(), 1);
+            match_index.insert(p.clone(), 0);
+        }
+
         Self {
             node_id,
             partition_id,
@@ -108,6 +120,8 @@ impl RaftNode {
                 election_timeout_ms: 300,
                 heartbeat_ms: 100,
                 last_activity: Instant::now(),
+                next_index,
+                match_index,
             })),
             store,
             index_handle,
@@ -217,50 +231,60 @@ impl RaftNode {
     }
 
     /// Propose a command to the Raft group.
-    /// If this node is the leader, it will replicate the command.
-    /// If not, returns an error with the leader hint.
+    /// If this node is the leader, it persists to WAL and appends to log.
+    /// If no peers, commits immediately (single-node fast path).
+    /// If peers exist, the heartbeat loop handles replication + eventual commit.
+    /// If not leader, returns an error with the leader hint.
     pub async fn propose(&self, command: RaftCommand) -> Result<(), RekhaError> {
-        let (is_leader, term, leader_hint) = {
+        let (is_leader, term, leader_hint, peers_empty) = {
             let raft_state = self.raft_state.lock().await;
             match &raft_state.role {
-                RaftRole::Leader => (true, raft_state.current_term, None),
+                RaftRole::Leader => (
+                    true,
+                    raft_state.current_term,
+                    None,
+                    self.peers.is_empty(),
+                ),
                 RaftRole::Follower | RaftRole::Candidate => {
-                    (false, 0, raft_state.leader_id.clone())
+                    (false, 0, raft_state.leader_id.clone(), true)
                 }
             }
         };
 
-        if is_leader {
-            let mut log = self.log.lock().await;
-            let index = log.len() as u64 + 1;
-            let entry = RaftLogEntry {
-                term,
-                index,
-                command,
-            };
+        if !is_leader {
+            return Err(RaftError::NotLeader { leader_hint }.into());
+        }
 
-            // Persist to RocksDB before in-memory (write-ahead).
-            if let Some(ref store) = self.store {
-                store.store_entry(self.partition_id, &entry)?;
-            }
+        let mut log = self.log.lock().await;
+        let index = log.len() as u64 + 1;
+        let entry = RaftLogEntry {
+            term,
+            index,
+            command,
+        };
 
-            let cmd = entry.command.clone();
-            log.push(entry);
+        if let Some(ref store) = self.store {
+            store.store_entry(self.partition_id, &entry)?;
+        }
+
+        let cmd = entry.command.clone();
+        log.push(entry);
+        drop(log);
+
+        if peers_empty {
+            // Single-node fast path: commit immediately.
             let mut state = self.state.write().await;
             cmd.apply(&mut state);
             drop(state);
-            drop(log);
-
-            // Notify the index about the committed command.
             self.notify_index(&cmd);
-
             let mut rs = self.raft_state.lock().await;
             rs.commit_index = index;
             rs.last_applied = index;
-            Ok(())
-        } else {
-            Err(RaftError::NotLeader { leader_hint }.into())
         }
+        // Multi-node: entry is in WAL and in-memory log.
+        // The heartbeat loop will push it to followers and advance commit_index.
+
+        Ok(())
     }
 
     /// Initiate leader election.
@@ -307,9 +331,14 @@ impl RaftNode {
     /// Transition from Candidate to Leader after winning an election.
     /// Called by the server layer after collecting majority votes.
     pub async fn become_leader(&self) {
+        let last_log_idx = self.log.lock().await.len() as u64;
         let mut rs = self.raft_state.lock().await;
         rs.role = RaftRole::Leader;
         rs.leader_id = Some(self.node_id.clone());
+        for peer in &self.peers {
+            rs.next_index.insert(peer.clone(), last_log_idx + 1);
+            rs.match_index.insert(peer.clone(), 0);
+        }
         info!(
             "Node {} became leader for term {} (partition {})",
             self.node_id, rs.current_term, self.partition_id
@@ -476,15 +505,99 @@ impl RaftNode {
         self.state.read().await
     }
 
-    /// Apply committed log entries up to the given index.
+    /// Set the index buffer handle after construction.
+    pub fn set_index_handle(&mut self, handle: Arc<dyn IndexBufferHandle>) {
+        self.index_handle = Some(handle);
+    }
+
+    /// Get pending log entries for a peer since its last acknowledged index.
+    /// Returns (entries, prev_log_index, prev_log_term) for an AppendEntries RPC.
+    pub async fn entries_for_peer(&self, peer: &str) -> (Vec<RaftLogEntry>, u64, u64) {
+        let next_idx = {
+            let rs = self.raft_state.lock().await;
+            rs.next_index.get(peer).copied().unwrap_or(1)
+        };
+        let log = self.log.lock().await;
+        let log_len = log.len() as u64;
+
+        if next_idx > log_len {
+            return (Vec::new(), log_len, log.last().map(|e| e.term).unwrap_or(0));
+        }
+
+        let prev_log_index = next_idx.saturating_sub(1);
+        let prev_log_term = if prev_log_index > 0 {
+            log[(prev_log_index - 1) as usize].term
+        } else {
+            0
+        };
+
+        let entries: Vec<RaftLogEntry> = log[(next_idx - 1) as usize..]
+            .iter()
+            .cloned()
+            .collect();
+        (entries, prev_log_index, prev_log_term)
+    }
+
+    /// Record that a peer has replicated up to the given index.
+    pub async fn record_replication(&self, peer: &str, last_index: u64) {
+        let mut rs = self.raft_state.lock().await;
+        rs.match_index.insert(peer.to_string(), last_index);
+        rs.next_index.insert(peer.to_string(), last_index + 1);
+    }
+
+    /// Decrement next_index for a peer (log mismatch — retry with older entries).
+    pub async fn retry_replication(&self, peer: &str) {
+        let mut rs = self.raft_state.lock().await;
+        let current = rs.next_index.get(peer).copied().unwrap_or(1);
+        if current > 1 {
+            rs.next_index.insert(peer.to_string(), current - 1);
+        }
+    }
+
+    /// Advance commit_index based on replicated match_index across all peers.
+    /// Returns the new commit_index, or 0 if unchanged.
+    pub async fn advance_commit(&self) -> u64 {
+        let mut rs = self.raft_state.lock().await;
+        let term = rs.current_term;
+        let current_commit = rs.commit_index;
+        let log_len = self.log.lock().await.len() as u64;
+
+        // Collect all match_index values + self's log length
+        let mut indices: Vec<u64> = rs.match_index.values().copied().collect();
+        indices.push(log_len); // leader's own log
+        indices.sort_unstable();
+
+        let majority = (indices.len() / 2) as usize;
+        let new_commit = indices[majority];
+
+        if new_commit > current_commit && new_commit <= log_len {
+            // Only commit entries from the current term (Raft safety rule)
+            let entry_term = if new_commit > 0 {
+                let log = self.log.lock().await;
+                log[(new_commit - 1) as usize].term
+            } else {
+                0
+            };
+            if entry_term == term {
+                rs.commit_index = new_commit;
+                drop(rs);
+                self.apply_up_to(new_commit).await;
+                return new_commit;
+            }
+        }
+        current_commit
+    }
+
+    /// Apply committed entries up to a given index and notify the index handle.
     async fn apply_up_to(&self, index: u64) {
         let mut state = self.state.write().await;
         let log = self.log.lock().await;
 
         for entry in log.iter() {
             if entry.index <= index && entry.index > state.last_applied {
-                entry.command.apply(&mut state);
-                self.notify_index(&entry.command);
+                let cmd = entry.command.clone();
+                cmd.apply(&mut state);
+                self.notify_index(&cmd);
                 state.last_applied = entry.index;
             }
         }
@@ -500,14 +613,15 @@ impl RaftNode {
                 RaftCommand::Delete { ids } => {
                     handle.buffer_delete(ids);
                 }
+                RaftCommand::CreateCollection { name, config } => {
+                    handle.notify_create_collection(name, config);
+                }
+                RaftCommand::DropCollection { name } => {
+                    handle.notify_drop_collection(name);
+                }
                 RaftCommand::NoOp => {}
             }
         }
-    }
-
-    /// Set the index buffer handle after construction.
-    pub fn set_index_handle(&mut self, handle: Arc<dyn IndexBufferHandle>) {
-        self.index_handle = Some(handle);
     }
 }
 

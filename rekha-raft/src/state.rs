@@ -1,3 +1,4 @@
+use rekha_core::CollectionConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -26,6 +27,8 @@ pub struct ReplicatedState {
     pub vectors: HashMap<u64, Vec<u8>>,
     /// Payloads stored in this partition.
     pub payloads: HashMap<u64, Vec<u8>>,
+    /// Collection metadata (for system Raft group).
+    pub collections: HashMap<String, CollectionConfig>,
 }
 
 impl ReplicatedState {
@@ -39,6 +42,7 @@ impl ReplicatedState {
             last_applied: 0,
             vectors: HashMap::new(),
             payloads: HashMap::new(),
+            collections: HashMap::new(),
         }
     }
 
@@ -104,6 +108,15 @@ pub enum RaftCommand {
     Delete {
         ids: Vec<u64>,
     },
+    /// Create a collection (used by system Raft group).
+    CreateCollection {
+        name: String,
+        config: CollectionConfig,
+    },
+    /// Drop a collection (used by system Raft group).
+    DropCollection {
+        name: String,
+    },
     NoOp,
 }
 
@@ -120,6 +133,12 @@ impl RaftCommand {
             }
             Self::Delete { ids } => {
                 state.apply_delete(ids);
+            }
+            Self::CreateCollection { name, config } => {
+                state.collections.insert(name.clone(), config.clone());
+            }
+            Self::DropCollection { name } => {
+                state.collections.remove(name);
             }
             Self::NoOp => {}
         }

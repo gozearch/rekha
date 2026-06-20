@@ -495,20 +495,35 @@ impl Rekha for RekhaService {
             distance_metric: DistanceMetric::L2,
         };
 
-        match self
+        // Create locally first (so single-node works immediately).
+        if let Err(e) = self
             .coordinator
-            .create_collection(&req.name, collection_config)
+            .create_collection(&req.name, collection_config.clone())
             .await
         {
-            Ok(()) => Ok(Response::new(CreateCollectionResponse {
-                success: true,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Response::new(CreateCollectionResponse {
+            return Ok(Response::new(CreateCollectionResponse {
                 success: false,
                 error: e.to_string(),
-            })),
+            }));
         }
+
+        // Propose through system Raft group for replication.
+        if let Some(sys_node) = self.coordinator.system_raft_node() {
+            let cmd = rekha_raft::state::RaftCommand::CreateCollection {
+                name: req.name.clone(),
+                config: collection_config,
+            };
+            if let Err(e) = sys_node.propose(cmd).await {
+                // Local creation succeeded; system replication is best-effort.
+                // If the system group isn't ready, the collection still works locally.
+                info!("System Raft propose (create_collection) failed: {e}");
+            }
+        }
+
+        Ok(Response::new(CreateCollectionResponse {
+            success: true,
+            error: String::new(),
+        }))
     }
 
     async fn drop_collection(
@@ -516,6 +531,16 @@ impl Rekha for RekhaService {
         request: Request<DropCollectionRequest>,
     ) -> Result<Response<DropCollectionResponse>, Status> {
         let req = request.into_inner();
+
+        // Propose through system Raft group first.
+        if let Some(sys_node) = self.coordinator.system_raft_node() {
+            let cmd = rekha_raft::state::RaftCommand::DropCollection {
+                name: req.name.clone(),
+            };
+            let _ = sys_node.propose(cmd).await;
+        }
+
+        // Drop locally.
         match self.coordinator.drop_collection(&req.name).await {
             Ok(()) => Ok(Response::new(DropCollectionResponse {
                 success: true,
@@ -566,6 +591,39 @@ impl Rekha for RekhaService {
         let req = request.into_inner();
         let exists = self.coordinator.collection_exists(&req.name).await;
         Ok(Response::new(CollectionExistsResponse { exists }))
+    }
+}
+
+/// Convert an internal RaftCommand to a proto RaftCommand (for replication).
+pub fn raft_command_to_proto(cmd: &rekha_raft::state::RaftCommand) -> crate::proto::raft_command::Cmd {
+    use crate::proto::raft_command::Cmd;
+    match cmd {
+        rekha_raft::state::RaftCommand::Insert { id, vector, payload } => {
+            Cmd::Insert(crate::proto::InsertRequest {
+                id: *id,
+                vector: vector.clone(),
+                payload: payload.clone().map(|data| crate::proto::Payload {
+                    content_type: "raw".into(),
+                    data,
+                }),
+                collection_name: String::new(),
+            })
+        }
+        rekha_raft::state::RaftCommand::Delete { ids } => {
+            Cmd::Delete(crate::proto::DeleteRequest {
+                ids: ids.clone(),
+                collection_name: String::new(),
+            })
+        }
+        rekha_raft::state::RaftCommand::CreateCollection { name, .. } => {
+            Cmd::Custom(format!("create_collection:{name}").into_bytes())
+        }
+        rekha_raft::state::RaftCommand::DropCollection { name } => {
+            Cmd::Custom(format!("drop_collection:{name}").into_bytes())
+        }
+        rekha_raft::state::RaftCommand::NoOp => {
+            Cmd::Custom(vec![])
+        }
     }
 }
 

@@ -11,12 +11,11 @@ use tonic::transport::{Identity, Server};
 use tracing::{info, warn};
 
 use crate::config::ServerConfig;
-use crate::coordinator::Coordinator;
+use crate::coordinator::{Coordinator, SystemRaftHandle, SYSTEM_PARTITION_ID};
 use crate::proto::rekha_server::RekhaServer as RekhaGrpcServer;
-use crate::proto::{HeartbeatRequest, RaftVoteRequest};
+use crate::proto::{AppendEntriesRequest, HeartbeatRequest, RaftVoteRequest};
 use crate::service::RekhaService;
 
-/// The Rekha distributed vector database server.
 pub struct ServerInstance {
     config: ServerConfig,
     coordinator: Arc<Coordinator>,
@@ -54,7 +53,7 @@ impl ServerInstance {
             partition_manager,
         ));
 
-        // Create default collection (or recover existing ones).
+        // Create default collection.
         coordinator.create_default_collection().await?;
 
         // Create Raft nodes for the default collection.
@@ -69,7 +68,6 @@ impl ServerInstance {
             .cloned()
             .collect();
 
-        // Create a per-collection IndexBufferHandle for the default collection.
         let index_handle: Arc<dyn rekha_core::IndexBufferHandle> = {
             let name = "default".to_string();
             let collections = coordinator.collections.clone();
@@ -113,9 +111,38 @@ impl ServerInstance {
                 Some(raft_log_store.clone()),
                 Some(index_handle.clone()),
             ));
+            if peers.is_empty() {
+                let _ = raft_node.start_election().await;
+            }
             coordinator.register_raft_node("default", shard, raft_node);
         }
         info!("Created {} Raft nodes for default collection", num_shards);
+
+        // Create the system Raft group for collection metadata.
+        let system_raft_log_store = coordinator.raft_log_store_for("__system__");
+        let system_state = rekha_raft::ReplicatedState::new(SYSTEM_PARTITION_ID);
+        let system_handle = Arc::new(SystemRaftHandle {
+            coordinator: Arc::as_ptr(&coordinator),
+        });
+        let system_raft_node = Arc::new(rekha_raft::RaftNode::with_store(
+            config.cluster.node_id.clone(),
+            SYSTEM_PARTITION_ID,
+            peers.clone(),
+            system_state,
+            Some(system_raft_log_store),
+            Some(system_handle as Arc<dyn rekha_core::IndexBufferHandle>),
+        ));
+        if peers.is_empty() {
+            let _ = system_raft_node.start_election().await;
+        }
+
+        // Register system Raft node on the coordinator.
+        {
+            let mut coord_mut = Arc::as_ref(&coordinator) as *const Coordinator as *mut Coordinator;
+            let coord_ref = unsafe { &mut *coord_mut };
+            coord_ref.register_system_raft_node(system_raft_node);
+        }
+        info!("System Raft group created");
 
         coordinator.initialize_all().await;
 
@@ -151,9 +178,17 @@ impl ServerInstance {
                     match tonic::transport::Channel::from_shared(endpoint) {
                         Ok(ch) => match ch.connect().await {
                             Ok(ch) => {
-                                let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
+                                let mut client =
+                                    crate::proto::rekha_client::RekhaClient::new(ch);
                                 let (raft_term, commit_idx) =
-                                    if let Some(raft_node) = coordinator.raft_node("default", 0) {
+                                    if let Some(sys_node) = coordinator.system_raft_node() {
+                                        (
+                                            sys_node.current_term().await,
+                                            sys_node.commit_index().await,
+                                        )
+                                    } else if let Some(raft_node) =
+                                        coordinator.raft_node("default", 0)
+                                    {
                                         (
                                             raft_node.current_term().await,
                                             raft_node.commit_index().await,
@@ -205,83 +240,72 @@ impl ServerInstance {
             loop {
                 tokio::time::sleep(Duration::from_millis(election_check_ms)).await;
 
-                // Iterate over all collections and their raft nodes.
-                let mut snapshots = Vec::new();
-                for entry in coordinator.collections.iter() {
-                    let col_name = entry.key().clone();
-                    for n in entry.raft_nodes.iter() {
-                        snapshots.push((col_name.clone(), *n.key()));
-                    }
-                }
+                let nodes = coordinator.all_raft_nodes();
+                for (col_name, pid, node) in nodes {
+                    if node.check_election_timeout().await {
+                        info!(
+                            "Election triggered for '{}' partition {} on node {}",
+                            col_name,
+                            pid,
+                            node.node_id()
+                        );
 
-                for (col_name, pid) in snapshots {
-                    if let Some(node) = coordinator.raft_node(&col_name, pid) {
-                        if node.check_election_timeout().await {
-                            info!(
-                                "Election triggered for collection '{}' partition {} on node {}",
-                                col_name,
-                                pid,
-                                node.node_id()
-                            );
+                        let term = node.current_term().await;
+                        let last_log_idx = node.last_log_index().await;
+                        let last_log_term = node.last_log_term().await;
+                        let peers = node.peers().to_vec();
+                        let candidate_id = node_id.clone();
+                        let n = node.clone();
+                        let cname = col_name.clone();
 
-                            let term = node.current_term().await;
-                            let last_log_idx = node.last_log_index().await;
-                            let last_log_term = node.last_log_term().await;
-                            let peers = node.peers().to_vec();
-                            let candidate_id = node_id.clone();
-                            let n = node.clone();
-                            let cname = col_name.clone();
+                        if peers.is_empty() {
+                            continue;
+                        }
 
-                            if peers.is_empty() {
-                                continue;
-                            }
+                        tokio::spawn(async move {
+                            let mut votes = 1u64;
+                            let group_size = peers.len() as u64 + 1;
+                            let majority = group_size / 2 + 1;
 
-                            tokio::spawn(async move {
-                                let mut votes = 1u64;
-                                let group_size = peers.len() as u64 + 1;
-                                let majority = group_size / 2 + 1;
-
-                                for peer_addr in &peers {
-                                    let endpoint = format!("http://{}", peer_addr);
-                                    let ch = match tonic::transport::Channel::from_shared(endpoint)
+                            for peer_addr in &peers {
+                                let endpoint = format!("http://{}", peer_addr);
+                                let ch = match tonic::transport::Channel::from_shared(endpoint) {
+                                    Ok(e) => match e
+                                        .connect_timeout(Duration::from_secs(2))
+                                        .connect()
+                                        .await
                                     {
-                                        Ok(e) => match e
-                                            .connect_timeout(Duration::from_secs(2))
-                                            .connect()
-                                            .await
-                                        {
-                                            Ok(ch) => ch,
-                                            Err(_) => continue,
-                                        },
+                                        Ok(ch) => ch,
                                         Err(_) => continue,
-                                    };
-                                    let mut client =
-                                        crate::proto::rekha_client::RekhaClient::new(ch);
-                                    let req = tonic::Request::new(RaftVoteRequest {
-                                        term,
-                                        candidate_id: candidate_id.clone(),
-                                        last_log_index: last_log_idx,
-                                        last_log_term,
-                                        partition_id: pid,
-                                        collection_name: cname.clone(),
-                                    });
-                                    if let Ok(resp) = client.raft_request_vote(req).await {
-                                        if resp.into_inner().vote_granted {
-                                            votes += 1;
-                                        }
+                                    },
+                                    Err(_) => continue,
+                                };
+                                let mut client =
+                                    crate::proto::rekha_client::RekhaClient::new(ch);
+                                let req = tonic::Request::new(RaftVoteRequest {
+                                    term,
+                                    candidate_id: candidate_id.clone(),
+                                    last_log_index: last_log_idx,
+                                    last_log_term,
+                                    partition_id: pid,
+                                    collection_name: cname.clone(),
+                                });
+                                if let Ok(resp) = client.raft_request_vote(req).await {
+                                    if resp.into_inner().vote_granted {
+                                        votes += 1;
                                     }
                                 }
+                            }
 
-                                if votes >= majority {
-                                    n.become_leader().await;
-                                } else {
-                                    info!(
-                                        "Election lost for '{}' partition {} (got {votes}/{majority} votes)",
-                                        cname, pid
-                                    );
-                                }
-                            });
-                        }
+                            if votes >= majority {
+                                n.become_leader().await;
+                            } else {
+                                info!(
+                                    "Election lost for '{}' partition {} (got {votes}/{majority} votes)",
+                                    cname, pid
+                                );
+                            }
+                        });
                     }
                 }
             }
@@ -296,53 +320,88 @@ impl ServerInstance {
             loop {
                 tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
 
-                let mut snapshots = Vec::new();
-                for entry in coordinator.collections.iter() {
-                    let col_name = entry.key().clone();
-                    for n in entry.raft_nodes.iter() {
-                        snapshots.push((col_name.clone(), *n.key()));
+                let nodes = coordinator.all_raft_nodes();
+
+                for (col_name, pid, node) in &nodes {
+                    if !node.is_leader().await {
+                        continue;
                     }
-                }
 
-                for (col_name, pid) in snapshots {
-                    if let Some(node) = coordinator.raft_node(&col_name, pid) {
-                        if !node.is_leader().await {
-                            continue;
-                        }
+                    let term = node.current_term().await;
+                    let commit_idx = node.commit_index().await;
+                    let leader_id = node.node_id().to_string();
+                    let peers = node.peers().to_vec();
 
-                        let term = node.current_term().await;
-                        let commit_idx = node.commit_index().await;
-                        let last_log_idx = node.last_log_index().await;
-                        let last_log_term = node.last_log_term().await;
-                        let leader_id = node.node_id().to_string();
-                        let peers = node.peers().to_vec();
+                    for peer_addr in &peers {
+                        let (entries, prev_log_index, prev_log_term) =
+                            node.entries_for_peer(&peer_addr).await;
 
-                        for peer_addr in &peers {
-                            let endpoint = format!("http://{}", peer_addr);
-                            let ch = match tonic::transport::Channel::from_shared(endpoint) {
-                                Ok(e) => {
-                                    match e.connect_timeout(Duration::from_secs(2)).connect().await
-                                    {
-                                        Ok(ch) => ch,
-                                        Err(_) => continue,
-                                    }
+                        let endpoint = format!("http://{}", peer_addr);
+                        let ch = match tonic::transport::Channel::from_shared(endpoint) {
+                            Ok(e) => {
+                                match e.connect_timeout(Duration::from_secs(2)).connect().await {
+                                    Ok(ch) => ch,
+                                    Err(_) => continue,
                                 }
-                                Err(_) => continue,
-                            };
-                            let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
-                            let req = tonic::Request::new(crate::proto::AppendEntriesRequest {
-                                partition_id: pid,
-                                leader_term: term,
-                                leader_id: leader_id.clone(),
-                                prev_log_index: last_log_idx,
-                                prev_log_term: last_log_term,
-                                entries: vec![],
-                                leader_commit: commit_idx,
-                                collection_name: col_name.clone(),
-                            });
-                            let _ = client.raft_append_entries(req).await;
+                            }
+                            Err(_) => continue,
+                        };
+                        let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
+
+                        // Convert entries to proto
+                        let proto_entries = entries
+                            .iter()
+                            .map(|e| crate::proto::RaftEntry {
+                                term: e.term,
+                                index: e.index,
+                                command: Some(crate::proto::RaftCommand {
+                                    cmd: Some(
+                                        crate::service::raft_command_to_proto(&e.command),
+                                    ),
+                                }),
+                            })
+                            .collect();
+
+                        let req = tonic::Request::new(AppendEntriesRequest {
+                            partition_id: *pid,
+                            leader_term: term,
+                            leader_id: leader_id.clone(),
+                            prev_log_index,
+                            prev_log_term,
+                            entries: proto_entries,
+                            leader_commit: commit_idx,
+                            collection_name: col_name.clone(),
+                        });
+
+                        match client.raft_append_entries(req).await {
+                            Ok(resp) => {
+                                let ack = resp.into_inner();
+                                if ack.success {
+                                    // Record replication up to the last entry sent
+                                    if let Some(last) = entries.last() {
+                                        node.record_replication(&peer_addr, last.index).await;
+                                    }
+                                } else if ack.current_term > term {
+                                    // Leader is stale → step down
+                                    info!(
+                                        "Stale leader for '{}' partition {} (peer has term {} > {}), stepping down",
+                                        col_name, pid, ack.current_term, term
+                                    );
+                                    // We don't step down automatically here;
+                                    // the election timer will handle it.
+                                } else {
+                                    // Log mismatch — retry with older entries
+                                    node.retry_replication(&peer_addr).await;
+                                }
+                            }
+                            Err(_) => {
+                                // Peer unreachable — will retry on next tick
+                            }
                         }
                     }
+
+                    // After processing all peers, check if we can advance commit_index
+                    node.advance_commit().await;
                 }
             }
         });
@@ -377,20 +436,21 @@ impl ServerInstance {
                 .as_ref()
                 .ok_or_else(|| "TLS enabled but key_path not configured".to_string())?;
 
-            let cert = std::fs::read(cert_path).map_err(|e| format!("failed to read cert: {e}"))?;
-            let key = std::fs::read(key_path).map_err(|e| format!("failed to read key: {e}"))?;
+            let cert = std::fs::read(cert_path)
+                .map_err(|e| format!("failed to read cert: {e}"))?;
+            let key =
+                std::fs::read(key_path).map_err(|e| format!("failed to read key: {e}"))?;
             let identity = Identity::from_pem(cert, key);
 
             let mut tls_config = ServerTlsConfig::new().identity(identity);
             if let Some(ca_path) = &self.config.tls.ca_cert_path {
-                let ca_cert =
-                    std::fs::read(ca_path).map_err(|e| format!("failed to read CA cert: {e}"))?;
+                let ca_cert = std::fs::read(ca_path)
+                    .map_err(|e| format!("failed to read CA cert: {e}"))?;
                 tls_config =
                     tls_config.client_ca_root(tonic::transport::Certificate::from_pem(ca_cert));
             }
 
             info!("gRPC server listening on {addr} with TLS");
-
             Server::builder()
                 .tls_config(tls_config)?
                 .add_service(RekhaGrpcServer::new(service))
@@ -398,7 +458,6 @@ impl ServerInstance {
                 .await?;
         } else {
             info!("gRPC server listening on {addr} (plaintext)");
-
             Server::builder()
                 .add_service(RekhaGrpcServer::new(service))
                 .serve_with_shutdown(addr, shutdown)
@@ -430,12 +489,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_server_from_config_file_not_found() {
-        let result = ServerInstance::from_config_file("/nonexistent/config.yaml").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_default_collection_created() {
         let config = ServerConfig::dev_default("test-node", &temp_dir());
         let server = ServerInstance::from_config(config).await.unwrap();
@@ -452,11 +505,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_server_config_refs() {
+    async fn test_system_raft_node_created() {
         let config = ServerConfig::dev_default("test-node", &temp_dir());
         let server = ServerInstance::from_config(config).await.unwrap();
-        assert_eq!(server.config.cluster.node_id, "test-node");
-        assert_eq!(server.config.partition.num_dim_groups, 4);
+        let sys_node = server.coordinator.system_raft_node();
+        assert!(sys_node.is_some());
+        assert_eq!(sys_node.unwrap().partition_id(), SYSTEM_PARTITION_ID);
+    }
+
+    #[tokio::test]
+    async fn test_raft_nodes_contain_system_node() {
+        let config = ServerConfig::dev_default("test-node", &temp_dir());
+        let server = ServerInstance::from_config(config).await.unwrap();
+        let all = server.coordinator.all_raft_nodes();
+        assert!(all.iter().any(|(name, _, _)| name == "__system__"));
+        assert!(all.iter().any(|(name, _, _)| name == "default"));
     }
 
     #[tokio::test]

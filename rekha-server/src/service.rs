@@ -4,7 +4,7 @@ use rekha_core::{
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::coordinator::Coordinator;
 use crate::proto::{
@@ -392,7 +392,16 @@ impl Rekha for RekhaService {
         let raft_node = self
             .coordinator
             .raft_node(cname, req.partition_id)
-            .ok_or_else(|| Status::not_found("no raft node for partition"))?;
+            .ok_or_else(|| {
+                warn!(
+                    "raft_append_entries: no node for cname='{}' pid={}",
+                    cname, req.partition_id
+                );
+                Status::not_found(format!(
+                    "no raft node for partition {} collection '{}'",
+                    req.partition_id, cname
+                ))
+            })?;
 
         let entries: Vec<_> = req
             .entries
@@ -507,17 +516,14 @@ impl Rekha for RekhaService {
             }));
         }
 
-        // Propose through system Raft group for replication.
+        // Replicate via system Raft group. If not leader, the heartbeat loop
+        // on the elected leader will push the local metadata to followers.
         if let Some(sys_node) = self.coordinator.system_raft_node() {
             let cmd = rekha_raft::state::RaftCommand::CreateCollection {
                 name: req.name.clone(),
                 config: collection_config,
             };
-            if let Err(e) = sys_node.propose(cmd).await {
-                // Local creation succeeded; system replication is best-effort.
-                // If the system group isn't ready, the collection still works locally.
-                info!("System Raft propose (create_collection) failed: {e}");
-            }
+            let _ = sys_node.propose(cmd).await;
         }
 
         Ok(Response::new(CreateCollectionResponse {
@@ -594,7 +600,7 @@ impl Rekha for RekhaService {
     }
 }
 
-/// Convert an internal RaftCommand to a proto RaftCommand (for replication).
+/// Convert internal RaftCommand → proto RaftCommand for AppendEntries.
 pub fn raft_command_to_proto(cmd: &rekha_raft::state::RaftCommand) -> crate::proto::raft_command::Cmd {
     use crate::proto::raft_command::Cmd;
     match cmd {
@@ -603,30 +609,44 @@ pub fn raft_command_to_proto(cmd: &rekha_raft::state::RaftCommand) -> crate::pro
                 id: *id,
                 vector: vector.clone(),
                 payload: payload.clone().map(|data| crate::proto::Payload {
-                    content_type: "raw".into(),
-                    data,
+                    content_type: "raw".into(), data,
                 }),
                 collection_name: String::new(),
             })
         }
         rekha_raft::state::RaftCommand::Delete { ids } => {
             Cmd::Delete(crate::proto::DeleteRequest {
-                ids: ids.clone(),
-                collection_name: String::new(),
+                ids: ids.clone(), collection_name: String::new(),
             })
         }
-        rekha_raft::state::RaftCommand::CreateCollection { name, .. } => {
-            Cmd::Custom(format!("create_collection:{name}").into_bytes())
+        rekha_raft::state::RaftCommand::CreateCollection { name, config } => {
+            let pb_config = crate::proto::CollectionConfig {
+                dim: config.dim,
+                num_vector_shards: config.num_vector_shards,
+                replication_factor: config.replication_factor,
+                num_dim_groups: config.num_dim_groups,
+                dim_group_size: config.dim_group_size,
+                graph_degree: config.graph_degree,
+                search_list_size: config.search_list_size,
+                pq_num_sub_vectors: config.pq_num_sub_vectors,
+                pq_num_centroids: config.pq_num_centroids,
+                re_rank_k: config.re_rank_k,
+            };
+            Cmd::CreateCollection(crate::proto::CreateCollectionCommand {
+                name: name.clone(),
+                config: Some(pb_config),
+            })
         }
         rekha_raft::state::RaftCommand::DropCollection { name } => {
-            Cmd::Custom(format!("drop_collection:{name}").into_bytes())
+            Cmd::DropCollection(crate::proto::DropCollectionCommand {
+                name: name.clone(),
+            })
         }
-        rekha_raft::state::RaftCommand::NoOp => {
-            Cmd::Custom(vec![])
-        }
+        rekha_raft::state::RaftCommand::NoOp => Cmd::Custom(vec![]),
     }
 }
 
+/// Convert proto RaftCommand → internal RaftCommand (from AppendEntries).
 fn proto_raft_command_to_internal(
     cmd: crate::proto::RaftCommand,
 ) -> rekha_raft::state::RaftCommand {
@@ -636,14 +656,32 @@ fn proto_raft_command_to_internal(
             id: insert.id,
             vector: insert.vector,
             payload: insert.payload.and_then(|p| {
-                if p.data.is_empty() {
-                    None
-                } else {
-                    Some(p.data)
-                }
+                if p.data.is_empty() { None } else { Some(p.data) }
             }),
         },
         Some(Cmd::Delete(delete)) => rekha_raft::state::RaftCommand::Delete { ids: delete.ids },
+        Some(Cmd::CreateCollection(cc)) => {
+            let cfg = cc.config.unwrap_or_default();
+            rekha_raft::state::RaftCommand::CreateCollection {
+                name: cc.name,
+                config: rekha_core::CollectionConfig {
+                    dim: cfg.dim,
+                    num_vector_shards: cfg.num_vector_shards,
+                    replication_factor: cfg.replication_factor,
+                    num_dim_groups: cfg.num_dim_groups,
+                    dim_group_size: cfg.dim_group_size,
+                    graph_degree: cfg.graph_degree,
+                    search_list_size: cfg.search_list_size,
+                    pq_num_sub_vectors: cfg.pq_num_sub_vectors,
+                    pq_num_centroids: cfg.pq_num_centroids,
+                    re_rank_k: cfg.re_rank_k,
+                    distance_metric: rekha_core::DistanceMetric::L2,
+                },
+            }
+        }
+        Some(Cmd::DropCollection(dc)) => rekha_raft::state::RaftCommand::DropCollection {
+            name: dc.name,
+        },
         Some(Cmd::Custom(_)) | None => rekha_raft::state::RaftCommand::NoOp,
     }
 }

@@ -28,6 +28,7 @@ service Rekha {
     rpc RaftAppendEntries(AppendEntriesRequest) returns (RaftAck);
     rpc RaftRequestVote(RaftVoteRequest) returns (RaftVoteResponse);
     rpc RaftInstallSnapshot(stream RaftSnapshotChunk) returns (RaftAck);
+
 }
 
 // ── Core Data Types ─────────────────────────────────────────
@@ -182,11 +183,22 @@ message RaftEntry {
     RaftCommand command = 3;
 }
 
+message CreateCollectionCommand {
+    string name = 1;
+    CollectionConfig config = 2;
+}
+
+message DropCollectionCommand {
+    string name = 1;
+}
+
 message RaftCommand {
     oneof cmd {
         InsertRequest insert = 1;
         DeleteRequest delete = 2;
         bytes custom = 3;
+        CreateCollectionCommand create_collection = 4;
+        DropCollectionCommand drop_collection = 5;
     }
 }
 
@@ -284,3 +296,4 @@ message RaftSnapshotChunk {
     bytes data = 4;
     bool done = 5;
 }
+

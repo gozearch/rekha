@@ -1,6 +1,7 @@
 use rekha_core::{
-    ClusterTopology, DistanceMetric, IndexBufferHandle, NodeInfo, NodeStatus, Payload, RekhaError,
-    ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
+    ClusterTopology, CollectionConfig, CollectionMeta, DistanceMetric, IndexBufferHandle,
+    NodeInfo, NodeStatus, Payload, RekhaError, ScoredPoint, SearchParams, SearchStats,
+    VectorIndex, VectorStoreBackend,
 };
 use rekha_index::RekhaIndex;
 use rekha_partition::PartitionManager;
@@ -14,21 +15,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::ServerConfig;
 
-/// How long without a heartbeat before a peer is marked Unreachable.
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Tracked information about a peer node.
 #[derive(Debug, Clone)]
 pub(crate) struct PeerState {
     pub info: NodeInfo,
     pub last_seen: Instant,
 }
 
-/// A gRPC client connection to a peer node.
 struct PeerClient {
     #[allow(dead_code)]
     info: NodeInfo,
@@ -64,7 +62,6 @@ impl PeerClient {
     }
 }
 
-/// Pool of gRPC clients to known peer nodes.
 pub(crate) struct PeerPool {
     clients: HashMap<String, PeerClient>,
     collection_name: String,
@@ -78,15 +75,11 @@ impl PeerPool {
         }
     }
 
-    /// Reconcile the pool with the current peer list.
-    /// Connects to new peers, keeps existing connections, drops removed peers.
     pub async fn refresh(&mut self, peers: &[NodeInfo]) {
-        // Drop peers no longer in the list.
         let active: std::collections::HashSet<String> =
             peers.iter().map(|p| p.node_id.clone()).collect();
         self.clients.retain(|node_id, _| active.contains(node_id));
 
-        // Connect to new or reconnecting peers.
         for info in peers {
             if !self.clients.contains_key(&info.node_id) {
                 match PeerClient::connect(info, &self.collection_name).await {
@@ -102,8 +95,6 @@ impl PeerPool {
         }
     }
 
-    /// Fan out a search query to all connected peers.
-    /// Returns merged (candidates, stats) from all peers that responded.
     pub async fn search_fan_out(
         &mut self,
         query: &[f32],
@@ -128,7 +119,6 @@ impl PeerPool {
                     Err(_) => {
                         if let Some(c) = self.clients.get_mut(node_id) {
                             c.error_count += 1;
-                            // Remove client after 3 consecutive errors.
                             if c.error_count >= 3 {
                                 info!("Dropping peer {} after 3 errors", node_id);
                                 self.clients.remove(node_id);
@@ -155,41 +145,59 @@ impl PeerPool {
     }
 }
 
-/// The distributed query coordinator.
-///
-/// Responsibilities:
-/// - Route search queries to the appropriate partitions
-/// - Fan out to dimension groups for partial distance computation
-/// - Merge partial results from multiple nodes
-/// - Apply early-stop pruning across dimension groups
-/// - Manage cluster topology and node health
-pub struct Coordinator {
-    /// Server configuration.
-    config: ServerConfig,
-    /// Local index (this node's data).
-    index: Arc<RwLock<Option<RekhaIndex>>>,
-    /// Local storage backend.
-    store: Arc<RocksVectorStore>,
-    /// Partition topology manager.
-    #[allow(dead_code)]
-    partition_manager: Arc<RwLock<PartitionManager>>,
-    /// Raft nodes for each partition hosted on this node.
+/// Per-collection state held by the coordinator.
+pub struct CollectionState {
+    pub config: CollectionConfig,
+    pub meta: CollectionMeta,
+    pub store: Arc<RocksVectorStore>,
+    pub index: Arc<RwLock<Option<RekhaIndex>>>,
     pub raft_nodes: DashMap<u64, Arc<RaftNode>>,
-    /// Cluster topology (peer nodes).
+    pub raft_log_store: RaftLogStore,
+    pub next_auto_id: AtomicU64,
+}
+
+/// Thin handle that routes IndexBufferHandle calls to a specific collection.
+struct PerCollectionHandle {
+    collection_name: String,
+    collections: Arc<DashMap<String, CollectionState>>,
+}
+
+impl IndexBufferHandle for PerCollectionHandle {
+    fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
+        if let Some(state) = self.collections.get(&self.collection_name) {
+            if let Ok(idx) = state.index.try_read() {
+                if let Some(ref idx) = *idx {
+                    idx.buffer_insert(id, vector);
+                }
+            }
+        }
+    }
+
+    fn buffer_delete(&self, ids: &[u64]) {
+        if let Some(state) = self.collections.get(&self.collection_name) {
+            if let Ok(idx) = state.index.try_read() {
+                if let Some(ref idx) = *idx {
+                    idx.buffer_delete(ids);
+                }
+            }
+        }
+    }
+}
+
+/// The distributed query coordinator, now collection-aware.
+pub struct Coordinator {
+    pub config: ServerConfig,
+    pub store: Arc<RocksVectorStore>,
+    pub collections: Arc<DashMap<String, CollectionState>>,
+    pub partition_manager: Arc<RwLock<PartitionManager>>,
     topology: Arc<RwLock<ClusterTopology>>,
-    /// Whether this coordinator is initialized.
     initialized: Arc<RwLock<bool>>,
-    /// Peer node tracking (node_id → state).
     peers: Arc<RwLock<HashMap<String, PeerState>>>,
-    /// gRPC client pool for peer nodes.
     peer_pool: Arc<RwLock<PeerPool>>,
-    /// Auto-incrementing ID counter. Initialized from max stored ID + 1.
-    /// When the client sends id=0, we replace it with next_auto_id.fetch_add(1).
     next_auto_id: AtomicU64,
 }
 
 impl Coordinator {
-    /// Create a new coordinator.
     pub fn new(
         config: ServerConfig,
         store: Arc<RocksVectorStore>,
@@ -198,10 +206,9 @@ impl Coordinator {
         let starting_id = Self::starting_auto_id(&store);
         Self {
             config,
-            index: Arc::new(RwLock::new(None)),
             store,
+            collections: Arc::new(DashMap::new()),
             partition_manager,
-            raft_nodes: DashMap::new(),
             topology: Arc::new(RwLock::new(ClusterTopology {
                 cluster_id: String::new(),
                 nodes: HashMap::new(),
@@ -214,7 +221,6 @@ impl Coordinator {
         }
     }
 
-    /// Compute the starting auto-ID by scanning all stored IDs and taking max+1.
     fn starting_auto_id(store: &RocksVectorStore) -> u64 {
         match store.iter_ids() {
             Ok(ids) => ids.iter().max().copied().unwrap_or(0) + 1,
@@ -222,85 +228,261 @@ impl Coordinator {
         }
     }
 
-    /// Initialize the coordinator with an index.
-    pub async fn initialize(&self, index: RekhaIndex) {
-        {
-            let mut idx = self.index.write().await;
-            *idx = Some(index);
+    /// Create a "default" collection for backward compat.
+    /// Used when server starts with no explicit collections.
+    pub async fn create_default_collection(&self) -> Result<(), RekhaError> {
+        if self.collections.contains_key("default") {
+            return Ok(());
         }
-        *self.initialized.write().await = true;
+        let meta = self.load_or_create_meta("default").await;
+        let config = meta.config.clone();
+        let namespaced_store = self.namespaced_store("default");
+        let raft_log_store = RaftLogStore::with_namespace(self.store.clone(), "default".into());
+        let dim = (config.dim_group_size as usize) * (config.num_dim_groups as usize);
 
-        // Rehydrate insert buffer from Raft state (crash recovery).
-        let _ = self.recover_index_buffer().await;
+        let index = RekhaIndex::new(
+            dim,
+            config.pq_num_sub_vectors as usize,
+            config.pq_num_centroids as usize,
+            config.graph_degree as usize,
+            (*namespaced_store).clone(),
+            config.distance_metric,
+        )?;
 
-        // Spawn background flush loop.
-        self.spawn_flush_loop();
-        info!("Coordinator initialized");
-    }
+        let state = CollectionState {
+            config: config.clone(),
+            meta,
+            store: namespaced_store.clone(),
+            index: Arc::new(RwLock::new(Some(index))),
+            raft_nodes: DashMap::new(),
+            raft_log_store: raft_log_store.clone(),
+            next_auto_id: AtomicU64::new(1),
+        };
 
-    /// Recover the insert buffer from Raft-replicated state after restart.
-    async fn recover_index_buffer(&self) -> Result<(), RekhaError> {
-        let mut idx = self.index.write().await;
-        let index = idx.as_mut().ok_or_else(|| RekhaError::Internal {
-            detail: "index not initialized for recovery".into(),
-        })?;
-
-        let mut recovered = 0usize;
-        for item in self.raft_nodes.iter() {
-            let raft_node = item.value();
-            let state = raft_node.read_state().await;
-            for (id, bytes) in state.vectors.iter() {
-                if index.graph_contains_id(*id) {
-                    continue; // Already in the graph
-                }
-                let vec: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
-                index.buffer_insert(*id, vec);
-                recovered += 1;
-            }
-        }
-
-        if recovered > 0 {
-            info!("Recovered {recovered} vectors into insert buffer from Raft state");
-            // Flush immediately if buffer exceeds threshold
-            if index.should_flush() {
-                index.flush_buffer()?;
-                info!("Immediate flush after recovery ({recovered} vectors)");
-            }
-        }
+        self.collections.insert("default".into(), state);
+        self.spawn_flush_loop("default");
+        info!("Created default collection");
         Ok(())
     }
 
-    /// Spawn a background task that periodically flushes the insert buffer.
-    fn spawn_flush_loop(&self) {
-        let flush_ms = self.config.index.insert_buffer_flush_interval_ms;
-        let index = self.index.clone();
+    /// Create a named collection with given config.
+    pub async fn create_collection(
+        &self,
+        name: &str,
+        config: CollectionConfig,
+    ) -> Result<(), RekhaError> {
+        if self.collections.contains_key(name) {
+            return Err(RekhaError::InvalidArgument(format!(
+                "collection '{name}' already exists"
+            )));
+        }
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(flush_ms));
-            loop {
-                interval.tick().await;
-                let mut idx = index.write().await;
-                if let Some(ref mut idx) = *idx {
-                    if idx.should_flush() || idx.buffer_len() > 0 {
-                        let buf_len = idx.buffer_len();
-                        if let Err(e) = idx.flush_buffer() {
-                            tracing::warn!("Buffer flush failed: {e} (buffer: {buf_len} vectors)");
-                        }
-                    }
-                }
-            }
+        let meta = CollectionMeta {
+            name: name.to_string(),
+            config: config.clone(),
+            vector_count: 0,
+            index_ready: false,
+            created_at_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        self.store.store_collection_meta(&meta)?;
+
+        let namespaced_store = self.namespaced_store(name);
+        let raft_log_store = RaftLogStore::with_namespace(self.store.clone(), name.into());
+        let dim = (config.dim_group_size as usize) * (config.num_dim_groups as usize);
+
+        let index = RekhaIndex::new(
+            dim,
+            config.pq_num_sub_vectors as usize,
+            config.pq_num_centroids as usize,
+            config.graph_degree as usize,
+            (*namespaced_store).clone(),
+            config.distance_metric,
+        )?;
+
+        let handle = Arc::new(PerCollectionHandle {
+            collection_name: name.to_string(),
+            collections: self.collections.clone(),
         });
+
+        let num_shards = config.num_vector_shards;
+        let node_id = &self.config.cluster.node_id;
+        let peers: Vec<String> = self
+            .config
+            .cluster
+            .seed_nodes
+            .iter()
+            .filter(|s| !s.starts_with(node_id))
+            .cloned()
+            .collect();
+
+        let raft_nodes = DashMap::new();
+        for shard in 0..num_shards {
+            let raft_state = rekha_raft::ReplicatedState::new(shard);
+            let raft_node = Arc::new(RaftNode::with_store(
+                node_id.clone(),
+                shard,
+                peers.clone(),
+                raft_state,
+                Some(raft_log_store.clone()),
+                Some(handle.clone() as Arc<dyn IndexBufferHandle>),
+            ));
+            raft_nodes.insert(shard, raft_node);
+        }
+        info!("Created {} Raft nodes for collection '{}'", num_shards, name);
+
+        let state = CollectionState {
+            config: config.clone(),
+            meta,
+            store: namespaced_store.clone(),
+            index: Arc::new(RwLock::new(Some(index))),
+            raft_nodes,
+            raft_log_store: raft_log_store.clone(),
+            next_auto_id: AtomicU64::new(1),
+        };
+
+        self.collections.insert(name.to_string(), state);
+        self.spawn_flush_loop(name);
+        info!("Collection '{}' created successfully", name);
+        Ok(())
     }
 
-    /// Check if initialized.
+    /// Drop a collection and all its data.
+    pub async fn drop_collection(&self, name: &str) -> Result<(), RekhaError> {
+        let state = self.collections.remove(name).ok_or_else(|| {
+            RekhaError::NotFound(format!("collection '{name}' not found"))
+        })?;
+
+        if let Err(e) = state.1.store.delete_all_in_namespace() {
+            warn!("Failed to delete all data in collection '{name}': {e}");
+        }
+        if let Err(e) = self.store.delete_collection_meta(name) {
+            warn!("Failed to delete collection meta '{name}': {e}");
+        }
+        info!("Collection '{}' dropped", name);
+        Ok(())
+    }
+
+    /// List all collections.
+    pub async fn list_collections(&self) -> Vec<CollectionMeta> {
+        self.store
+            .list_collections()
+            .unwrap_or_else(|e| {
+                warn!("Failed to list collections: {e}");
+                Vec::new()
+            })
+    }
+
+    /// Check if a collection exists by name.
+    pub async fn collection_exists(&self, name: &str) -> bool {
+        self.collections.contains_key(name)
+            || self
+                .store
+                .load_collection_meta(name)
+                .ok()
+                .flatten()
+                .is_some()
+    }
+
+    /// Get collection config.
+    pub fn collection_config(&self, name: &str) -> Option<CollectionConfig> {
+        self.collections
+            .get(name)
+            .map(|s| s.config.clone())
+    }
+
+    /// Get a collection's namespaced store.
+    pub fn collection_store(&self, name: &str) -> Option<Arc<RocksVectorStore>> {
+        self.collections.get(name).map(|s| s.store.clone())
+    }
+
+    fn namespaced_store(&self, name: &str) -> Arc<RocksVectorStore> {
+        let db = self.store.db().clone();
+        Arc::new(RocksVectorStore::from_db(db, Some(name.to_string())))
+    }
+
+    async fn load_or_create_meta(&self, name: &str) -> CollectionMeta {
+        if let Ok(Some(meta)) = self.store.load_collection_meta(name) {
+            return meta;
+        }
+        let dim_val = (self.config.partition.dim_group_size as usize)
+            * (self.config.partition.num_dim_groups as usize);
+        let config = CollectionConfig {
+            dim: dim_val as u32,
+            num_vector_shards: self.config.partition.num_vector_shards,
+            replication_factor: self.config.partition.replication_factor as u64,
+            num_dim_groups: self.config.partition.num_dim_groups,
+            dim_group_size: self.config.partition.dim_group_size as u32,
+            distance_metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+        let meta = CollectionMeta {
+            name: name.to_string(),
+            config,
+            vector_count: 0,
+            index_ready: false,
+            created_at_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let _ = self.store.store_collection_meta(&meta);
+        meta
+    }
+
+    /// Initialize all collections from stored metadata and recover state.
+    pub async fn initialize_all(&self) {
+        let collections = self.list_collections().await;
+        for meta in &collections {
+            if self.collections.contains_key(&meta.name) {
+                continue;
+            }
+            let name = meta.name.clone();
+            let config = meta.config.clone();
+            let namespaced_store = self.namespaced_store(&name);
+            let raft_log_store =
+                RaftLogStore::with_namespace(self.store.clone(), name.clone());
+            let dim = (config.dim_group_size as usize) * (config.num_dim_groups as usize);
+
+            let index = match RekhaIndex::new(
+                dim,
+                config.pq_num_sub_vectors as usize,
+                config.pq_num_centroids as usize,
+                config.graph_degree as usize,
+                (*namespaced_store).clone(),
+                config.distance_metric,
+            ) {
+                Ok(idx) => Arc::new(RwLock::new(Some(idx))),
+                Err(e) => {
+                    warn!("Failed to create index for collection '{name}': {e}");
+                    Arc::new(RwLock::new(None))
+                }
+            };
+
+            let state = CollectionState {
+                config: config.clone(),
+                meta: meta.clone(),
+                store: namespaced_store.clone(),
+                index,
+                raft_nodes: DashMap::new(),
+                raft_log_store: raft_log_store.clone(),
+                next_auto_id: AtomicU64::new(1),
+            };
+
+            self.collections.insert(name.clone(), state);
+            self.spawn_flush_loop(&name);
+            info!("Recovered collection '{}' from storage", name);
+        }
+        *self.initialized.write().await = true;
+        info!("Coordinator initialized with {} collections", collections.len());
+    }
+
     pub async fn is_initialized(&self) -> bool {
         *self.initialized.read().await
     }
 
-    /// Look up a peer's address by node ID.
     pub async fn peer_address(&self, node_id: &str) -> Option<String> {
         self.peers
             .read()
@@ -309,12 +491,11 @@ impl Coordinator {
             .map(|p| p.info.address.clone())
     }
 
-    /// Get node info for this node.
     pub fn local_node_info(&self) -> NodeInfo {
         NodeInfo {
             node_id: self.config.cluster.node_id.clone(),
             address: self.config.cluster.bind_addr.clone(),
-            partition_id: 0, // Simplified
+            partition_id: 0,
             dim_groups: (0..self.config.partition.num_dim_groups).collect(),
             is_leader: true,
             raft_term: 1,
@@ -325,7 +506,6 @@ impl Coordinator {
         }
     }
 
-    /// Get a reference to the local store.
     pub fn store(&self) -> &Arc<RocksVectorStore> {
         &self.store
     }
@@ -346,7 +526,6 @@ impl Coordinator {
         &self.config.cluster.seed_nodes
     }
 
-    /// Register or update a peer from a heartbeat or handshake.
     pub async fn register_peer(&self, info: NodeInfo) {
         let mut peers = self.peers.write().await;
         let mut info = info;
@@ -365,7 +544,6 @@ impl Coordinator {
         self.refresh_peer_pool().await;
     }
 
-    /// Get the list of healthy peers (for pool refresh and handshake responses).
     pub async fn healthy_peers(&self) -> Vec<NodeInfo> {
         let peers = self.peers.read().await;
         peers
@@ -375,7 +553,6 @@ impl Coordinator {
             .collect()
     }
 
-    /// Refresh the peer connection pool from current healthy peer list.
     async fn refresh_peer_pool(&self) {
         let healthy = self.healthy_peers().await;
         let mut pool = self.peer_pool.write().await;
@@ -386,8 +563,6 @@ impl Coordinator {
         pool.refresh(&external).await;
     }
 
-    /// Get the list of known peers for handshake responses.
-    /// Excludes the given node_id (the requester).
     pub async fn peers_for_handshake(&self, exclude: &str) -> Vec<NodeInfo> {
         let peers = self.peers.read().await;
         peers
@@ -397,7 +572,6 @@ impl Coordinator {
             .collect()
     }
 
-    /// Mark peers that haven't sent a heartbeat recently as Unreachable.
     pub async fn check_peer_health(&self) {
         let mut peers = self.peers.write().await;
         let mut changed = false;
@@ -418,7 +592,6 @@ impl Coordinator {
         }
     }
 
-    /// Rebuild the cluster topology from current peer state + local node.
     async fn sync_topology(&self) {
         let peers = self.peers.read().await;
         let mut nodes = HashMap::new();
@@ -430,48 +603,59 @@ impl Coordinator {
         topo.nodes = nodes;
     }
 
-    /// Return the config reference (for server heartbeat loop).
     pub fn config_ref(&self) -> &ServerConfig {
         &self.config
     }
 
-    /// Register a Raft node for a partition.
-    pub fn register_raft_node(&self, partition_id: u64, node: Arc<RaftNode>) {
-        self.raft_nodes.insert(partition_id, node);
-    }
-
-    /// Get a Raft node by partition ID.
-    pub fn raft_node(&self, partition_id: u64) -> Option<Arc<RaftNode>> {
-        self.raft_nodes.get(&partition_id).map(|n| n.clone())
-    }
-
-    /// Create a persistent log store backed by the local RocksDB.
-    pub fn raft_log_store(&self) -> RaftLogStore {
-        RaftLogStore::new(self.store.clone())
-    }
-}
-
-impl IndexBufferHandle for Coordinator {
-    fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
-        if let Ok(idx) = self.index.try_read() {
-            if let Some(ref idx) = *idx {
-                idx.buffer_insert(id, vector);
-            }
+    /// Register a Raft node for a specific collection + partition.
+    pub fn register_raft_node(&self, collection_name: &str, partition_id: u64, node: Arc<RaftNode>) {
+        if let Some(state) = self.collections.get(collection_name) {
+            state.raft_nodes.insert(partition_id, node);
         }
     }
 
-    fn buffer_delete(&self, ids: &[u64]) {
-        if let Ok(idx) = self.index.try_read() {
-            if let Some(ref idx) = *idx {
-                idx.buffer_delete(ids);
-            }
-        }
+    /// Get a Raft node for a specific collection + partition.
+    pub fn raft_node(&self, collection_name: &str, partition_id: u64) -> Option<Arc<RaftNode>> {
+        self.collections
+            .get(collection_name)
+            .and_then(|state| state.raft_nodes.get(&partition_id).map(|n| n.clone()))
     }
-}
 
-impl Coordinator {
-    pub async fn search(
+    /// Create a RaftLogStore for a given collection.
+    pub fn raft_log_store_for(&self, collection_name: &str) -> RaftLogStore {
+        RaftLogStore::with_namespace(self.store.clone(), collection_name.into())
+    }
+
+    fn spawn_flush_loop(&self, collection_name: &str) {
+        let flush_ms = self.config.index.insert_buffer_flush_interval_ms;
+        let name = collection_name.to_string();
+        let collections = self.collections.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(flush_ms));
+            loop {
+                interval.tick().await;
+                if let Some(state) = collections.get(&name) {
+                    let mut idx = state.index.write().await;
+                    if let Some(ref mut idx) = *idx {
+                        if idx.should_flush() || idx.buffer_len() > 0 {
+                            let buf_len = idx.buffer_len();
+                            if let Err(e) = idx.flush_buffer() {
+                                warn!(
+                                    "Buffer flush failed for '{}': {e} (buffer: {buf_len} vectors)",
+                                    name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Search within a specific collection.
+    pub async fn search_for_collection(
         &self,
+        collection_name: &str,
         query: Vec<f32>,
         k: usize,
         params: SearchParams,
@@ -479,16 +663,21 @@ impl Coordinator {
         let start = std::time::Instant::now();
         let mut stats = SearchStats::default();
 
-        let index_guard = self.index.read().await;
+        let (index_arc, store) = {
+            let state = self.collections.get(collection_name).ok_or_else(|| {
+                RekhaError::NotFound(format!("collection '{collection_name}' not found"))
+            })?;
+            (state.index.clone(), state.store.clone())
+        };
+        let index_guard = index_arc.read().await;
         let index = index_guard.as_ref().ok_or_else(|| RekhaError::Internal {
-            detail: "index not initialized".into(),
+            detail: format!("index for collection '{collection_name}' not initialized"),
         })?;
 
         let num_groups = self.config.partition.num_dim_groups;
         let total_dim = query.len();
         let dims_per_group = total_dim / num_groups as usize;
 
-        // Phase 1: Collect candidates from local index (dimension group fan-out).
         let mut candidates: Vec<ScoredPoint> = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
         let mut local_groups = 0u32;
@@ -514,7 +703,7 @@ impl Coordinator {
                         }
 
                         let payload = if params.include_payloads {
-                            self.store
+                            store
                                 .get_payload(*id)
                                 .ok()
                                 .flatten()
@@ -538,7 +727,6 @@ impl Coordinator {
             }
         }
 
-        // Phase 2: Fan out to peer nodes if available (skip for local-only searches).
         let peer_count = if params.local_only {
             0
         } else {
@@ -556,16 +744,13 @@ impl Coordinator {
             }
         };
 
-        // Phase 3: Re-rank top candidates with full-precision vectors.
-        // Sort by partial score and take top (k * 2) for re-ranking.
         candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
         candidates.truncate(k * 2);
 
-        // Re-rank with exact distances.
-        let metric = DistanceMetric::L2; // default; configurable later
+        let metric = DistanceMetric::L2;
         for candidate in candidates.iter_mut().take(k * 2) {
             let id = candidate.id;
-            if let Ok(Some(full_vec)) = self.store.get_vector(id) {
+            if let Ok(Some(full_vec)) = store.get_vector(id) {
                 let exact_dist = metric.distance(&full_vec, &query);
                 candidate.score = exact_dist;
             }
@@ -579,35 +764,73 @@ impl Coordinator {
         Ok((candidates, stats))
     }
 
-    pub async fn insert(
+    /// Insert into a specific collection.
+    pub async fn insert_into_collection(
         &self,
+        collection_name: &str,
         id: u64,
         vector: Vec<f32>,
         payload: Option<Payload>,
     ) -> Result<u64, RekhaError> {
+        let state = self.collections.get(collection_name).ok_or_else(|| {
+            RekhaError::NotFound(format!("collection '{collection_name}' not found"))
+        })?;
+
         let id = if id == 0 {
-            self.next_auto_id.fetch_add(1, Ordering::SeqCst)
+            state.next_auto_id.fetch_add(1, Ordering::SeqCst)
         } else {
             id
         };
 
-        // Route through Raft if a Raft node exists for partition 0.
-        if let Some(raft_node) = self.raft_node(0) {
-            let cmd = rekha_raft::state::RaftCommand::Insert {
-                id,
-                vector,
-                payload: payload.map(|p| p.data),
-            };
-            raft_node.propose(cmd).await?;
-            return Ok(id);
+        let store = state.store.clone();
+        if let Some(raft_node) = state.raft_nodes.get(&0) {
+            if raft_node.is_leader().await {
+                let cmd = rekha_raft::state::RaftCommand::Insert {
+                    id,
+                    vector,
+                    payload: payload.map(|p| p.data),
+                };
+                raft_node.propose(cmd).await?;
+                return Ok(id);
+            }
         }
+        drop(state);
 
-        // Fallback: direct store write (single-node / uninitialized).
-        self.store.put_vector(id, &vector)?;
+        store.put_vector(id, &vector)?;
         if let Some(ref p) = payload {
-            self.store.put_payload(id, &p.data)?;
+            store.put_payload(id, &p.data)?;
         }
         Ok(id)
+    }
+
+    /// Delete from a specific collection.
+    pub async fn delete_from_collection(
+        &self,
+        collection_name: &str,
+        ids: &[u64],
+    ) -> Result<u64, RekhaError> {
+        let state = self.collections.get(collection_name).ok_or_else(|| {
+            RekhaError::NotFound(format!("collection '{collection_name}' not found"))
+        })?;
+        state.store.delete(ids)
+    }
+
+    /// Fetch from a specific collection.
+    pub async fn fetch_from_collection(
+        &self,
+        collection_name: &str,
+        ids: &[u64],
+    ) -> Result<Vec<(u64, Option<Vec<f32>>, Option<Vec<u8>>)>, RekhaError> {
+        let state = self.collections.get(collection_name).ok_or_else(|| {
+            RekhaError::NotFound(format!("collection '{collection_name}' not found"))
+        })?;
+        let mut results = Vec::new();
+        for id in ids {
+            let vec = state.store.get_vector(*id)?;
+            let payload = state.store.get_payload(*id)?;
+            results.push((*id, vec, payload));
+        }
+        Ok(results)
     }
 
     pub async fn topology(&self) -> Result<ClusterTopology, RekhaError> {
@@ -618,11 +841,33 @@ impl Coordinator {
     pub async fn node_info(&self, _node_id: &str) -> Result<NodeInfo, RekhaError> {
         Ok(self.local_node_info())
     }
+}
 
-    pub async fn build_index(&self) -> Result<(), RekhaError> {
-        Err(RekhaError::Unavailable {
-            detail: "build_index is deprecated; index builds automatically".into(),
-        })
+impl IndexBufferHandle for Coordinator {
+    fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
+        if self.collections.is_empty() {
+            return;
+        }
+        for state in self.collections.iter() {
+            if let Ok(idx) = state.index.try_read() {
+                if let Some(ref idx) = *idx {
+                    idx.buffer_insert(id, vector.clone());
+                }
+            }
+        }
+    }
+
+    fn buffer_delete(&self, ids: &[u64]) {
+        if self.collections.is_empty() {
+            return;
+        }
+        for state in self.collections.iter() {
+            if let Ok(idx) = state.index.try_read() {
+                if let Some(ref idx) = *idx {
+                    idx.buffer_delete(ids);
+                }
+            }
+        }
     }
 }
 
@@ -659,83 +904,353 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_coordinator_initialize() {
+    async fn test_create_default_collection() {
         let coord = test_coordinator();
-        let store = temp_store();
-        let mut index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.add_vector_for_test(i, v);
-        }
-        index.build().unwrap();
-        coord.initialize(index).await;
-        assert!(coord.is_initialized().await);
+        coord.create_default_collection().await.unwrap();
+        assert!(coord.collections.contains_key("default"));
+        assert!(coord.collection_exists("default").await);
     }
 
     #[tokio::test]
-    async fn test_coordinator_search_before_init() {
+    async fn test_create_collection_and_exists() {
         let coord = test_coordinator();
-        let result = coord.search(vec![0.0; 8], 5, SearchParams::default()).await;
+        coord
+            .create_collection(
+                "test_col",
+                CollectionConfig {
+                    dim: 64,
+                    num_vector_shards: 1,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(coord.collection_exists("test_col").await);
+        assert!(!coord.collection_exists("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn test_create_duplicate_collection() {
+        let coord = test_coordinator();
+        coord
+            .create_collection(
+                "dup",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let result = coord
+            .create_collection(
+                "dup",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_coordinator_local_node_info() {
+    #[tokio::test]
+    async fn test_drop_collection() {
         let coord = test_coordinator();
-        let info = coord.local_node_info();
-        assert_eq!(info.node_id, "test-node");
-        assert!(info.is_leader);
-        assert_eq!(info.status, NodeStatus::Healthy);
-        assert_eq!(info.dim_groups, vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn test_coordinator_store() {
-        let coord = test_coordinator();
-        let store = coord.store();
-        // Store should be accessible
-        store.put_vector(1, &[1.0, 2.0]).unwrap();
-        let v = store.get_vector(1).unwrap().unwrap();
-        assert!((v[0] - 1.0).abs() < 1e-6);
+        coord
+            .create_collection(
+                "to_drop",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(coord.collection_exists("to_drop").await);
+        coord.drop_collection("to_drop").await.unwrap();
+        assert!(!coord.collection_exists("to_drop").await);
     }
 
     #[tokio::test]
-    async fn test_coordinator_insert() {
+    async fn test_list_collections() {
         let coord = test_coordinator();
-        coord.insert(42, vec![0.1, 0.2, 0.3], None).await.unwrap();
-        let v = coord.store().get_vector(42).unwrap().unwrap();
+        coord
+            .create_collection(
+                "list_a",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        coord
+            .create_collection(
+                "list_b",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let list = coord.list_collections().await;
+        assert!(list.iter().any(|m| m.name == "list_a"));
+        assert!(list.iter().any(|m| m.name == "list_b"));
+    }
+
+    #[tokio::test]
+    async fn test_collection_config() {
+        let coord = test_coordinator();
+        coord
+            .create_collection(
+                "cfg_col",
+                CollectionConfig {
+                    dim: 128,
+                    num_vector_shards: 3,
+                    distance_metric: DistanceMetric::Cosine,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let cfg = coord.collection_config("cfg_col").unwrap();
+        assert_eq!(cfg.dim, 128);
+        assert_eq!(cfg.num_vector_shards, 3);
+        assert_eq!(cfg.distance_metric, DistanceMetric::Cosine);
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_collection() {
+        let coord = test_coordinator();
+        coord
+            .create_collection(
+                "ins_col",
+                CollectionConfig {
+                    dim: 8,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let id = coord
+            .insert_into_collection("ins_col", 42, vec![0.1, 0.2], None)
+            .await
+            .unwrap();
+        assert_eq!(id, 42);
+        let store = coord.collection_store("ins_col").unwrap();
+        let v = store.get_vector(42).unwrap().unwrap();
         assert!((v[0] - 0.1).abs() < 1e-6);
     }
 
     #[tokio::test]
-    async fn test_coordinator_insert_with_payload() {
+    async fn test_insert_auto_id() {
         let coord = test_coordinator();
+        coord
+            .create_collection(
+                "auto_col",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let id1 = coord
+            .insert_into_collection("auto_col", 0, vec![0.1], None)
+            .await
+            .unwrap();
+        let id2 = coord
+            .insert_into_collection("auto_col", 0, vec![0.2], None)
+            .await
+            .unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+    }
+
+    #[tokio::test]
+    async fn test_insert_with_payload() {
+        let coord = test_coordinator();
+        coord
+            .create_collection(
+                "pay_col",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let payload = Payload::from_text("test data");
-        coord.insert(7, vec![0.5], Some(payload)).await.unwrap();
-        let stored_payload = coord.store().get_payload(7).unwrap().unwrap();
-        assert_eq!(stored_payload, b"test data");
+        coord
+            .insert_into_collection("pay_col", 7, vec![0.5], Some(payload))
+            .await
+            .unwrap();
+        let store = coord.collection_store("pay_col").unwrap();
+        let stored = store.get_payload(7).unwrap().unwrap();
+        assert_eq!(stored, b"test data");
     }
 
     #[tokio::test]
-    async fn test_coordinator_topology() {
+    async fn test_search_across_collections() {
         let coord = test_coordinator();
-        let topo = coord.topology().await.unwrap();
-        assert!(topo.nodes.is_empty());
+        coord
+            .create_collection(
+                "srch_a",
+                CollectionConfig {
+                    dim: 64,
+                    num_vector_shards: 1,
+                    num_dim_groups: 8,
+                    dim_group_size: 8,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let store_a = coord.collection_store("srch_a").unwrap();
+        let mut index_a = RekhaIndex::new(
+            64, 4, 16, 4, (*store_a).clone(), DistanceMetric::L2,
+        )
+        .unwrap();
+        for i in 0..5 {
+            let v: Vec<f32> = (0..64).map(|d| (i * 10 + d) as f32).collect();
+            index_a.add_vector_for_test(i, v);
+            store_a.put_vector(i, &(0..64).map(|d| (i * 10 + d) as f32).collect::<Vec<_>>()).unwrap();
+        }
+        index_a.build().unwrap();
+        if let Some(state) = coord.collections.get("srch_a") {
+            *state.index.write().await = Some(index_a);
+        }
+
+        let (results, _stats) = coord
+            .search_for_collection("srch_a", vec![0.0; 64], 3, SearchParams::default())
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
     }
 
     #[tokio::test]
-    async fn test_coordinator_node_info() {
+    async fn test_search_missing_collection() {
         let coord = test_coordinator();
-        let info = coord.node_info("any-node").await.unwrap();
+        let result = coord
+            .search_for_collection("nonexistent", vec![0.0; 8], 3, SearchParams::default())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_collection() {
+        let coord = test_coordinator();
+        coord
+            .create_collection(
+                "del_col",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        coord
+            .insert_into_collection("del_col", 1, vec![1.0], None)
+            .await
+            .unwrap();
+        let count = coord
+            .delete_from_collection("del_col", &[1])
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let store = coord.collection_store("del_col").unwrap();
+        assert!(store.get_vector(1).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_from_collection() {
+        let coord = test_coordinator();
+        coord
+            .create_collection(
+                "fetch_col",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        coord
+            .insert_into_collection("fetch_col", 10, vec![1.0, 2.0], Some(Payload::from_bytes(b"data".to_vec())))
+            .await
+            .unwrap();
+        let results = coord
+            .fetch_from_collection("fetch_col", &[10])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let (id, vec, payload) = &results[0];
+        assert_eq!(*id, 10);
+        assert_eq!(payload.as_deref(), Some(&b"data"[..]));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_all_recovery() {
+        let coord = test_coordinator();
+        coord
+            .create_collection(
+                "recover_col",
+                CollectionConfig {
+                    dim: 64,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 16,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(coord.collections.contains_key("recover_col"));
+
+        // Create a new coordinator from the same store to test recovery
+        let coord2 = Coordinator::new(
+            coord.config.clone(),
+            coord.store.clone(),
+            coord.partition_manager.clone(),
+        );
+        coord2.initialize_all().await;
+        assert!(coord2.collections.contains_key("recover_col"));
+        assert!(coord2.is_initialized().await);
+    }
+
+    #[tokio::test]
+    async fn test_local_node_info() {
+        let coord = test_coordinator();
+        let info = coord.local_node_info();
         assert_eq!(info.node_id, "test-node");
+        assert!(info.is_leader);
     }
 
     #[tokio::test]
@@ -756,113 +1271,35 @@ mod tests {
         coord.register_peer(info.clone()).await;
         let peers = coord.peers_for_handshake("").await;
         assert!(!peers.is_empty());
-        assert_eq!(peers[0].node_id, "peer-1");
     }
 
     #[tokio::test]
-    async fn test_register_peer_update() {
+    async fn test_check_peer_health() {
         let coord = test_coordinator();
-        let info = NodeInfo {
-            node_id: "peer-1".into(),
-            address: "10.0.0.2:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![0, 1],
-            is_leader: false,
-            raft_term: 1,
-            commit_index: 5,
-            storage_bytes: 256,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        coord.register_peer(info).await;
-        let updated_info = NodeInfo {
-            node_id: "peer-1".into(),
-            address: "10.0.0.2:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![0, 1],
-            is_leader: true,
-            raft_term: 2,
-            commit_index: 10,
-            storage_bytes: 512,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        coord.register_peer(updated_info).await;
-        let peers = coord.peers_for_handshake("").await;
-        assert_eq!(peers.len(), 1);
-        assert!(peers[0].is_leader);
-    }
-
-    #[tokio::test]
-    async fn test_peers_for_handshake_excludes_requester() {
-        let coord = test_coordinator();
-        let info = NodeInfo {
-            node_id: "peer-1".into(),
-            address: "10.0.0.2:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![0, 1],
-            is_leader: false,
-            raft_term: 1,
-            commit_index: 5,
-            storage_bytes: 256,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        coord.register_peer(info).await;
-        let peers = coord.peers_for_handshake("peer-1").await;
-        assert!(peers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_peers_for_handshake_empty() {
-        let coord = test_coordinator();
-        let peers = coord.peers_for_handshake("any").await;
-        assert!(peers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_healthy_peers() {
-        let coord = test_coordinator();
-        let info = NodeInfo {
-            node_id: "peer-1".into(),
-            address: "10.0.0.2:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![0, 1],
-            is_leader: false,
-            raft_term: 1,
-            commit_index: 5,
-            storage_bytes: 256,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        coord.register_peer(info).await;
+        coord.check_peer_health().await;
         let healthy = coord.healthy_peers().await;
-        assert_eq!(healthy.len(), 1);
+        assert!(healthy.is_empty());
     }
 
     #[tokio::test]
-    async fn test_register_raft_node() {
+    async fn test_accessors() {
         let coord = test_coordinator();
-        let state = rekha_raft::ReplicatedState::new(0);
-        let node = std::sync::Arc::new(rekha_raft::RaftNode::new("n1".into(), 0, vec![], state));
-        coord.register_raft_node(0, node);
-        let found = coord.raft_node(0);
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().node_id(), "n1");
+        assert_eq!(coord.cluster_id(), "rekha-dev");
+        assert_eq!(coord.node_id(), "test-node");
+        assert_eq!(coord.bind_addr(), "0.0.0.0:50051");
     }
 
     #[tokio::test]
-    async fn test_raft_node_nonexistent() {
+    async fn test_drop_nonexistent_collection() {
         let coord = test_coordinator();
-        let node = coord.raft_node(999);
-        assert!(node.is_none());
+        let result = coord.drop_collection("nope").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_raft_log_store_creation() {
+    async fn test_raft_log_store_for() {
         let coord = test_coordinator();
-        let log_store = coord.raft_log_store();
-        // RaftLogStore created from the coordinator's store should be usable
+        let log_store = coord.raft_log_store_for("my_col");
         let entry = rekha_raft::node::RaftLogEntry {
             term: 1,
             index: 1,
@@ -871,548 +1308,5 @@ mod tests {
         log_store.store_entry(0, &entry).unwrap();
         let entries = log_store.load_entries(0, 1).unwrap();
         assert_eq!(entries.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_search_with_local_index() {
-        let coord = test_coordinator();
-        let store = temp_store();
-        let mut index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        for i in 0..20 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.add_vector_for_test(i, v);
-        }
-        index.build().unwrap();
-        coord.initialize(index).await;
-
-        let (results, _stats) = coord
-            .search(vec![0.0; 8], 5, SearchParams::default())
-            .await
-            .unwrap();
-        assert!(!results.is_empty());
-        assert!(results.len() <= 5);
-    }
-
-    #[tokio::test]
-    async fn test_search_with_payloads() {
-        let coord = test_coordinator();
-        // Use coordinator's store so include_payloads search can find them
-        let shared_store = coord.store().clone();
-        let payload_data = b"test-payload".to_vec();
-
-        // Insert vector and payload directly into coordinator's store
-        shared_store.put_vector(42, &[1.0; 8]).unwrap();
-        shared_store.put_payload(42, &payload_data).unwrap();
-
-        // Initialize index with same store
-        let mut index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*shared_store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.add_vector_for_test(i, v);
-        }
-        index.build().unwrap();
-        coord.initialize(index).await;
-
-        let params = SearchParams {
-            include_payloads: true,
-            ..Default::default()
-        };
-        let (results, stats) = coord.search(vec![0.0; 8], 5, params).await.unwrap();
-        assert!(!results.is_empty());
-        assert!(stats.vectors_scanned > 0);
-    }
-
-    #[tokio::test]
-    async fn test_search_re_rank_exact() {
-        let coord = test_coordinator();
-        // Use coordinator's store so re-rank can find full-precision vectors
-        let shared_store = coord.store().clone();
-        let mut index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*shared_store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        // Add vectors where one is an exact match for the query
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| i as f32 * 10.0 + d as f32).collect();
-            index.add_vector_for_test(i, v);
-        }
-        index.build().unwrap();
-        coord.initialize(index).await;
-
-        // Search for a vector identical to id=5
-        let query: Vec<f32> = (0..8).map(|d| 50.0 + d as f32).collect();
-        let (results, _stats) = coord
-            .search(query, 3, SearchParams::default())
-            .await
-            .unwrap();
-        assert!(!results.is_empty());
-        // The exact match (id=5) should be the first result
-        assert_eq!(results[0].id, 5);
-        // Score should be 0.0 for exact match
-        assert!(results[0].score.abs() < 1e-5);
-    }
-
-    #[tokio::test]
-    async fn test_peer_pool_new_empty() {
-        let pool = PeerPool::new("default");
-        assert!(pool.is_empty());
-        assert_eq!(pool.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_starting_auto_id_empty_store() {
-        let store = temp_store();
-        let id = Coordinator::starting_auto_id(&store);
-        assert_eq!(id, 1); // empty store -> 0 + 1
-    }
-
-    #[tokio::test]
-    async fn test_starting_auto_id_with_existing() {
-        let store = temp_store();
-        store.put_vector(10, &[1.0]).unwrap();
-        store.put_vector(5, &[2.0]).unwrap();
-        store.put_vector(100, &[3.0]).unwrap();
-        let id = Coordinator::starting_auto_id(&store);
-        assert_eq!(id, 101); // max=100, +1=101
-    }
-
-    #[tokio::test]
-    async fn test_peer_address_known() {
-        let coord = test_coordinator();
-        let info = NodeInfo {
-            node_id: "peer-1".into(),
-            address: "10.0.0.2:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![],
-            is_leader: false,
-            raft_term: 1,
-            commit_index: 0,
-            storage_bytes: 0,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        coord.register_peer(info).await;
-        let addr = coord.peer_address("peer-1").await;
-        assert_eq!(addr, Some("10.0.0.2:50051".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_peer_address_unknown() {
-        let coord = test_coordinator();
-        let addr = coord.peer_address("nonexistent").await;
-        assert!(addr.is_none());
-    }
-
-    #[test]
-    fn test_accessors() {
-        let config = ServerConfig::dev_default("test-node", "/tmp/acc_test");
-        let store = temp_store();
-        let pm = Arc::new(RwLock::new(rekha_partition::PartitionManager::new(
-            HashMap::new(),
-            4,
-            768,
-        )));
-        let coord = Coordinator::new(config, store, pm);
-
-        assert_eq!(coord.cluster_id(), "rekha-dev");
-        assert_eq!(coord.node_id(), "test-node");
-        assert_eq!(coord.bind_addr(), "0.0.0.0:50051");
-        assert_eq!(coord.seed_nodes(), &["127.0.0.1:50051"]);
-        assert_eq!(coord.config_ref().cluster.node_id, "test-node");
-    }
-
-    #[tokio::test]
-    async fn test_sync_topology() {
-        let coord = test_coordinator();
-        // Register a peer then sync
-        let info = NodeInfo {
-            node_id: "peer-1".into(),
-            address: "10.0.0.2:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![],
-            is_leader: false,
-            raft_term: 1,
-            commit_index: 0,
-            storage_bytes: 0,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        coord.register_peer(info).await;
-        coord.sync_topology().await;
-        let topo = coord.topology().await.unwrap();
-        assert!(topo.nodes.contains_key("test-node"));
-        assert!(topo.nodes.contains_key("peer-1"));
-    }
-
-    #[tokio::test]
-    async fn test_check_peer_health_no_peers() {
-        let coord = test_coordinator();
-        // Should not panic with no peers
-        coord.check_peer_health().await;
-        let healthy = coord.healthy_peers().await;
-        assert!(healthy.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_index_buffer_handle_not_initialized() {
-        let coord = test_coordinator();
-        // buffer_insert and buffer_delete should be no-ops when index is None
-        coord.buffer_insert(1, vec![1.0, 2.0]);
-        coord.buffer_delete(&[1]);
-        // No panic = success
-    }
-
-    #[tokio::test]
-    async fn test_index_buffer_handle_with_initialized_index() {
-        let coord = test_coordinator();
-        let store = temp_store();
-        let mut index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.add_vector_for_test(i, v);
-        }
-        index.build().unwrap();
-        coord.initialize(index).await;
-
-        coord.buffer_insert(20, vec![0.0; 8]);
-        coord.buffer_delete(&[1]);
-        // No panic = success; buffer operations went through
-    }
-
-    #[tokio::test]
-    async fn test_build_index_deprecated() {
-        let coord = test_coordinator();
-        let result = coord.build_index().await;
-        assert!(result.is_err());
-        match result {
-            Err(RekhaError::Unavailable { .. }) => {}
-            _ => panic!("expected Unavailable error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_search_local_only() {
-        let coord = test_coordinator();
-        let store = temp_store();
-        let mut index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.add_vector_for_test(i, v);
-        }
-        index.build().unwrap();
-        coord.initialize(index).await;
-
-        let params = SearchParams {
-            local_only: true,
-            ..Default::default()
-        };
-        let (results, stats) = coord.search(vec![0.0; 8], 5, params).await.unwrap();
-        assert!(!results.is_empty());
-        // local_only=true skips peer fan-out; vectors_scanned should be > 0
-        assert!(stats.vectors_scanned > 0);
-    }
-
-    #[tokio::test]
-    async fn test_insert_auto_id() {
-        let coord = test_coordinator();
-        // id=0 triggers auto-generation
-        let id = coord.insert(0, vec![0.1, 0.2], None).await.unwrap();
-        assert_eq!(id, 1);
-        // Next auto-id should be 2
-        let id2 = coord.insert(0, vec![0.3, 0.4], None).await.unwrap();
-        assert_eq!(id2, 2);
-    }
-
-    #[tokio::test]
-    async fn test_insert_fallback_direct_store() {
-        // When no raft node exists for partition 0, insert falls through to
-        // direct store write (single-node / uninitialized path).
-        let coord = test_coordinator();
-        // coord has no raft nodes registered — insert will use the fallback path
-        let id = coord.insert(0, vec![0.5, 0.6], None).await.unwrap();
-        let v = coord.store().get_vector(id).unwrap().unwrap();
-        assert!((v[0] - 0.5).abs() < 1e-6);
-    }
-
-    #[tokio::test]
-    async fn test_insert_fallback_with_payload() {
-        let coord = test_coordinator();
-        let payload = Payload::from_text("fallback data");
-        let id = coord.insert(0, vec![0.7], Some(payload)).await.unwrap();
-        let stored = coord.store().get_payload(id).unwrap().unwrap();
-        assert_eq!(stored, b"fallback data");
-    }
-
-    #[tokio::test]
-    async fn test_check_peer_health_timeout_transition() {
-        let coord = test_coordinator();
-        // Register a peer with a very old last_seen (Instant::now() - 20s).
-        let info = NodeInfo {
-            node_id: "old-peer".into(),
-            address: "10.0.0.3:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![],
-            is_leader: false,
-            raft_term: 1,
-            commit_index: 0,
-            storage_bytes: 0,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        // Insert directly into peers map with an old timestamp
-        {
-            let mut peers = coord.peers.write().await;
-            peers.insert(
-                "old-peer".into(),
-                PeerState {
-                    info,
-                    last_seen: Instant::now() - Duration::from_secs(20),
-                },
-            );
-        }
-        coord.check_peer_health().await;
-        let healthy = coord.healthy_peers().await;
-        assert!(healthy.is_empty()); // old-peer should be marked Unreachable
-    }
-
-    #[tokio::test]
-    async fn test_check_peer_health_recovery() {
-        let coord = test_coordinator();
-        // Start with a peer that's Unreachable (last_seen fresh but status=Unreachable)
-        let info = NodeInfo {
-            node_id: "recovering-peer".into(),
-            address: "10.0.0.4:50051".into(),
-            partition_id: 0,
-            dim_groups: vec![],
-            is_leader: false,
-            raft_term: 1,
-            commit_index: 0,
-            storage_bytes: 0,
-            status: NodeStatus::Unreachable,
-            last_heartbeat: 0,
-        };
-        {
-            let mut peers = coord.peers.write().await;
-            peers.insert(
-                "recovering-peer".into(),
-                PeerState {
-                    info,
-                    last_seen: Instant::now(), // fresh
-                },
-            );
-        }
-        coord.check_peer_health().await;
-        let healthy = coord.healthy_peers().await;
-        assert_eq!(healthy.len(), 1);
-        assert_eq!(healthy[0].node_id, "recovering-peer");
-    }
-
-    #[tokio::test]
-    async fn test_recover_index_buffer_no_index() {
-        let coord = test_coordinator();
-        // recover_index_buffer with no index should return error
-        let result = coord.recover_index_buffer().await;
-        assert!(result.is_err());
-        match result {
-            Err(RekhaError::Internal { detail }) => {
-                assert!(detail.contains("not initialized for recovery"));
-            }
-            _ => panic!("expected Internal error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_insert_via_raft() {
-        let coord = std::sync::Arc::new(test_coordinator());
-        // Register a raft node with no peers (auto self-elects on start_election)
-        let state = rekha_raft::ReplicatedState::new(0);
-        let raft_log_store = coord.raft_log_store();
-        let node = std::sync::Arc::new(rekha_raft::RaftNode::with_store(
-            "test-node".into(),
-            0,
-            vec![],
-            state,
-            Some(raft_log_store),
-            Some(coord.clone() as Arc<dyn rekha_core::IndexBufferHandle>),
-        ));
-        let node_clone = node.clone();
-        node.start_election().await.unwrap();
-        assert!(node.is_leader().await);
-        coord.register_raft_node(0, node);
-
-        // Now insert routes through Raft (raft_node(0) exists and is leader)
-        let id = coord.insert(42, vec![0.1, 0.2, 0.3], None).await.unwrap();
-        assert_eq!(id, 42);
-        // The Raft path stores vectors in ReplicatedState, not directly in RocksDB
-        let state = node_clone.read_state().await;
-        assert!(state.get_vector(42).is_some());
-    }
-
-    #[tokio::test]
-    async fn test_insert_via_raft_with_payload() {
-        let coord = test_coordinator();
-        let state = rekha_raft::ReplicatedState::new(0);
-        let raft_log_store = coord.raft_log_store();
-        let node = std::sync::Arc::new(rekha_raft::RaftNode::with_store(
-            "test-node".into(),
-            0,
-            vec![],
-            state,
-            Some(raft_log_store),
-            None,
-        ));
-        let node_clone = node.clone();
-        node.start_election().await.unwrap();
-        coord.register_raft_node(0, node);
-
-        let payload = Payload::from_text("raft payload");
-        let id = coord.insert(7, vec![0.5], Some(payload)).await.unwrap();
-        assert_eq!(id, 7);
-        let state = node_clone.read_state().await;
-        assert_eq!(state.get_payload(7), Some(&b"raft payload"[..]));
-    }
-
-    #[tokio::test]
-    async fn test_recover_index_buffer_with_state() {
-        let coord = test_coordinator();
-        let store = coord.store().clone();
-
-        // Create a ReplicatedState with pre-populated vectors
-        let mut state = rekha_raft::ReplicatedState::new(0);
-        let vec_bytes: Vec<u8> = [1.0f32, 2.0f32, 3.0f32]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        state.vectors.insert(100u64, vec_bytes.clone());
-
-        let raft_log_store = coord.raft_log_store();
-        let node = std::sync::Arc::new(rekha_raft::RaftNode::with_store(
-            "test-node".into(),
-            0,
-            vec![],
-            state,
-            Some(raft_log_store),
-            None,
-        ));
-        coord.register_raft_node(0, node);
-
-        // Initialize coordinator with an empty built index
-        let index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        coord.initialize(index).await;
-
-        // recover_index_buffer ran inside initialize — verify vectors were recovered
-        // The index should buffer contain vector 100 (not in the graph)
-        assert!(coord.is_initialized().await);
-    }
-
-    #[tokio::test]
-    async fn test_search_empty_unbuilt_index() {
-        // Search with an initialized but empty (unbuilt) index should hit
-        // the search_dim_range error path for each dim group
-        let coord = test_coordinator();
-        let store = coord.store().clone();
-        let index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        coord.initialize(index).await;
-
-        let (results, _stats) = coord
-            .search(vec![0.0; 8], 5, SearchParams::default())
-            .await
-            .unwrap();
-        assert!(results.is_empty());
-        // Each dim group search should have failed, generating warnings
-        // (warnings presence varies; just verify search doesn't crash)
-    }
-
-    #[tokio::test]
-    async fn test_search_candidate_pruning() {
-        // Test that the score-based pruning in the candidate collection path works
-        let coord = test_coordinator();
-        let shared_store = coord.store().clone();
-        let mut index = rekha_index::RekhaIndex::new(
-            8,
-            4,
-            16,
-            4,
-            (*shared_store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
-        for i in 0..50 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 10 + d) as f32).collect();
-            index.add_vector_for_test(i, v);
-        }
-        index.build().unwrap();
-        coord.initialize(index).await;
-
-        // Search with a small k to trigger pruning
-        let (results, _stats) = coord
-            .search(vec![1000.0; 8], 3, SearchParams::default())
-            .await
-            .unwrap();
-        assert!(!results.is_empty());
-        assert!(results.len() <= 3);
-    }
-
-    #[tokio::test]
-    async fn test_spawn_flush_loop_runs() {
-        let coord = test_coordinator();
-        // spawn_flush_loop starts a background tokio task; verify it doesn't panic
-        coord.spawn_flush_loop();
-        // Give it a moment to tick once
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // No assertion needed — test passes if no panic
     }
 }

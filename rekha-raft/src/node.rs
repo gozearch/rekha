@@ -1,8 +1,8 @@
 use crate::state::{RaftCommand, ReplicatedState};
 use crate::storage::RaftLogStore;
 use rekha_core::{IndexBufferHandle, RaftError, RekhaError};
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
@@ -239,12 +239,7 @@ impl RaftNode {
         let (is_leader, term, leader_hint, peers_empty) = {
             let raft_state = self.raft_state.lock().await;
             match &raft_state.role {
-                RaftRole::Leader => (
-                    true,
-                    raft_state.current_term,
-                    None,
-                    self.peers.is_empty(),
-                ),
+                RaftRole::Leader => (true, raft_state.current_term, None, self.peers.is_empty()),
                 RaftRole::Follower | RaftRole::Candidate => {
                     (false, 0, raft_state.leader_id.clone(), true)
                 }
@@ -531,10 +526,7 @@ impl RaftNode {
             0
         };
 
-        let entries: Vec<RaftLogEntry> = log[(next_idx - 1) as usize..]
-            .iter()
-            .cloned()
-            .collect();
+        let entries: Vec<RaftLogEntry> = log[(next_idx - 1) as usize..].to_vec();
         (entries, prev_log_index, prev_log_term)
     }
 

@@ -1,6 +1,6 @@
+use rekha_core::RaftError;
 use rekha_core::{
     CollectionConfig, DistanceMetric, NodeInfo, NodeStatus, Payload, RekhaError, SearchParams,
-    VectorStoreBackend,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -16,8 +16,145 @@ use crate::proto::{
     RaftSnapshotChunk, RaftVoteRequest, RaftVoteResponse, ScoredPoint, SearchRequest,
     SearchResponse, TransferRequest, TransferResponse,
 };
-use rekha_core::RaftError;
 use tokio_stream::wrappers::ReceiverStream;
+
+pub fn error_to_status(e: RekhaError) -> Status {
+    match &e {
+        RekhaError::NotFound(_) => Status::not_found(e.to_string()),
+        RekhaError::InvalidArgument(_) | RekhaError::InvalidDimension { .. } => {
+            Status::invalid_argument(e.to_string())
+        }
+        RekhaError::IndexFull { .. } => Status::resource_exhausted(e.to_string()),
+        RekhaError::Timeout { .. } => Status::deadline_exceeded(e.to_string()),
+        RekhaError::Unavailable { .. } => Status::unavailable(e.to_string()),
+        RekhaError::Consensus(RaftError::NotLeader { .. }) => {
+            Status::failed_precondition(e.to_string())
+        }
+        _ => Status::internal(e.to_string()),
+    }
+}
+
+// ── From impls: proto ↔ internal types ──────────────────────
+
+impl From<proto::CollectionConfig> for CollectionConfig {
+    fn from(c: proto::CollectionConfig) -> Self {
+        Self {
+            dim: c.dim,
+            num_vector_shards: c.num_vector_shards,
+            replication_factor: c.replication_factor,
+            num_dim_groups: c.num_dim_groups,
+            dim_group_size: c.dim_group_size,
+            graph_degree: c.graph_degree,
+            search_list_size: c.search_list_size,
+            pq_num_sub_vectors: c.pq_num_sub_vectors,
+            pq_num_centroids: c.pq_num_centroids,
+            re_rank_k: c.re_rank_k,
+            distance_metric: DistanceMetric::L2,
+        }
+    }
+}
+
+impl From<&CollectionConfig> for proto::CollectionConfig {
+    fn from(c: &CollectionConfig) -> Self {
+        Self {
+            dim: c.dim,
+            num_vector_shards: c.num_vector_shards,
+            replication_factor: c.replication_factor,
+            num_dim_groups: c.num_dim_groups,
+            dim_group_size: c.dim_group_size,
+            graph_degree: c.graph_degree,
+            search_list_size: c.search_list_size,
+            pq_num_sub_vectors: c.pq_num_sub_vectors,
+            pq_num_centroids: c.pq_num_centroids,
+            re_rank_k: c.re_rank_k,
+        }
+    }
+}
+
+impl From<proto::Payload> for Payload {
+    fn from(p: proto::Payload) -> Self {
+        Self {
+            content_type: match p.content_type.as_str() {
+                "json" => rekha_core::PayloadType::Json,
+                "text" => rekha_core::PayloadType::Text,
+                _ => rekha_core::PayloadType::Raw,
+            },
+            data: p.data,
+        }
+    }
+}
+
+impl From<Payload> for proto::Payload {
+    fn from(p: Payload) -> Self {
+        Self {
+            content_type: p.content_type.to_string(),
+            data: p.data,
+        }
+    }
+}
+
+fn proto_raft_command_to_internal(cmd: proto::RaftCommand) -> rekha_raft::state::RaftCommand {
+    use crate::proto::raft_command::Cmd;
+    match cmd.cmd {
+        Some(Cmd::Insert(insert)) => rekha_raft::state::RaftCommand::Insert {
+            id: insert.id,
+            vector: insert.vector,
+            payload: insert.payload.and_then(|p| {
+                if p.data.is_empty() {
+                    None
+                } else {
+                    Some(p.data)
+                }
+            }),
+        },
+        Some(Cmd::Delete(delete)) => rekha_raft::state::RaftCommand::Delete { ids: delete.ids },
+        Some(Cmd::CreateCollection(cc)) => rekha_raft::state::RaftCommand::CreateCollection {
+            name: cc.name,
+            config: cc.config.map(Into::into).unwrap_or_default(),
+        },
+        Some(Cmd::DropCollection(dc)) => {
+            rekha_raft::state::RaftCommand::DropCollection { name: dc.name }
+        }
+        Some(Cmd::Custom(_)) | None => rekha_raft::state::RaftCommand::NoOp,
+    }
+}
+
+pub(crate) fn raft_command_to_proto(
+    cmd: &rekha_raft::state::RaftCommand,
+) -> crate::proto::raft_command::Cmd {
+    use crate::proto::raft_command::Cmd;
+    match cmd {
+        rekha_raft::state::RaftCommand::Insert {
+            id,
+            vector,
+            payload,
+        } => Cmd::Insert(crate::proto::InsertRequest {
+            id: *id,
+            vector: vector.clone(),
+            payload: payload.clone().map(|data| proto::Payload {
+                content_type: "raw".into(),
+                data,
+            }),
+            collection_name: String::new(),
+        }),
+        rekha_raft::state::RaftCommand::Delete { ids } => {
+            Cmd::Delete(crate::proto::DeleteRequest {
+                ids: ids.clone(),
+                collection_name: String::new(),
+            })
+        }
+        rekha_raft::state::RaftCommand::CreateCollection { name, config } => {
+            Cmd::CreateCollection(crate::proto::CreateCollectionCommand {
+                name: name.clone(),
+                config: Some(proto::CollectionConfig::from(config)),
+            })
+        }
+        rekha_raft::state::RaftCommand::DropCollection { name } => {
+            Cmd::DropCollection(crate::proto::DropCollectionCommand { name: name.clone() })
+        }
+        rekha_raft::state::RaftCommand::NoOp => Cmd::Custom(vec![]),
+    }
+}
 
 pub struct RekhaService {
     coordinator: Arc<Coordinator>,
@@ -26,22 +163,6 @@ pub struct RekhaService {
 impl RekhaService {
     pub fn new(coordinator: Arc<Coordinator>) -> Self {
         Self { coordinator }
-    }
-
-    pub fn map_error(e: RekhaError) -> Status {
-        match &e {
-            RekhaError::NotFound(_) => Status::not_found(e.to_string()),
-            RekhaError::InvalidArgument(_) => Status::invalid_argument(e.to_string()),
-            RekhaError::IndexFull { .. } => Status::resource_exhausted(e.to_string()),
-            RekhaError::InvalidDimension { .. } => Status::invalid_argument(e.to_string()),
-            RekhaError::Timeout { .. } => Status::deadline_exceeded(e.to_string()),
-            RekhaError::Unavailable { .. } => Status::unavailable(e.to_string()),
-            RekhaError::Consensus(rekha_core::RaftError::NotLeader { .. }) => {
-                Status::failed_precondition(e.to_string())
-            }
-            RekhaError::Consensus(_) => Status::internal(e.to_string()),
-            _ => Status::internal(e.to_string()),
-        }
     }
 
     fn collection_name(req: &str) -> &str {
@@ -62,14 +183,7 @@ impl Rekha for RekhaService {
     ) -> Result<Response<InsertResponse>, Status> {
         let req = request.into_inner();
         let cname = Self::collection_name(&req.collection_name);
-        let payload = req.payload.map(|p| Payload {
-            content_type: match p.content_type.as_str() {
-                "json" => rekha_core::PayloadType::Json,
-                "text" => rekha_core::PayloadType::Text,
-                _ => rekha_core::PayloadType::Raw,
-            },
-            data: p.data,
-        });
+        let payload = req.payload.map(Into::into);
 
         let result = self
             .coordinator
@@ -87,7 +201,7 @@ impl Rekha for RekhaService {
                 };
                 return Err(Status::failed_precondition(detail));
             }
-            return Err(Self::map_error(e.clone()));
+            return Err(error_to_status(e.clone()));
         }
         let actual_id = result.unwrap();
 
@@ -108,14 +222,7 @@ impl Rekha for RekhaService {
 
         while let Some(item) = stream.message().await? {
             let cname = Self::collection_name(&item.collection_name);
-            let payload = item.payload.map(|p| Payload {
-                content_type: match p.content_type.as_str() {
-                    "json" => rekha_core::PayloadType::Json,
-                    "text" => rekha_core::PayloadType::Text,
-                    _ => rekha_core::PayloadType::Raw,
-                },
-                data: p.data,
-            });
+            let payload = item.payload.map(Into::into);
 
             match self
                 .coordinator
@@ -144,7 +251,7 @@ impl Rekha for RekhaService {
             .coordinator
             .delete_from_collection(cname, &req.ids)
             .await
-            .map_err(Self::map_error)?;
+            .map_err(error_to_status)?;
 
         Ok(Response::new(DeleteResponse {
             deleted_count: deleted,
@@ -164,7 +271,7 @@ impl Rekha for RekhaService {
             .coordinator
             .fetch_from_collection(cname, &req.ids)
             .await
-            .map_err(Self::map_error)?;
+            .map_err(error_to_status)?;
 
         let mut vectors = Vec::new();
         let mut points = Vec::new();
@@ -219,10 +326,7 @@ impl Rekha for RekhaService {
                     .map(|r| ScoredPoint {
                         id: r.id,
                         score: r.score,
-                        payload: r.payload.map(|p| proto::Payload {
-                            content_type: p.content_type.to_string(),
-                            data: p.data,
-                        }),
+                        payload: r.payload.map(Into::into),
                     })
                     .collect();
 
@@ -236,7 +340,7 @@ impl Rekha for RekhaService {
                     }),
                 }))
             }
-            Err(e) => Err(Self::map_error(e)),
+            Err(e) => Err(error_to_status(e)),
         }
     }
 
@@ -274,10 +378,7 @@ impl Rekha for RekhaService {
                         let point = ScoredPoint {
                             id: r.id,
                             score: r.score,
-                            payload: r.payload.map(|p| proto::Payload {
-                                content_type: p.content_type.to_string(),
-                                data: p.data,
-                            }),
+                            payload: r.payload.map(Into::into),
                         };
                         if tx.send(Ok(point)).await.is_err() {
                             break;
@@ -463,7 +564,7 @@ impl Rekha for RekhaService {
             .await
         {
             Ok((vote_granted, term)) => Ok(Response::new(RaftVoteResponse { term, vote_granted })),
-            Err(e) => Err(Self::map_error(e)),
+            Err(e) => Err(error_to_status(e)),
         }
     }
 
@@ -486,23 +587,10 @@ impl Rekha for RekhaService {
         request: Request<CreateCollectionRequest>,
     ) -> Result<Response<CreateCollectionResponse>, Status> {
         let req = request.into_inner();
-        let config = req
+        let collection_config: CollectionConfig = req
             .config
-            .ok_or_else(|| Status::invalid_argument("collection config required"))?;
-
-        let collection_config = CollectionConfig {
-            dim: config.dim,
-            num_vector_shards: config.num_vector_shards,
-            replication_factor: config.replication_factor,
-            num_dim_groups: config.num_dim_groups,
-            dim_group_size: config.dim_group_size,
-            graph_degree: config.graph_degree,
-            search_list_size: config.search_list_size,
-            pq_num_sub_vectors: config.pq_num_sub_vectors,
-            pq_num_centroids: config.pq_num_centroids,
-            re_rank_k: config.re_rank_k,
-            distance_metric: DistanceMetric::L2,
-        };
+            .ok_or_else(|| Status::invalid_argument("collection config required"))?
+            .into();
 
         // Create locally first (so single-node works immediately).
         if let Err(e) = self
@@ -520,38 +608,29 @@ impl Rekha for RekhaService {
         if let Some(sys_node) = self.coordinator.system_raft_node() {
             let cmd = rekha_raft::state::RaftCommand::CreateCollection {
                 name: req.name.clone(),
-                config: collection_config,
+                config: collection_config.clone(),
             };
             match sys_node.propose(cmd).await {
                 Ok(()) => {}
                 Err(RekhaError::Consensus(RaftError::NotLeader { leader_hint })) => {
-                    // Not the system leader — forward to leader via create_collection RPC.
                     let leader_id = leader_hint.unwrap_or_default();
                     if let Some(addr) = self.coordinator.peer_address(&leader_id).await {
                         let uri = format!("http://{addr}");
-                        let endpoint = tonic::transport::Endpoint::from_shared(uri);
-                        if let Ok(endpoint) = endpoint {
-                            let endpoint = endpoint.connect_timeout(std::time::Duration::from_secs(5));
+                        if let Ok(endpoint) = tonic::transport::Endpoint::from_shared(uri) {
+                            let endpoint =
+                                endpoint.connect_timeout(std::time::Duration::from_secs(5));
                             if let Ok(ch) = endpoint.connect().await {
                                 let mut leader_client =
                                     crate::proto::rekha_client::RekhaClient::new(ch);
-                                let _ = leader_client.create_collection(tonic::Request::new(
-                                    crate::proto::CreateCollectionRequest {
-                                        name: req.name.clone(),
-                                        config: Some(crate::proto::CollectionConfig {
-                                            dim: config.dim,
-                                            num_vector_shards: config.num_vector_shards,
-                                            replication_factor: config.replication_factor,
-                                            num_dim_groups: config.num_dim_groups,
-                                            dim_group_size: config.dim_group_size,
-                                            graph_degree: config.graph_degree,
-                                            search_list_size: config.search_list_size,
-                                            pq_num_sub_vectors: config.pq_num_sub_vectors,
-                                            pq_num_centroids: config.pq_num_centroids,
-                                            re_rank_k: config.re_rank_k,
-                                        }),
-                                    },
-                                )).await;
+                                let pb_config = proto::CollectionConfig::from(&collection_config);
+                                let _ = leader_client
+                                    .create_collection(tonic::Request::new(
+                                        crate::proto::CreateCollectionRequest {
+                                            name: req.name.clone(),
+                                            config: Some(pb_config),
+                                        },
+                                    ))
+                                    .await;
                             }
                         }
                     }
@@ -602,18 +681,7 @@ impl Rekha for RekhaService {
             .into_iter()
             .map(|m| crate::proto::CollectionInfo {
                 name: m.name.clone(),
-                config: Some(crate::proto::CollectionConfig {
-                    dim: m.config.dim,
-                    num_vector_shards: m.config.num_vector_shards,
-                    replication_factor: m.config.replication_factor,
-                    num_dim_groups: m.config.num_dim_groups,
-                    dim_group_size: m.config.dim_group_size,
-                    graph_degree: m.config.graph_degree,
-                    search_list_size: m.config.search_list_size,
-                    pq_num_sub_vectors: m.config.pq_num_sub_vectors,
-                    pq_num_centroids: m.config.pq_num_centroids,
-                    re_rank_k: m.config.re_rank_k,
-                }),
+                config: Some(proto::CollectionConfig::from(&m.config)),
                 vector_count: m.vector_count,
                 index_ready: m.index_ready,
             })
@@ -634,164 +702,70 @@ impl Rekha for RekhaService {
     }
 }
 
-/// Convert internal RaftCommand → proto RaftCommand for AppendEntries.
-pub fn raft_command_to_proto(cmd: &rekha_raft::state::RaftCommand) -> crate::proto::raft_command::Cmd {
-    use crate::proto::raft_command::Cmd;
-    match cmd {
-        rekha_raft::state::RaftCommand::Insert { id, vector, payload } => {
-            Cmd::Insert(crate::proto::InsertRequest {
-                id: *id,
-                vector: vector.clone(),
-                payload: payload.clone().map(|data| crate::proto::Payload {
-                    content_type: "raw".into(), data,
-                }),
-                collection_name: String::new(),
-            })
-        }
-        rekha_raft::state::RaftCommand::Delete { ids } => {
-            Cmd::Delete(crate::proto::DeleteRequest {
-                ids: ids.clone(), collection_name: String::new(),
-            })
-        }
-        rekha_raft::state::RaftCommand::CreateCollection { name, config } => {
-            let pb_config = crate::proto::CollectionConfig {
-                dim: config.dim,
-                num_vector_shards: config.num_vector_shards,
-                replication_factor: config.replication_factor,
-                num_dim_groups: config.num_dim_groups,
-                dim_group_size: config.dim_group_size,
-                graph_degree: config.graph_degree,
-                search_list_size: config.search_list_size,
-                pq_num_sub_vectors: config.pq_num_sub_vectors,
-                pq_num_centroids: config.pq_num_centroids,
-                re_rank_k: config.re_rank_k,
-            };
-            Cmd::CreateCollection(crate::proto::CreateCollectionCommand {
-                name: name.clone(),
-                config: Some(pb_config),
-            })
-        }
-        rekha_raft::state::RaftCommand::DropCollection { name } => {
-            Cmd::DropCollection(crate::proto::DropCollectionCommand {
-                name: name.clone(),
-            })
-        }
-        rekha_raft::state::RaftCommand::NoOp => Cmd::Custom(vec![]),
-    }
-}
-
-/// Convert proto RaftCommand → internal RaftCommand (from AppendEntries).
-fn proto_raft_command_to_internal(
-    cmd: crate::proto::RaftCommand,
-) -> rekha_raft::state::RaftCommand {
-    use crate::proto::raft_command::Cmd;
-    match cmd.cmd {
-        Some(Cmd::Insert(insert)) => rekha_raft::state::RaftCommand::Insert {
-            id: insert.id,
-            vector: insert.vector,
-            payload: insert.payload.and_then(|p| {
-                if p.data.is_empty() { None } else { Some(p.data) }
-            }),
-        },
-        Some(Cmd::Delete(delete)) => rekha_raft::state::RaftCommand::Delete { ids: delete.ids },
-        Some(Cmd::CreateCollection(cc)) => {
-            let cfg = cc.config.unwrap_or_default();
-            rekha_raft::state::RaftCommand::CreateCollection {
-                name: cc.name,
-                config: rekha_core::CollectionConfig {
-                    dim: cfg.dim,
-                    num_vector_shards: cfg.num_vector_shards,
-                    replication_factor: cfg.replication_factor,
-                    num_dim_groups: cfg.num_dim_groups,
-                    dim_group_size: cfg.dim_group_size,
-                    graph_degree: cfg.graph_degree,
-                    search_list_size: cfg.search_list_size,
-                    pq_num_sub_vectors: cfg.pq_num_sub_vectors,
-                    pq_num_centroids: cfg.pq_num_centroids,
-                    re_rank_k: cfg.re_rank_k,
-                    distance_metric: rekha_core::DistanceMetric::L2,
-                },
-            }
-        }
-        Some(Cmd::DropCollection(dc)) => rekha_raft::state::RaftCommand::DropCollection {
-            name: dc.name,
-        },
-        Some(Cmd::Custom(_)) | None => rekha_raft::state::RaftCommand::NoOp,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_map_error_not_found() {
-        let err = RekhaError::NotFound("test".into());
-        let status = RekhaService::map_error(err);
+    fn test_error_to_status_not_found() {
+        let status = super::error_to_status(RekhaError::NotFound("test".into()));
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[test]
-    fn test_map_error_invalid_argument() {
-        let err = RekhaError::InvalidArgument("bad".into());
-        let status = RekhaService::map_error(err);
+    fn test_error_to_status_invalid_argument() {
+        let status = super::error_to_status(RekhaError::InvalidArgument("bad".into()));
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
-    fn test_map_error_index_full() {
-        let err = RekhaError::IndexFull {
+    fn test_error_to_status_index_full() {
+        let status = super::error_to_status(RekhaError::IndexFull {
             capacity: 100,
             attempted: 101,
-        };
-        let status = RekhaService::map_error(err);
+        });
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     #[test]
-    fn test_map_error_invalid_dimension() {
-        let err = RekhaError::InvalidDimension {
+    fn test_error_to_status_invalid_dimension() {
+        let status = super::error_to_status(RekhaError::InvalidDimension {
             expected: 768,
             actual: 64,
-        };
-        let status = RekhaService::map_error(err);
+        });
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
-    fn test_map_error_timeout() {
-        let err = RekhaError::Timeout {
+    fn test_error_to_status_timeout() {
+        let status = super::error_to_status(RekhaError::Timeout {
             operation: "search",
             elapsed_ms: 5000,
-        };
-        let status = RekhaService::map_error(err);
+        });
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
     }
 
     #[test]
-    fn test_map_error_unavailable() {
-        let err = RekhaError::Unavailable {
+    fn test_error_to_status_unavailable() {
+        let status = super::error_to_status(RekhaError::Unavailable {
             detail: "down".into(),
-        };
-        let status = RekhaService::map_error(err);
+        });
         assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     #[test]
-    fn test_map_error_not_leader() {
-        let err = RekhaError::Consensus(rekha_core::RaftError::NotLeader {
+    fn test_error_to_status_not_leader() {
+        let status = super::error_to_status(RekhaError::Consensus(RaftError::NotLeader {
             leader_hint: Some("n2".into()),
-        });
-        let status = RekhaService::map_error(err);
+        }));
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
     #[test]
-    fn test_map_error_internal() {
-        let err = RekhaError::Internal {
+    fn test_error_to_status_internal() {
+        let status = super::error_to_status(RekhaError::Internal {
             detail: "oops".into(),
-        };
-        let status = RekhaService::map_error(err);
+        });
         assert_eq!(status.code(), tonic::Code::Internal);
     }
 
@@ -1002,7 +976,7 @@ mod tests {
 
         let req = tonic::Request::new(InsertRequest {
             id: 42,
-            vector: vec![0.1, 0.2, 0.3],
+            vector: vec![0.1; 256],
             payload: None,
             collection_name: "default".into(),
         });

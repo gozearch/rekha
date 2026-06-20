@@ -1,4 +1,5 @@
 use crate::store::RocksVectorStore;
+use rekha_core::util::vector_to_bytes;
 use rekha_core::{RekhaError, StorageError};
 use rocksdb::WriteBatch as RocksWriteBatch;
 
@@ -25,7 +26,7 @@ impl<'a> WriteBatch<'a> {
     }
 
     pub fn put_vector(mut self, id: u64, data: &[f32]) -> Self {
-        let key = id.to_be_bytes();
+        let key = self.store.encode_key(id);
         let value = vector_to_bytes(data);
         let cf = self.store.db().cf_handle(CF_VECTORS).unwrap();
         self.batch.put_cf(&cf, key, value);
@@ -34,7 +35,7 @@ impl<'a> WriteBatch<'a> {
     }
 
     pub fn put_payload(mut self, id: u64, payload: &[u8]) -> Self {
-        let key = id.to_be_bytes();
+        let key = self.store.encode_key(id);
         let cf = self.store.db().cf_handle(CF_PAYLOADS).unwrap();
         self.batch.put_cf(&cf, key, payload);
         self.pending += 1;
@@ -43,11 +44,11 @@ impl<'a> WriteBatch<'a> {
 
     #[allow(dead_code)]
     pub fn delete(mut self, id: u64) -> Self {
-        let key = id.to_be_bytes();
+        let key = self.store.encode_key(id);
         let cf_v = self.store.db().cf_handle(CF_VECTORS).unwrap();
         let cf_p = self.store.db().cf_handle(CF_PAYLOADS).unwrap();
-        self.batch.delete_cf(&cf_v, key);
-        self.batch.delete_cf(&cf_p, key);
+        self.batch.delete_cf(&cf_v, &key);
+        self.batch.delete_cf(&cf_p, &key);
         self.pending += 2;
         self
     }
@@ -73,14 +74,6 @@ impl<'a> WriteBatch<'a> {
             .into()
         })
     }
-}
-
-fn vector_to_bytes(data: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for &val in data {
-        bytes.extend_from_slice(&val.to_le_bytes());
-    }
-    bytes
 }
 
 #[cfg(test)]

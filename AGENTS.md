@@ -65,7 +65,16 @@ rekha delete 42 43 44
 
 ## Code Style
 
-- No comments in production code.
-- `Serialize`/`Deserialize` derive on all data types.
-- `async-trait` for async trait methods.
-- Manual `Display` + `Error` impls (not `thiserror` derive).
+- **No comments** in production code. The code should be self-documenting.
+- **Prefer `From`/`TryFrom` impls** over manual field-by-field conversion functions for type mappings. Keeps `service.rs` handlers lean.
+- **Use free functions** (not associated methods) for error-to-status mapping when the orphan rule prevents `From` impls. Example: `error_to_status(e)` instead of `RekhaService::map_error(e)`.
+- **Shared utilities** belong in `rekha-core::util`, not copy-pasted across crates. `vector_to_bytes`/`bytes_to_vector` live there.
+- **Use `derive`** for `Serialize`, `Deserialize`, `Clone`, `Debug` on all data types.
+- **Manual `Display` + `Error` impls** (not `thiserror` derive) for all error types.
+- **`async-trait`** for async trait methods.
+- **No `unsafe`** except in FFI or mmap code. Use interior mutability patterns (`std::sync::RwLock`, `OnceLock`) instead of pointer casts.
+- **Avoid duplicate state.** If data already exists in a persistence layer (RocksDB) or in-memory struct, don't replicate it elsewhere.
+- **Each function should do one thing.** If a function maps proto → internal in 30+ lines, extract it into a `From` impl.
+- **Batch writes must respect namespacing.** Always use `store.encode_key(id)` in `WriteBatch`, never raw `id.to_be_bytes()`.
+- **Prefix unused variables** with `_` in trait default method bodies to suppress clippy warnings.
+- **`unwrap()` is acceptable in tests** but avoid in production code — propagate errors with `?` or `map_err`.

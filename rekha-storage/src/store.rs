@@ -1,3 +1,4 @@
+use rekha_core::util::{bytes_to_vector, vector_to_bytes};
 use rekha_core::{CollectionMeta, RekhaError, StorageError, VectorStoreBackend};
 use rocksdb::{ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded, Options};
 use std::path::Path;
@@ -90,7 +91,7 @@ impl RocksVectorStore {
     }
 
     /// Encode a u64 ID into a big-endian key, optionally prefixed with namespace.
-    fn encode_key(&self, id: u64) -> Vec<u8> {
+    pub(crate) fn encode_key(&self, id: u64) -> Vec<u8> {
         let ns = self.namespace.as_deref();
         if let Some(ns) = ns {
             let mut key = Vec::with_capacity(ns.len() + 1 + 8);
@@ -425,27 +426,10 @@ impl VectorStoreBackend for RocksVectorStore {
     }
 }
 
-/// Serialize a `Vec<f32>` to bytes (little-endian f32 array).
-fn vector_to_bytes(data: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for &val in data {
-        bytes.extend_from_slice(&val.to_le_bytes());
-    }
-    bytes
-}
-
-/// Deserialize bytes back into a `Vec<f32>`.
-fn bytes_to_vector(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rekha_core::{CollectionConfig, CollectionMeta, DistanceMetric};
+    use rekha_core::{CollectionConfig, CollectionMeta};
 
     #[test]
     fn vector_roundtrip() {

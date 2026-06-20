@@ -69,9 +69,9 @@ pub trait IndexBufferHandle: Send + Sync {
     /// Mark committed deletes in the index buffer.
     fn buffer_delete(&self, ids: &[u64]);
     /// Notify that a collection was created via Raft commit.
-    fn notify_create_collection(&self, name: &str, config: &CollectionConfig) {}
+    fn notify_create_collection(&self, _name: &str, _config: &CollectionConfig) {}
     /// Notify that a collection was dropped via Raft commit.
-    fn notify_drop_collection(&self, name: &str) {}
+    fn notify_drop_collection(&self, _name: &str) {}
 }
 
 /// Storage backend trait for persisting vectors and metadata.

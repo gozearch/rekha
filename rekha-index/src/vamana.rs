@@ -147,7 +147,6 @@ impl VamanaGraph {
         let start_dist = l2_squared(query, &vectors[self.id_to_pos[&self.ids[start_pos]]].1);
         candidates.push(SearchNode {
             dist: start_dist,
-            id: self.ids[start_pos],
             pos: start_pos,
         });
         visited.insert(self.ids[start_pos]);
@@ -170,7 +169,6 @@ impl VamanaGraph {
                         if dist < kth_best {
                             candidates.push(SearchNode {
                                 dist,
-                                id: neighbor_id,
                                 pos: neighbor_pos,
                             });
 
@@ -273,7 +271,6 @@ impl VamanaGraph {
         let start_dist = l2_squared(query, vectors[start].1);
         candidates.push(SearchNode {
             dist: start_dist,
-            id: vectors[start].0,
             pos: start,
         });
         visited.insert(vectors[start].0);
@@ -292,11 +289,7 @@ impl VamanaGraph {
                     if let Some(&npos) = self.id_to_pos.get(&nid) {
                         let dist = l2_squared(query, vectors[npos].1);
                         if dist < kth_best {
-                            candidates.push(SearchNode {
-                                dist,
-                                id: nid,
-                                pos: npos,
-                            });
+                            candidates.push(SearchNode { dist, pos: npos });
 
                             let mut all: Vec<f32> = visited
                                 .iter()
@@ -379,8 +372,6 @@ impl VamanaGraph {
 #[derive(Debug, Clone)]
 struct SearchNode {
     dist: f32,
-    #[allow(dead_code)]
-    id: u64,
     pos: usize,
 }
 

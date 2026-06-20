@@ -13,6 +13,7 @@ use rekha_client::RekhaClient as PeerRekhaClient;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock as SyncRwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -223,7 +224,7 @@ impl IndexBufferHandle for SystemRaftHandle {
 pub const SYSTEM_PARTITION_ID: u64 = u64::MAX;
 
 pub struct Coordinator {
-    pub config: ServerConfig,
+    pub     config: ServerConfig,
     pub store: Arc<RocksVectorStore>,
     pub collections: Arc<DashMap<String, CollectionState>>,
     pub partition_manager: Arc<RwLock<PartitionManager>>,
@@ -231,8 +232,7 @@ pub struct Coordinator {
     initialized: Arc<RwLock<bool>>,
     peers: Arc<RwLock<HashMap<String, PeerState>>>,
     peer_pool: Arc<RwLock<PeerPool>>,
-    next_auto_id: AtomicU64,
-    pub system_raft_node: Option<Arc<RaftNode>>,
+    system_raft_node: SyncRwLock<Option<Arc<RaftNode>>>,
 }
 
 impl Coordinator {
@@ -241,7 +241,6 @@ impl Coordinator {
         store: Arc<RocksVectorStore>,
         partition_manager: Arc<RwLock<PartitionManager>>,
     ) -> Self {
-        let starting_id = Self::starting_auto_id(&store);
         Self {
             config,
             store,
@@ -255,15 +254,7 @@ impl Coordinator {
             initialized: Arc::new(RwLock::new(false)),
             peers: Arc::new(RwLock::new(HashMap::new())),
             peer_pool: Arc::new(RwLock::new(PeerPool::new("default"))),
-            next_auto_id: AtomicU64::new(starting_id),
-            system_raft_node: None,
-        }
-    }
-
-    fn starting_auto_id(store: &RocksVectorStore) -> u64 {
-        match store.iter_ids() {
-            Ok(ids) => ids.iter().max().copied().unwrap_or(0) + 1,
-            Err(_) => 1,
+            system_raft_node: SyncRwLock::new(None),
         }
     }
 
@@ -374,7 +365,10 @@ impl Coordinator {
             }
             raft_nodes.insert(shard, raft_node);
         }
-        info!("Created {} Raft nodes for collection '{}'", num_shards, name);
+        info!(
+            "Created {} Raft nodes for collection '{}'",
+            num_shards, name
+        );
 
         let state = CollectionState {
             config: config.clone(),
@@ -447,11 +441,10 @@ impl Coordinator {
         if let Ok(Some(meta)) = self.store.load_collection_meta(name) {
             return meta;
         }
-        let dim_val = (self.config.partition.dim_group_size as usize)
-            * (self.config.partition.num_dim_groups as usize);
+        let dim_val = self.config.partition.dim_group_size
+            * self.config.partition.num_dim_groups as usize;
         let mut pq_m = std::cmp::min(self.config.index.pq_num_sub_vectors as u32, dim_val as u32);
-        // Ensure pq_m divides dim evenly (PQ requirement)
-        while pq_m > 1 && dim_val as u32 % pq_m != 0 {
+        while pq_m > 1 && !(dim_val as u32).is_multiple_of(pq_m) {
             pq_m -= 1;
         }
         let config = CollectionConfig {
@@ -685,8 +678,10 @@ impl Coordinator {
         }
         // Check system Raft group.
         if collection_name == "__system__" || partition_id == SYSTEM_PARTITION_ID {
-            if let Some(ref sys) = self.system_raft_node {
-                return Some(sys.clone());
+            if let Ok(guard) = self.system_raft_node.read() {
+                if let Some(ref sys) = *guard {
+                    return Some(sys.clone());
+                }
             }
         }
         None
@@ -975,20 +970,24 @@ impl Coordinator {
                 nodes.push((col_name.clone(), *n.key(), n.value().clone()));
             }
         }
-        if let Some(ref sys) = self.system_raft_node {
-            nodes.push(("__system__".into(), SYSTEM_PARTITION_ID, sys.clone()));
+        if let Ok(guard) = self.system_raft_node.read() {
+            if let Some(ref sys) = *guard {
+                nodes.push(("__system__".into(), SYSTEM_PARTITION_ID, sys.clone()));
+            }
         }
         nodes
     }
 
     /// Register the system Raft node for collection metadata replication.
-    pub fn register_system_raft_node(&mut self, node: Arc<RaftNode>) {
-        self.system_raft_node = Some(node);
+    pub fn register_system_raft_node(&self, node: Arc<RaftNode>) {
+        if let Ok(mut guard) = self.system_raft_node.write() {
+            *guard = Some(node);
+        }
     }
 
     /// Get the system Raft node.
     pub fn system_raft_node(&self) -> Option<Arc<RaftNode>> {
-        self.system_raft_node.clone()
+        self.system_raft_node.read().ok().and_then(|g| g.clone())
     }
 }
 
@@ -1170,7 +1169,7 @@ mod tests {
             .await
             .unwrap();
         let id = coord
-            .insert_into_collection("ins_col", 42, vec![0.1, 0.2], None)
+            .insert_into_collection("ins_col", 42, vec![0.1; 8], None)
             .await
             .unwrap();
         assert_eq!(id, 42);
@@ -1195,11 +1194,11 @@ mod tests {
             .await
             .unwrap();
         let id1 = coord
-            .insert_into_collection("auto_col", 0, vec![0.1], None)
+            .insert_into_collection("auto_col", 0, vec![0.1; 64], None)
             .await
             .unwrap();
         let id2 = coord
-            .insert_into_collection("auto_col", 0, vec![0.2], None)
+            .insert_into_collection("auto_col", 0, vec![0.2; 64], None)
             .await
             .unwrap();
         assert_eq!(id1, 1);
@@ -1223,7 +1222,7 @@ mod tests {
             .unwrap();
         let payload = Payload::from_text("test data");
         coord
-            .insert_into_collection("pay_col", 7, vec![0.5], Some(payload))
+            .insert_into_collection("pay_col", 7, vec![0.5; 64], Some(payload))
             .await
             .unwrap();
         let store = coord.collection_store("pay_col").unwrap();
@@ -1297,7 +1296,7 @@ mod tests {
             .await
             .unwrap();
         coord
-            .insert_into_collection("del_col", 1, vec![1.0], None)
+            .insert_into_collection("del_col", 1, vec![1.0; 64], None)
             .await
             .unwrap();
         let count = coord.delete_from_collection("del_col", &[1]).await.unwrap();
@@ -1325,7 +1324,7 @@ mod tests {
             .insert_into_collection(
                 "fetch_col",
                 10,
-                vec![1.0, 2.0],
+                vec![1.0; 64],
                 Some(Payload::from_bytes(b"data".to_vec())),
             )
             .await
@@ -1335,7 +1334,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
-        let (id, vec, payload) = &results[0];
+        let (id, _vec, payload) = &results[0];
         assert_eq!(*id, 10);
         assert_eq!(payload.as_deref(), Some(&b"data"[..]));
     }

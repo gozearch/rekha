@@ -1,4 +1,3 @@
-use rekha_index::RekhaIndex;
 use rekha_partition::PartitionManager;
 use rekha_storage::RocksVectorStore;
 
@@ -44,7 +43,7 @@ impl ServerInstance {
         let partition_manager = Arc::new(RwLock::new(PartitionManager::new(
             HashMap::new(),
             config.partition.num_dim_groups,
-            (config.partition.dim_group_size as usize) * (config.partition.num_dim_groups as usize),
+            config.partition.dim_group_size * config.partition.num_dim_groups as usize,
         )));
 
         let coordinator = Arc::new(Coordinator::new(
@@ -60,7 +59,12 @@ impl ServerInstance {
         let raft_log_store = coordinator.raft_log_store_for("default");
         let num_shards = config.partition.num_vector_shards;
         let node_id = &config.cluster.node_id;
-        let bind_port = config.cluster.bind_addr.split(':').nth(1).unwrap_or("50051");
+        let bind_port = config
+            .cluster
+            .bind_addr
+            .split(':')
+            .nth(1)
+            .unwrap_or("50051");
         let peers: Vec<String> = config
             .cluster
             .seed_nodes
@@ -74,7 +78,8 @@ impl ServerInstance {
                 // This filters out 127.0.0.1:50051 when bind_addr is 0.0.0.0:50051.
                 let seed_port = s.split(':').nth(1).unwrap_or("50051");
                 let seed_host = s.split(':').next().unwrap_or("");
-                if seed_port == bind_port && (seed_host == "127.0.0.1" || seed_host == "localhost") {
+                if seed_port == bind_port && (seed_host == "127.0.0.1" || seed_host == "localhost")
+                {
                     return false;
                 }
                 true
@@ -83,8 +88,6 @@ impl ServerInstance {
             .collect();
 
         let index_handle: Arc<dyn rekha_core::IndexBufferHandle> = {
-            let name = "default".to_string();
-            let collections = coordinator.collections.clone();
             struct DefaultHandle {
                 name: String,
                 collections: Arc<dashmap::DashMap<String, crate::coordinator::CollectionState>>,
@@ -151,11 +154,7 @@ impl ServerInstance {
         }
 
         // Register system Raft node on the coordinator.
-        {
-            let mut coord_mut = Arc::as_ref(&coordinator) as *const Coordinator as *mut Coordinator;
-            let coord_ref = unsafe { &mut *coord_mut };
-            coord_ref.register_system_raft_node(system_raft_node);
-        }
+        coordinator.register_system_raft_node(system_raft_node);
         info!("System Raft group created");
 
         coordinator.initialize_all().await;
@@ -192,24 +191,20 @@ impl ServerInstance {
                     match tonic::transport::Channel::from_shared(endpoint) {
                         Ok(ch) => match ch.connect().await {
                             Ok(ch) => {
-                                let mut client =
-                                    crate::proto::rekha_client::RekhaClient::new(ch);
-                                let (raft_term, commit_idx) =
-                                    if let Some(sys_node) = coordinator.system_raft_node() {
-                                        (
-                                            sys_node.current_term().await,
-                                            sys_node.commit_index().await,
-                                        )
-                                    } else if let Some(raft_node) =
-                                        coordinator.raft_node("default", 0)
-                                    {
-                                        (
-                                            raft_node.current_term().await,
-                                            raft_node.commit_index().await,
-                                        )
-                                    } else {
-                                        (0, 0)
-                                    };
+                                let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
+                                let (raft_term, commit_idx) = if let Some(sys_node) =
+                                    coordinator.system_raft_node()
+                                {
+                                    (sys_node.current_term().await, sys_node.commit_index().await)
+                                } else if let Some(raft_node) = coordinator.raft_node("default", 0)
+                                {
+                                    (
+                                        raft_node.current_term().await,
+                                        raft_node.commit_index().await,
+                                    )
+                                } else {
+                                    (0, 0)
+                                };
                                 let req = tonic::Request::new(HeartbeatRequest {
                                     node_id: node_id.clone(),
                                     address: my_addr.clone(),
@@ -294,8 +289,7 @@ impl ServerInstance {
                                     },
                                     Err(_) => continue,
                                 };
-                                let mut client =
-                                    crate::proto::rekha_client::RekhaClient::new(ch);
+                                let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
                                 let req = tonic::Request::new(RaftVoteRequest {
                                     term,
                                     candidate_id: candidate_id.clone(),
@@ -348,7 +342,7 @@ impl ServerInstance {
 
                     for peer_addr in &peers {
                         let (entries, prev_log_index, prev_log_term) =
-                            node.entries_for_peer(&peer_addr).await;
+                            node.entries_for_peer(peer_addr).await;
 
                         let endpoint = format!("http://{}", peer_addr);
                         let ch = match tonic::transport::Channel::from_shared(endpoint) {
@@ -369,9 +363,7 @@ impl ServerInstance {
                                 term: e.term,
                                 index: e.index,
                                 command: Some(crate::proto::RaftCommand {
-                                    cmd: Some(
-                                        crate::service::raft_command_to_proto(&e.command),
-                                    ),
+                                    cmd: Some(crate::service::raft_command_to_proto(&e.command)),
                                 }),
                             })
                             .collect();
@@ -393,7 +385,7 @@ impl ServerInstance {
                                 if ack.success {
                                     // Record replication up to the last entry sent
                                     if let Some(last) = entries.last() {
-                                        node.record_replication(&peer_addr, last.index).await;
+                                        node.record_replication(peer_addr, last.index).await;
                                     }
                                 } else if ack.current_term > term {
                                     // Leader is stale → step down
@@ -405,7 +397,7 @@ impl ServerInstance {
                                     // the election timer will handle it.
                                 } else {
                                     // Log mismatch — retry with older entries
-                                    node.retry_replication(&peer_addr).await;
+                                    node.retry_replication(peer_addr).await;
                                 }
                             }
                             Err(_) => {
@@ -450,16 +442,14 @@ impl ServerInstance {
                 .as_ref()
                 .ok_or_else(|| "TLS enabled but key_path not configured".to_string())?;
 
-            let cert = std::fs::read(cert_path)
-                .map_err(|e| format!("failed to read cert: {e}"))?;
-            let key =
-                std::fs::read(key_path).map_err(|e| format!("failed to read key: {e}"))?;
+            let cert = std::fs::read(cert_path).map_err(|e| format!("failed to read cert: {e}"))?;
+            let key = std::fs::read(key_path).map_err(|e| format!("failed to read key: {e}"))?;
             let identity = Identity::from_pem(cert, key);
 
             let mut tls_config = ServerTlsConfig::new().identity(identity);
             if let Some(ca_path) = &self.config.tls.ca_cert_path {
-                let ca_cert = std::fs::read(ca_path)
-                    .map_err(|e| format!("failed to read CA cert: {e}"))?;
+                let ca_cert =
+                    std::fs::read(ca_path).map_err(|e| format!("failed to read CA cert: {e}"))?;
                 tls_config =
                     tls_config.client_ca_root(tonic::transport::Certificate::from_pem(ca_cert));
             }

@@ -7,6 +7,8 @@ import grpc
 import pytest
 
 from rekha import (
+    Collection,
+    CollectionMeta,
     RekhaClient,
     RekhaConnectError,
     RekhaError,
@@ -61,6 +63,18 @@ class FakeStub:
     def Handshake(self, request: Any, timeout: float = 0) -> Any:
         return self._call("Handshake", request, timeout=timeout)
 
+    def CreateCollection(self, request: Any, timeout: float = 0) -> Any:
+        return self._call("CreateCollection", request, timeout=timeout)
+
+    def DropCollection(self, request: Any, timeout: float = 0) -> Any:
+        return self._call("DropCollection", request, timeout=timeout)
+
+    def ListCollections(self, request: Any, timeout: float = 0) -> Any:
+        return self._call("ListCollections", request, timeout=timeout)
+
+    def CollectionExists(self, request: Any, timeout: float = 0) -> Any:
+        return self._call("CollectionExists", request, timeout=timeout)
+
 
 @dataclass
 class MockStats:
@@ -93,7 +107,7 @@ class FakeResponse:
 class TestRekhaClient:
     def test_connect_empty_seeds(self) -> None:
         with pytest.raises(RekhaError, match="at least one seed node"):
-            RekhaClient(seeds=[])
+            RekhaClient.connect(seeds=[])
 
     def test_insert_ok(self) -> None:
         stub = FakeStub({
@@ -243,3 +257,127 @@ class TestRekhaClient:
         )
         assert results[0].payload is not None
         assert results[0].payload.data == b'{"k":"v"}'
+
+
+class TestCollectionAPI:
+    def test_create_collection(self) -> None:
+        stub = FakeStub({
+            "CreateCollection": lambda request, timeout: FakeResponse(success=True, error=""),
+        })
+        client = make_client(stub)
+        coll = client.create_collection("my_col", dim=128)
+        assert isinstance(coll, Collection)
+        assert coll.name == "my_col"
+        assert coll.dim == 128
+
+    def test_create_collection_exists(self) -> None:
+        stub = FakeStub({
+            "CollectionExists": lambda request, timeout: FakeResponse(exists=True),
+            "ListCollections": lambda request, timeout: FakeResponse(
+                collections=[
+                    FakeResponse(
+                        name="existing",
+                        config=FakeResponse(dim=64),
+                        vector_count=10,
+                        index_ready=True,
+                    )
+                ]
+            ),
+        })
+        client = make_client(stub)
+        result = client.collection_exists("existing")
+        assert result is True
+
+    def test_get_or_create_collection_new(self) -> None:
+        stub = FakeStub({
+            "CollectionExists": lambda request, timeout: FakeResponse(exists=False),
+            "CreateCollection": lambda request, timeout: FakeResponse(success=True, error=""),
+        })
+        client = make_client(stub)
+        coll = client.get_or_create_collection("new_col", dim=256)
+        assert coll.name == "new_col"
+        assert coll.dim == 256
+
+    def test_delete_collection(self) -> None:
+        stub = FakeStub({
+            "DropCollection": lambda request, timeout: FakeResponse(success=True, error=""),
+        })
+        client = make_client(stub)
+        client.delete_collection("old_col")
+
+    def test_list_collections(self) -> None:
+        col_meta = FakeResponse(
+            name="col1",
+            config=FakeResponse(dim=128),
+            vector_count=5,
+            index_ready=True,
+        )
+        stub = FakeStub({
+            "ListCollections": lambda request, timeout: FakeResponse(collections=[col_meta]),
+        })
+        client = make_client(stub)
+        collections = client.list_collections()
+        assert len(collections) == 1
+        assert collections[0].name == "col1"
+        assert collections[0].dim == 128
+
+    def test_collection_add_with_embeddings(self) -> None:
+        call_count = [0]
+
+        def insert_handler(request, timeout):
+            call_count[0] += 1
+            return FakeResponse(success=True, error="", id=request.id)
+
+        stub = FakeStub({
+            "Insert": insert_handler,
+        })
+        client = make_client(stub)
+        meta = CollectionMeta(name="test", dim=4)
+        coll = Collection(client, "test", meta)
+        coll.add(
+            ids=["a", "b"],
+            embeddings=[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]],
+        )
+        assert call_count[0] == 2
+
+    def test_collection_add_mismatched_lengths(self) -> None:
+        client = make_client()
+        meta = CollectionMeta(name="test", dim=4)
+        coll = Collection(client, "test", meta)
+        with pytest.raises(ValueError, match="embeddings length"):
+            coll.add(
+                ids=["a", "b"],
+                embeddings=[[0.1, 0.2, 0.3, 0.4]],
+            )
+
+    def test_collection_add_no_data(self) -> None:
+        client = make_client()
+        meta = CollectionMeta(name="test", dim=4)
+        coll = Collection(client, "test", meta)
+        with pytest.raises(ValueError, match="At least one"):
+            coll.add(ids=["a"])
+
+    def test_collection_query(self) -> None:
+        point = FakeResponse(id=1, score=0.5, payload=None)
+        stub = FakeStub({
+            "Search": lambda request, timeout: FakeResponse(
+                results=[point],
+                stats=MockStats(),
+            ),
+        })
+        client = make_client(stub)
+        meta = CollectionMeta(name="test", dim=4)
+        coll = Collection(client, "test", meta)
+        result = coll.query(query_embeddings=[[0.1, 0.2, 0.3, 0.4]], n_results=5)
+        assert len(result.ids) == 1
+        assert len(result.distances[0]) == 1
+        assert result.ids[0][0] == "1"
+
+    def test_collection_properties(self) -> None:
+        client = make_client()
+        meta = CollectionMeta(name="props", dim=64, vector_count=42, index_ready=True)
+        coll = Collection(client, "props", meta)
+        assert coll.name == "props"
+        assert coll.dim == 64
+        assert coll.vector_count == 42
+        assert coll.index_ready is True

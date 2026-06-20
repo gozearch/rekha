@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class Payload:
-    content_type: str  # "json", "text", "raw"
+    content_type: str
     data: bytes
 
     @classmethod
@@ -54,3 +54,28 @@ class NodeInfo:
 class ClusterTopology:
     cluster_id: str
     peers: List[NodeInfo]
+
+
+@dataclass
+class CollectionMeta:
+    name: str
+    dim: int
+    vector_count: int = 0
+    index_ready: bool = False
+
+
+@dataclass
+class GetResult:
+    ids: List[str]
+    embeddings: Optional[List[List[float]]] = None
+    metadatas: Optional[List[Dict[str, Any]]] = None
+    documents: Optional[List[str]] = None
+
+
+@dataclass
+class QueryResult:
+    ids: List[List[str]]
+    distances: List[List[float]]
+    embeddings: Optional[List[List[List[float]]]] = None
+    metadatas: Optional[List[List[Dict[str, Any]]]] = None
+    documents: Optional[List[List[str]]] = None

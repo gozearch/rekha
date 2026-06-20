@@ -1,21 +1,42 @@
 from __future__ import annotations
 
+import json
 import random
 import time
-from typing import Any, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import grpc
 
 import rekha.proto.rekha_pb2 as pb
 import rekha.proto.rekha_pb2_grpc as pb_grpc
+from .collection import Collection
 from .errors import RekhaConnectError, RekhaError, RekhaRequestError
-from .types import ClusterTopology, NodeInfo, Payload, ScoredPoint, SearchParams, SearchStats
+from .types import (
+    ClusterTopology,
+    CollectionMeta,
+    NodeInfo,
+    Payload,
+    ScoredPoint,
+    SearchParams,
+    SearchStats,
+)
 
 
 class RekhaClient:
+    """Chroma-like client for the Rekha vector database.
+
+    Usage::
+
+        client = RekhaClient(host="localhost", port=50051)
+        collection = client.create_collection("my_docs", dim=768)
+        collection.add(ids=["doc1"], embeddings=[[0.1, 0.2, ...]])
+        results = collection.query(query_embeddings=[[0.1, 0.2, ...]], n_results=10)
+    """
+
     def __init__(
         self,
-        seeds: List[str],
+        host: str = "localhost",
+        port: int = 50051,
         connect_timeout: float = 10.0,
         request_timeout: float = 60.0,
         max_retries: int = 3,
@@ -29,7 +50,8 @@ class RekhaClient:
             "use_tls": use_tls,
             "ca_cert": ca_cert,
         }
-        self._channel, self._stub = self._connect(seeds)
+        seed = f"{host}:{port}"
+        self._channel, self._stub = self._connect([seed])
 
     @classmethod
     def connect(
@@ -39,16 +61,19 @@ class RekhaClient:
         request_timeout: float = 60.0,
         max_retries: int = 3,
     ) -> RekhaClient:
-        return cls(
-            seeds=seeds,
-            connect_timeout=connect_timeout,
-            request_timeout=request_timeout,
-            max_retries=max_retries,
-        )
+        """Factory method: connect to one or more seed nodes."""
+        client = cls.__new__(cls)
+        client._config = {
+            "connect_timeout": connect_timeout,
+            "request_timeout": request_timeout,
+            "max_retries": max_retries,
+            "use_tls": False,
+            "ca_cert": None,
+        }
+        client._channel, client._stub = client._connect(seeds)
+        return client
 
-    def _connect(
-        self, seeds: List[str]
-    ) -> Tuple[grpc.Channel, pb_grpc.RekhaStub]:
+    def _connect(self, seeds: List[str]) -> Tuple[grpc.Channel, pb_grpc.RekhaStub]:
         if not seeds:
             raise RekhaError("at least one seed node required")
 
@@ -100,6 +125,111 @@ class RekhaClient:
                 jitter = random.randint(0, base_ms // 4)
                 time.sleep((base_ms + jitter) / 1000.0)
 
+    def _default_params(self) -> SearchParams:
+        return SearchParams(ef_search=100, beam_width=4, include_payloads=False)
+
+    def _serialize_metadata(self, meta: Dict[str, Any]) -> bytes:
+        return json.dumps(meta).encode("utf-8")
+
+    def _deserialize_metadata(self, data: Optional[bytes]) -> Optional[Dict[str, Any]]:
+        if data is None:
+            return None
+        try:
+            return json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+
+    # ── Collection management ──────────────────────────────────
+
+    def create_collection(
+        self,
+        name: str,
+        dim: int = 256,
+    ) -> Collection:
+        """Create a new collection. Returns a Collection handle."""
+        config = pb.CollectionConfig(
+            dim=dim,
+            num_vector_shards=1,
+            replication_factor=1,
+            num_dim_groups=1,
+            dim_group_size=dim,
+            graph_degree=64,
+            search_list_size=128,
+            pq_num_sub_vectors=min(64, dim),
+            pq_num_centroids=256,
+            re_rank_k=256,
+        )
+        request = pb.CreateCollectionRequest(name=name, config=config)
+
+        def call():
+            response = self._stub.CreateCollection(request, timeout=self._config["request_timeout"])
+            if not response.success:
+                raise RekhaError(response.error)
+            return response
+
+        self._with_retry("create_collection", call)
+        return Collection(self, name, CollectionMeta(name=name, dim=dim))
+
+    def get_collection(self, name: str) -> Collection:
+        """Get an existing collection. Raises NotFound if missing."""
+        meta = self._fetch_collection_meta(name)
+        return Collection(self, name, meta)
+
+    def get_or_create_collection(self, name: str, dim: int = 256) -> Collection:
+        """Get an existing collection or create a new one."""
+        if self.collection_exists(name):
+            return self.get_collection(name)
+        return self.create_collection(name, dim=dim)
+
+    def list_collections(self) -> List[CollectionMeta]:
+        """List all collections."""
+        request = pb.ListCollectionsRequest()
+
+        def call():
+            response = self._stub.ListCollections(request, timeout=self._config["request_timeout"])
+            return [
+                CollectionMeta(
+                    name=c.name,
+                    dim=c.config.dim if c.config else 0,
+                    vector_count=c.vector_count,
+                    index_ready=c.index_ready,
+                )
+                for c in response.collections
+            ]
+
+        return self._with_retry("list_collections", call)
+
+    def delete_collection(self, name: str) -> None:
+        """Delete a collection and all its data."""
+        request = pb.DropCollectionRequest(name=name)
+
+        def call():
+            response = self._stub.DropCollection(request, timeout=self._config["request_timeout"])
+            if not response.success:
+                raise RekhaError(response.error)
+            return response
+
+        self._with_retry("delete_collection", call)
+
+    def collection_exists(self, name: str) -> bool:
+        """Check if a collection exists."""
+        request = pb.CollectionExistsRequest(name=name)
+
+        def call():
+            response = self._stub.CollectionExists(request, timeout=self._config["request_timeout"])
+            return response.exists
+
+        return self._with_retry("collection_exists", call)
+
+    def _fetch_collection_meta(self, name: str) -> CollectionMeta:
+        collections = self.list_collections()
+        for c in collections:
+            if c.name == name:
+                return c
+        raise RekhaError(f"collection '{name}' not found")
+
+    # ── Low-level data operations ──────────────────────────────
+
     def insert(
         self,
         vector: List[float],
@@ -109,9 +239,14 @@ class RekhaClient:
     ) -> int:
         pb_payload = None
         if payload is not None:
-            pb_payload = pb.Payload(content_type="raw", data=payload)
+            pb_payload = pb.Payload(content_type="json", data=payload)
 
-        request = pb.InsertRequest(id=id, vector=vector, collection_name=collection_name, payload=pb_payload)
+        request = pb.InsertRequest(
+            id=id,
+            vector=vector,
+            collection_name=collection_name,
+            payload=pb_payload,
+        )
 
         def call():
             response = self._stub.Insert(request, timeout=self._config["request_timeout"])
@@ -186,7 +321,9 @@ class RekhaClient:
     def fetch(
         self, ids: List[int], collection_name: str, include_payloads: bool = False
     ) -> List[ScoredPoint]:
-        request = pb.FetchRequest(ids=ids, collection_name=collection_name, include_payloads=include_payloads)
+        request = pb.FetchRequest(
+            ids=ids, collection_name=collection_name, include_payloads=include_payloads
+        )
 
         def call():
             response = self._stub.Fetch(request, timeout=self._config["request_timeout"])

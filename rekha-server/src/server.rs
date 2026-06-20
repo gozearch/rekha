@@ -60,11 +60,25 @@ impl ServerInstance {
         let raft_log_store = coordinator.raft_log_store_for("default");
         let num_shards = config.partition.num_vector_shards;
         let node_id = &config.cluster.node_id;
+        let bind_port = config.cluster.bind_addr.split(':').nth(1).unwrap_or("50051");
         let peers: Vec<String> = config
             .cluster
             .seed_nodes
             .iter()
-            .filter(|s| !s.starts_with(node_id))
+            .filter(|s| {
+                // Filter self: seed starts with node_id (Docker convention).
+                if s.starts_with(node_id) {
+                    return false;
+                }
+                // Filter self: seed has same port as bind_addr (local dev).
+                // This filters out 127.0.0.1:50051 when bind_addr is 0.0.0.0:50051.
+                let seed_port = s.split(':').nth(1).unwrap_or("50051");
+                let seed_host = s.split(':').next().unwrap_or("");
+                if seed_port == bind_port && (seed_host == "127.0.0.1" || seed_host == "localhost") {
+                    return false;
+                }
+                true
+            })
             .cloned()
             .collect();
 

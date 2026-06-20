@@ -578,6 +578,9 @@ impl Coordinator {
     }
 
     pub async fn register_peer(&self, info: NodeInfo) {
+        if info.node_id.is_empty() || info.address.is_empty() {
+            return;
+        }
         let mut peers = self.peers.write().await;
         let mut info = info;
         info.last_heartbeat = std::time::SystemTime::now()
@@ -672,9 +675,21 @@ impl Coordinator {
 
     /// Get a Raft node for a specific collection + partition.
     pub fn raft_node(&self, collection_name: &str, partition_id: u64) -> Option<Arc<RaftNode>> {
-        self.collections
+        // Check per-collection raft nodes.
+        if let Some(node) = self
+            .collections
             .get(collection_name)
             .and_then(|state| state.raft_nodes.get(&partition_id).map(|n| n.clone()))
+        {
+            return Some(node);
+        }
+        // Check system Raft group.
+        if collection_name == "__system__" || partition_id == SYSTEM_PARTITION_ID {
+            if let Some(ref sys) = self.system_raft_node {
+                return Some(sys.clone());
+            }
+        }
+        None
     }
 
     /// Create a RaftLogStore for a given collection.

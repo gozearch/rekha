@@ -516,14 +516,48 @@ impl Rekha for RekhaService {
             }));
         }
 
-        // Replicate via system Raft group. If not leader, the heartbeat loop
-        // on the elected leader will push the local metadata to followers.
+        // Replicate via system Raft group.
         if let Some(sys_node) = self.coordinator.system_raft_node() {
             let cmd = rekha_raft::state::RaftCommand::CreateCollection {
                 name: req.name.clone(),
                 config: collection_config,
             };
-            let _ = sys_node.propose(cmd).await;
+            match sys_node.propose(cmd).await {
+                Ok(()) => {}
+                Err(RekhaError::Consensus(RaftError::NotLeader { leader_hint })) => {
+                    // Not the system leader — forward to leader via create_collection RPC.
+                    let leader_id = leader_hint.unwrap_or_default();
+                    if let Some(addr) = self.coordinator.peer_address(&leader_id).await {
+                        let uri = format!("http://{addr}");
+                        let endpoint = tonic::transport::Endpoint::from_shared(uri);
+                        if let Ok(endpoint) = endpoint {
+                            let endpoint = endpoint.connect_timeout(std::time::Duration::from_secs(5));
+                            if let Ok(ch) = endpoint.connect().await {
+                                let mut leader_client =
+                                    crate::proto::rekha_client::RekhaClient::new(ch);
+                                let _ = leader_client.create_collection(tonic::Request::new(
+                                    crate::proto::CreateCollectionRequest {
+                                        name: req.name.clone(),
+                                        config: Some(crate::proto::CollectionConfig {
+                                            dim: config.dim,
+                                            num_vector_shards: config.num_vector_shards,
+                                            replication_factor: config.replication_factor,
+                                            num_dim_groups: config.num_dim_groups,
+                                            dim_group_size: config.dim_group_size,
+                                            graph_degree: config.graph_degree,
+                                            search_list_size: config.search_list_size,
+                                            pq_num_sub_vectors: config.pq_num_sub_vectors,
+                                            pq_num_centroids: config.pq_num_centroids,
+                                            re_rank_k: config.re_rank_k,
+                                        }),
+                                    },
+                                )).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => info!("system raft propose: {e}"),
+            }
         }
 
         Ok(Response::new(CreateCollectionResponse {

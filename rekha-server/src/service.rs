@@ -9,21 +9,44 @@ use crate::proto::{
     CollectionExistsResponse, CreateCollectionRequest, CreateCollectionResponse, DeleteRequest,
     DeleteResponse, DropCollectionRequest, DropCollectionResponse, FetchRequest, FetchResponse,
     HandshakeRequest, HandshakeResponse, HeartbeatRequest, HeartbeatResponse, InsertBatchResponse,
-    InsertRequest, InsertResponse, ListCollectionsRequest, ListCollectionsResponse, RaftAck,
-    RaftSnapshotChunk, RaftVoteRequest, RaftVoteResponse, ScoredPoint, SearchRequest,
-    SearchResponse, TransferRequest, TransferResponse,
+    InsertRequest, InsertResponse, InstallConfigRequest, InstallConfigResponse,
+    ListCollectionsRequest, ListCollectionsResponse, MembershipChangeRequest,
+    MembershipChangeResponse, RaftAck, RaftSnapshotChunk, RaftVoteRequest, RaftVoteResponse,
+    ScoredPoint, SearchRequest, SearchResponse, TransferRequest, TransferResponse,
 };
 use rekha_core::RaftError;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::auth::Authenticator;
+
 /// gRPC service implementation for the Rekha distributed vector database.
 pub struct RekhaService {
     coordinator: Arc<Coordinator>,
+    authenticator: Arc<Authenticator>,
 }
 
 impl RekhaService {
-    pub fn new(coordinator: Arc<Coordinator>) -> Self {
-        Self { coordinator }
+    pub fn new(coordinator: Arc<Coordinator>, authenticator: Arc<Authenticator>) -> Self {
+        Self {
+            coordinator,
+            authenticator,
+        }
+    }
+
+    /// Authenticate a request and return the AuthContext.
+    async fn authenticate_request<T>(&self, request: &tonic::Request<T>) -> Result<rekha_core::AuthContext, Status> {
+        let auth_header = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        self.authenticator
+            .authenticate(auth_header)
+            .await
+            .map_err(|e| match &e {
+                RekhaError::AuthenticationFailed(_) => Status::unauthenticated(e.to_string()),
+                RekhaError::PermissionDenied(_) => Status::permission_denied(e.to_string()),
+                _ => Status::internal(e.to_string()),
+            })
     }
 
     /// Map internal RekhaError to gRPC Status.
@@ -34,6 +57,8 @@ impl RekhaService {
             RekhaError::IndexFull { .. } => Status::resource_exhausted(e.to_string()),
             RekhaError::InvalidDimension { .. } => Status::invalid_argument(e.to_string()),
             RekhaError::Timeout { .. } => Status::deadline_exceeded(e.to_string()),
+            RekhaError::AuthenticationFailed(_) => Status::unauthenticated(e.to_string()),
+            RekhaError::PermissionDenied(_) => Status::permission_denied(e.to_string()),
             RekhaError::Unavailable { .. } => Status::unavailable(e.to_string()),
             RekhaError::Consensus(rekha_core::RaftError::NotLeader { .. }) => {
                 Status::failed_precondition(e.to_string())
@@ -51,7 +76,9 @@ impl Rekha for RekhaService {
         &self,
         request: Request<InsertRequest>,
     ) -> Result<Response<InsertResponse>, Status> {
+        let ctx = self.authenticate_request(&request).await?;
         let req = request.into_inner();
+        Authenticator::check_collection_access(&ctx, &req.collection_name, true).map_err(Self::map_error)?;
         let payload = req.payload.map(|p| Payload {
             content_type: match p.content_type.as_str() {
                 "json" => rekha_core::PayloadType::Json,
@@ -127,7 +154,9 @@ impl Rekha for RekhaService {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        let ctx = self.authenticate_request(&request).await?;
         let req = request.into_inner();
+        Authenticator::check_collection_access(&ctx, &req.collection_name, true).map_err(Self::map_error)?;
 
         let result = self
             .coordinator
@@ -198,7 +227,9 @@ impl Rekha for RekhaService {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        let ctx = self.authenticate_request(&request).await?;
         let req = request.into_inner();
+        Authenticator::check_collection_access(&ctx, &req.collection_name, false).map_err(Self::map_error)?;
         let params = req.params.unwrap_or_default();
 
         let search_params = SearchParams {
@@ -489,10 +520,12 @@ impl Rekha for RekhaService {
         let mut snapshot_data: Vec<u8> = Vec::new();
         let mut term = 0u64;
         let mut last_included_index = 0u64;
+        let mut partition_id: Option<u64> = None;
 
         while let Some(chunk) = stream.message().await? {
             term = chunk.term;
             last_included_index = chunk.last_included_index;
+            partition_id = Some(chunk.partition_id);
             snapshot_data.extend_from_slice(&chunk.data);
         }
 
@@ -505,37 +538,29 @@ impl Rekha for RekhaService {
             }));
         }
 
-        // Find the Raft node for this partition and install the snapshot.
-        // The partition_id is not in the chunk — we infer from chunk metadata.
-        // In a full implementation, the chunk should include partition_id.
-        // For now, find the first raft node and install.
-        let raft_node_opt = {
-            let first = self.coordinator.raft_nodes.iter().next();
-            first.map(|entry| entry.value().clone())
-        };
+        let pid = partition_id.ok_or_else(|| Status::invalid_argument("missing partition_id in snapshot chunk"))?;
+        let raft_node = self
+            .coordinator
+            .raft_node(pid)
+            .ok_or_else(|| Status::not_found(format!("no raft node for partition {pid}")))?;
 
-        match raft_node_opt {
-            Some(node) => {
-                match node
-                    .install_snapshot(term, last_included_index, &snapshot_data)
-                    .await
-                {
-                    Ok(()) => Ok(Response::new(RaftAck {
+        match raft_node
+            .install_snapshot(term, last_included_index, &snapshot_data)
+            .await
+        {
+            Ok(()) => Ok(Response::new(RaftAck {
                         success: true,
-                        current_term: node.current_term().await,
-                        commit_index: node.commit_index().await,
+                        current_term: raft_node.current_term().await,
+                        commit_index: raft_node.commit_index().await,
                         error: String::new(),
                     })),
                     Err(e) => Ok(Response::new(RaftAck {
                         success: false,
-                        current_term: node.current_term().await,
+                        current_term: raft_node.current_term().await,
                         commit_index: 0,
                         error: e.to_string(),
                     })),
                 }
-            }
-            None => Err(Status::not_found("no raft nodes to install snapshot")),
-        }
     }
 
     // ── Collection Management ──────────────────────────────────
@@ -572,6 +597,56 @@ impl Rekha for RekhaService {
         Err(Status::unimplemented(
             "collection_exists not yet implemented",
         ))
+    }
+
+    // ── Cluster Membership ──────────────────────────────────
+
+    async fn membership_change(
+        &self,
+        request: Request<MembershipChangeRequest>,
+    ) -> Result<Response<MembershipChangeResponse>, Status> {
+        let req = request.into_inner();
+
+        // Only the metadata Raft leader can propose membership changes.
+        let meta_node = self
+            .coordinator
+            .metadata_raft_node()
+            .await
+            .ok_or_else(|| Status::failed_precondition("metadata raft not initialized"))?;
+
+        let cmd = rekha_raft::state::RaftCommand::MembershipChange {
+            new_peers: req.new_peers,
+        };
+        meta_node.propose(cmd).await.map_err(|e| {
+            Status::failed_precondition(format!("membership change rejected: {e}"))
+        })?;
+
+        Ok(Response::new(MembershipChangeResponse {
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn install_config(
+        &self,
+        request: Request<InstallConfigRequest>,
+    ) -> Result<Response<InstallConfigResponse>, Status> {
+        let req = request.into_inner();
+
+        // Find the Raft node for this partition and update its peer list.
+        let raft_node = self
+            .coordinator
+            .raft_node(req.partition_id)
+            .ok_or_else(|| Status::not_found("no raft node for partition"))?;
+
+        // Update the peer list directly (the sender is trusted — this RPC is
+        // called by the current leader after committing the membership change).
+        raft_node.set_peers(req.new_peers).await;
+
+        Ok(Response::new(InstallConfigResponse {
+            success: true,
+            error: String::new(),
+        }))
     }
 }
 
@@ -793,8 +868,7 @@ mod tests {
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 1),
         ));
         let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
-        let service = RekhaService::new(coord);
-        // service is initialized; verify by checking it doesn't panic
+        let service = RekhaService::new(coord, test_auth());
         let _ = service;
     }
 
@@ -871,7 +945,7 @@ mod tests {
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 1),
         ));
         let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
-        let service = RekhaService::new(coord);
+        let service = RekhaService::new(coord, test_auth());
 
         let req = tonic::Request::new(SearchRequest {
             query_vector: vec![0.0; 8],
@@ -929,7 +1003,7 @@ mod tests {
         coord.create_collection("default", 256).await.unwrap();
         coord.initialize().await;
 
-        RekhaService::new(coord)
+        RekhaService::new(coord, test_auth())
     }
 
     #[tokio::test]

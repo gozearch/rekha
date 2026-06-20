@@ -33,4 +33,13 @@ pub trait RaftPeerNetwork: Send + Sync {
         last_log_index: u64,
         last_log_term: u64,
     ) -> Result<(bool, u64), RekhaError>;
+
+    /// Send an InstallConfig to a joining node, providing the latest peer list.
+    async fn install_config(
+        &self,
+        peer_id: &str,
+        partition_id: u64,
+        new_peers: Vec<String>,
+        term: u64,
+    ) -> Result<(), RekhaError>;
 }

@@ -92,6 +92,10 @@ fn raft_entry_to_proto(entry: &RaftLogEntry) -> crate::proto::RaftEntry {
         )),
         RaftCommand::CreateCollection { .. }
         | RaftCommand::DropCollection { .. }
+        | RaftCommand::MembershipChange { .. }
+        | RaftCommand::CreateUser { .. }
+        | RaftCommand::DropUser { .. }
+        | RaftCommand::UpdateUser { .. }
         | RaftCommand::NoOp => None,
     };
 
@@ -172,5 +176,28 @@ impl RaftPeerNetwork for GrpcRaftNetwork {
 
         let vote = resp.into_inner();
         Ok((vote.vote_granted, vote.term))
+    }
+
+    async fn install_config(
+        &self,
+        peer_addr: &str,
+        partition_id: u64,
+        new_peers: Vec<String>,
+        term: u64,
+    ) -> Result<(), RekhaError> {
+        let mut client = self.get_client(peer_addr).await?;
+        let req = tonic::Request::new(crate::proto::InstallConfigRequest {
+            leader_id: String::new(),
+            partition_id,
+            new_peers,
+            term,
+        });
+        client
+            .install_config(req)
+            .await
+            .map(|_| ())
+            .map_err(|s| RekhaError::Internal {
+                detail: format!("InstallConfig RPC failed: {s}"),
+            })
     }
 }

@@ -1,4 +1,4 @@
-use rekha_core::CollectionMetadata;
+use rekha_core::{CollectionMetadata, UserConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -38,6 +38,12 @@ pub struct ReplicatedState {
     /// Per-collection payload data (data Raft groups, multi-collection mode).
     #[serde(default)]
     pub collections_payloads: HashMap<String, HashMap<u64, Vec<u8>>>,
+    /// Peer list for this Raft group (set via MembershipChange).
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// User registry (metadata Raft group only).
+    #[serde(default)]
+    pub users: HashMap<String, UserConfig>,
 }
 
 impl ReplicatedState {
@@ -54,6 +60,8 @@ impl ReplicatedState {
             collections: HashMap::new(),
             collections_data: HashMap::new(),
             collections_payloads: HashMap::new(),
+            peers: Vec::new(),
+            users: HashMap::new(),
         }
     }
 
@@ -130,6 +138,26 @@ impl ReplicatedState {
         self.collections_payloads.remove(name);
     }
 
+    /// Apply a membership change command to the state.
+    pub fn apply_membership_change(&mut self, new_peers: Vec<String>) {
+        self.peers = new_peers;
+    }
+
+    /// Apply a create-user command to the state.
+    pub fn apply_create_user(&mut self, username: String, config: UserConfig) {
+        self.users.insert(username, config);
+    }
+
+    /// Apply a drop-user command to the state.
+    pub fn apply_drop_user(&mut self, username: &str) {
+        self.users.remove(username);
+    }
+
+    /// Apply an update-user command to the state.
+    pub fn apply_update_user(&mut self, username: &str, config: UserConfig) {
+        self.users.insert(username.to_string(), config);
+    }
+
     /// Get a vector by ID (from legacy flat map).
     pub fn get_vector(&self, id: u64) -> Option<Vec<f32>> {
         self.vectors.get(&id).map(|bytes| {
@@ -204,6 +232,24 @@ pub enum RaftCommand {
     },
     /// Drop a collection (metadata Raft group).
     DropCollection { name: String },
+    /// Membership change (update peer list).
+    MembershipChange {
+        new_peers: Vec<String>,
+    },
+    /// Create a user (metadata Raft group).
+    CreateUser {
+        username: String,
+        config: UserConfig,
+    },
+    /// Drop a user (metadata Raft group).
+    DropUser {
+        username: String,
+    },
+    /// Update a user's config (metadata Raft group).
+    UpdateUser {
+        username: String,
+        config: UserConfig,
+    },
     /// No-op (heartbeat, linearizable read).
     NoOp,
 }
@@ -231,6 +277,18 @@ impl RaftCommand {
             }
             Self::DropCollection { name } => {
                 state.apply_drop_collection(name);
+            }
+            Self::MembershipChange { new_peers } => {
+                state.apply_membership_change(new_peers.clone());
+            }
+            Self::CreateUser { username, config } => {
+                state.apply_create_user(username.clone(), config.clone());
+            }
+            Self::DropUser { username } => {
+                state.apply_drop_user(username);
+            }
+            Self::UpdateUser { username, config } => {
+                state.apply_update_user(username, config.clone());
             }
             Self::NoOp => {}
         }

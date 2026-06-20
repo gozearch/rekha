@@ -11,6 +11,8 @@ pub struct ServerConfig {
     pub tls: TlsConfig,
     pub observability: ObservabilityConfig,
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 impl ServerConfig {
@@ -57,6 +59,15 @@ impl ServerConfig {
         }
         if self.raft.election_timeout_min_ms == 0 {
             return Err("election_timeout_min_ms must be > 0".into());
+        }
+        if self.raft.election_timeout_min_ms > self.raft.election_timeout_max_ms {
+            return Err("election_timeout_min_ms must be <= election_timeout_max_ms".into());
+        }
+        if self.cluster.data_dir.is_empty() {
+            return Err("data_dir must not be empty".into());
+        }
+        if !matches!(self.security.auth_method.as_str(), "trust" | "password" | "cert" | "password+cert") {
+            return Err(format!("invalid auth_method: {}", self.security.auth_method).into());
         }
         if self.tls.enabled {
             if self.tls.cert_path.is_none() {
@@ -111,6 +122,40 @@ impl ServerConfig {
                 max_payload_size: 1_048_576,
                 max_inline_size: 1_048_576,
             },
+            security: SecurityConfig::default(),
+        }
+    }
+}
+
+/// Default user configuration for first-start bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefaultUserConfig {
+    pub username: String,
+    pub password: String,
+}
+
+/// Authentication and authorization configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Authentication method: "password" | "trust" | "cert" | "password+cert"
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String,
+    /// Default user created on first startup (hashed with bcrypt, not stored in plaintext).
+    pub default_user: Option<DefaultUserConfig>,
+}
+
+fn default_auth_method() -> String {
+    "password".to_string()
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            auth_method: "password".to_string(),
+            default_user: Some(DefaultUserConfig {
+                username: "admin".to_string(),
+                password: String::new(),
+            }),
         }
     }
 }

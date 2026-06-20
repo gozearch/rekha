@@ -27,6 +27,8 @@ pub enum RekhaError {
     },
     CollectionNotFound(String),
     CollectionAlreadyExists(String),
+    AuthenticationFailed(String),
+    PermissionDenied(String),
     Unavailable {
         detail: String,
     },
@@ -62,6 +64,8 @@ impl fmt::Display for RekhaError {
             Self::ClusterChanged { detail } => write!(f, "cluster membership changed: {detail}"),
             Self::CollectionNotFound(s) => write!(f, "collection not found: {s}"),
             Self::CollectionAlreadyExists(s) => write!(f, "collection already exists: {s}"),
+            Self::AuthenticationFailed(s) => write!(f, "authentication failed: {s}"),
+            Self::PermissionDenied(s) => write!(f, "permission denied: {s}"),
             Self::Unavailable { detail } => write!(f, "service unavailable: {detail}"),
             Self::Internal { detail } => write!(f, "internal error: {detail}"),
         }

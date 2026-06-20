@@ -28,6 +28,10 @@ service Rekha {
     rpc RaftAppendEntries(AppendEntriesRequest) returns (RaftAck);
     rpc RaftRequestVote(RaftVoteRequest) returns (RaftVoteResponse);
     rpc RaftInstallSnapshot(stream RaftSnapshotChunk) returns (RaftAck);
+
+    // ── Cluster membership (internal) ────────────────────────
+    rpc MembershipChange(MembershipChangeRequest) returns (MembershipChangeResponse);
+    rpc InstallConfig(InstallConfigRequest) returns (InstallConfigResponse);
 }
 
 // ── Core Data Types ─────────────────────────────────────────
@@ -283,4 +287,30 @@ message RaftSnapshotChunk {
     uint64 last_included_term = 3;
     bytes data = 4;
     bool done = 5;
+    uint64 partition_id = 6;
+}
+
+// ── Cluster Membership ────────────────────────────────────
+
+message MembershipChangeRequest {
+    uint64 partition_id = 1;
+    repeated string new_peers = 2;
+    string node_id = 3;
+}
+
+message MembershipChangeResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message InstallConfigRequest {
+    string leader_id = 1;
+    uint64 partition_id = 2;
+    repeated string new_peers = 3;
+    uint64 term = 4;
+}
+
+message InstallConfigResponse {
+    bool success = 1;
+    string error = 2;
 }

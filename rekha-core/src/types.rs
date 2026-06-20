@@ -271,6 +271,31 @@ impl OwnedRange {
     }
 }
 
+/// User role for access control.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum UserRole {
+    Admin,
+    User,
+    ReadOnly,
+}
+
+/// Configuration for an authenticated user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserConfig {
+    pub password_hash: String,
+    pub role: UserRole,
+    pub collections: Vec<String>,
+    pub created_at: u64,
+}
+
+/// Authenticated user context attached to each request.
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub username: String,
+    pub role: UserRole,
+    pub collections: Vec<String>,
+}
+
 /// Point in time identifier for Raft operations.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub struct RaftIndex {

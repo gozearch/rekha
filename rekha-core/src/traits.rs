@@ -63,6 +63,11 @@ pub trait IndexBufferHandle: Send + Sync {
     fn buffer_insert(&self, id: u64, vector: Vec<f32>, payload: Option<Vec<u8>>);
     /// Mark committed deletes in the index buffer.
     fn buffer_delete(&self, ids: &[u64]);
+    /// Called when a CreateCollection command is committed via Raft.
+    /// Used by the metadata Raft group to initialize local collection contexts.
+    fn on_collection_created(&self, _name: &str, _dim: usize, _config: &crate::CollectionConfig) {}
+    /// Called when a DropCollection command is committed via Raft.
+    fn on_collection_dropped(&self, _name: &str) {}
 }
 
 /// Storage backend trait for persisting vectors and metadata.

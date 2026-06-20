@@ -22,8 +22,8 @@ pub struct RaftNode {
     node_id: String,
     /// Partition (vector shard) this Raft group manages.
     partition_id: u64,
-    /// All peers in this Raft group.
-    peers: Vec<String>,
+    /// All peers in this Raft group (mutable for membership changes).
+    peers: RwLock<Vec<String>>,
     /// Replicated state machine.
     state: Arc<RwLock<ReplicatedState>>,
     /// Raft log: index -> RaftLogEntry
@@ -87,26 +87,65 @@ impl RaftNode {
         index_handle: Option<Arc<dyn IndexBufferHandle>>,
         network: Option<Arc<dyn RaftPeerNetwork>>,
     ) -> Self {
-        // Load persisted log entries and state into memory.
-        let (current_term, voted_for, log_entries) = if let Some(ref s) = store {
+        // Load persisted state: snapshot first, then log entries after the snapshot point.
+        let (current_term, voted_for, mut log_entries) = if let Some(ref s) =
+            store
+        {
             let term_vote = s.load_state(partition_id).ok().unwrap_or((0, None));
-            let entries = s.load_entries(partition_id, 1).unwrap_or_default();
-            (term_vote.0, term_vote.1, entries)
+            let mut from_index = 1u64;
+
+            // Try loading a snapshot first (faster than replaying from entry 1).
+            if let Ok(Some((snap_term, snap_idx, snap_data))) =
+                s.load_snapshot(partition_id)
+            {
+                if let Ok(snapshot_state) = bincode::deserialize::<ReplicatedState>(&snap_data) {
+                    state = snapshot_state;
+                    state.last_applied = snap_idx;
+                    from_index = snap_idx + 1;
+
+                    // Update term from snapshot if newer.
+                    let (final_term, final_voted) = if snap_term > term_vote.0 {
+                        (snap_term, None)
+                    } else {
+                        term_vote
+                    };
+
+                    let entries = s.load_entries(partition_id, from_index).unwrap_or_default();
+                    (final_term, final_voted, entries)
+                } else {
+                    let entries = s.load_entries(partition_id, from_index).unwrap_or_default();
+                    (term_vote.0, term_vote.1, entries)
+                }
+            } else {
+                let entries = s.load_entries(partition_id, from_index).unwrap_or_default();
+                (term_vote.0, term_vote.1, entries)
+            }
         } else {
             (0, None, Vec::new())
         };
 
         // Replay log entries into state machine (crash recovery).
-        let last_index = log_entries.last().map(|e| e.index).unwrap_or(0);
+        let mut last_index = state.last_applied;
         for entry in &log_entries {
             entry.command.apply(&mut state);
+            if entry.index > last_index {
+                last_index = entry.index;
+            }
         }
         state.last_applied = last_index;
+
+        // After replay, use peers from state (may have been updated by MembershipChange)
+        // falling back to the constructor parameter for the initial configuration.
+        let effective_peers = if state.peers.is_empty() {
+            peers
+        } else {
+            state.peers.clone()
+        };
 
         Self {
             node_id,
             partition_id,
-            peers,
+            peers: RwLock::new(effective_peers),
             state: Arc::new(RwLock::new(state)),
             log: Arc::new(Mutex::new(log_entries)),
             raft_state: Arc::new(Mutex::new(RaftInternalState {
@@ -135,8 +174,13 @@ impl RaftNode {
         self.partition_id
     }
 
-    pub fn peers(&self) -> &[String] {
-        &self.peers
+    pub async fn peers(&self) -> Vec<String> {
+        self.peers.read().await.clone()
+    }
+
+    /// Blocking variant of peers() for use outside async contexts.
+    pub fn peers_blocking(&self) -> Vec<String> {
+        self.peers.blocking_read().clone()
     }
 
     pub async fn current_term(&self) -> u64 {
@@ -158,6 +202,11 @@ impl RaftNode {
 
     pub async fn leader_id(&self) -> Option<String> {
         self.raft_state.lock().await.leader_id.clone()
+    }
+
+    /// Set the peer list (used by InstallConfig during membership changes).
+    pub async fn set_peers(&self, new_peers: Vec<String>) {
+        *self.peers.write().await = new_peers;
     }
 
     /// Get all vectors from the replicated state.
@@ -273,7 +322,8 @@ impl RaftNode {
         // log lock released
 
         // 2. Replicate to followers.
-        let n_peers = self.peers.len();
+        let peer_ids = self.peers.read().await.clone();
+        let n_peers = peer_ids.len();
         let group_size = n_peers as u64 + 1;
         let majority = group_size / 2 + 1;
         let mut acks = 1u64; // self-vote
@@ -286,7 +336,6 @@ impl RaftNode {
 
         if n_peers > 0 {
             if let Some(ref network) = self.network {
-                let peer_ids: Vec<String> = self.peers.clone();
                 let partition_id = self.partition_id;
                 let leader_commit = prev_commit_index;
 
@@ -384,7 +433,8 @@ impl RaftNode {
 
         // Single-node: self-elect immediately.
         // Multi-node: stay as Candidate — the server layer collects votes.
-        if self.peers.is_empty() {
+        let has_peers = !self.peers.read().await.is_empty();
+        if !has_peers {
             raft_state.role = RaftRole::Leader;
             raft_state.leader_id = Some(self.node_id.clone());
             info!("Node {} elected as leader for term {}", self.node_id, term);
@@ -505,11 +555,21 @@ impl RaftNode {
         drop(log);
         self.apply_up_to(leader_commit).await;
 
-        // Update commit_index.
+        // Update commit_index and peer list from membership changes.
         {
             let mut rs = self.raft_state.lock().await;
             if leader_commit > rs.commit_index {
                 rs.commit_index = leader_commit;
+            }
+        }
+        // Check for MembershipChange entries in the applied log range.
+        {
+            let log = self.log.lock().await;
+            for entry in log.iter().rev() {
+                if let RaftCommand::MembershipChange { new_peers } = &entry.command {
+                    *self.peers.write().await = new_peers.clone();
+                    break; // only the latest membership change entry matters
+                }
             }
         }
 
@@ -618,7 +678,14 @@ impl RaftNode {
                 RaftCommand::Delete { ids, .. } => {
                     handle.buffer_delete(ids);
                 }
-                RaftCommand::CreateCollection { .. } | RaftCommand::DropCollection { .. } => {}
+                RaftCommand::CreateCollection { name, dim, config } => {
+                    handle.on_collection_created(name, *dim, config);
+                }
+                RaftCommand::DropCollection { name } => {
+                    handle.on_collection_dropped(name);
+                }
+                RaftCommand::MembershipChange { .. } => {}
+                RaftCommand::CreateUser { .. } | RaftCommand::DropUser { .. } | RaftCommand::UpdateUser { .. } => {}
                 RaftCommand::NoOp => {}
             }
         }
@@ -1127,7 +1194,7 @@ mod tests {
     fn test_peers_accessor() {
         let state = ReplicatedState::new(1);
         let node = RaftNode::new("n1".into(), 1, vec!["n2".into(), "n3".into()], state);
-        let peers = node.peers();
+        let peers = node.peers_blocking();
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0], "n2");
     }

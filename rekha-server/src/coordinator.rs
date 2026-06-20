@@ -140,7 +140,7 @@ impl PeerPool {
             }
         }
 
-        all_candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+        all_candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
         all_candidates.truncate(k * 2);
         stats.nodes_contacted = nodes_contacted;
         (all_candidates, stats)
@@ -157,7 +157,7 @@ impl PeerPool {
 }
 
 /// Per-collection state: index, storage, Raft nodes, and auto-ID.
-pub(crate) struct CollectionCtx {
+pub struct CollectionCtx {
     #[allow(dead_code)]
     pub metadata: CollectionMetadata,
     pub store: RocksVectorStore,
@@ -180,9 +180,13 @@ pub(crate) struct PerCollectionIndexHandle {
 
 impl IndexBufferHandle for PerCollectionIndexHandle {
     fn buffer_insert(&self, id: u64, vector: Vec<f32>, payload: Option<Vec<u8>>) {
-        let _ = self.store.put_vector(id, &vector);
+        if let Err(e) = self.store.put_vector(id, &vector) {
+            tracing::error!("PerCollectionIndexHandle::buffer_insert put_vector failed: {e}");
+        }
         if let Some(ref p) = payload {
-            let _ = self.store.put_payload(id, p);
+            if let Err(e) = self.store.put_payload(id, p) {
+                tracing::error!("PerCollectionIndexHandle::buffer_insert put_payload failed: {e}");
+            }
         }
         if let Ok(idx) = self.index.try_read() {
             idx.buffer_insert(id, vector);
@@ -190,7 +194,9 @@ impl IndexBufferHandle for PerCollectionIndexHandle {
     }
 
     fn buffer_delete(&self, ids: &[u64]) {
-        let _ = self.store.delete(ids);
+        if let Err(e) = self.store.delete(ids) {
+            tracing::error!("PerCollectionIndexHandle::buffer_delete failed: {e}");
+        }
         if let Ok(idx) = self.index.try_read() {
             idx.buffer_delete(ids);
         }
@@ -259,6 +265,8 @@ impl Coordinator {
 
     /// Set the metadata Raft node (partition_id = METADATA_PARTITION_ID).
     pub async fn set_metadata_raft(&self, node: Arc<RaftNode>) {
+        let pid = node.partition_id();
+        self.raft_nodes.insert(pid, node.clone());
         *self.metadata_raft_node.write().await = Some(node);
     }
 
@@ -346,23 +354,65 @@ impl Coordinator {
 
         Ok(())
     }
-
-    /// List all collections from the metadata Raft state.
+    /// List all collections: merges metadata Raft state with local collection contexts.
     pub async fn list_collections(&self) -> Result<Vec<CollectionMetadata>, RekhaError> {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut result: Vec<CollectionMetadata> = Vec::new();
+
+        // Add collections from the local coordinator map (includes "default").
+        for (name, ctx) in self.collections.read().await.iter() {
+            if seen.insert(name.clone()) {
+                result.push(ctx.metadata.clone());
+            }
+        }
+
+        // Also include any collections from the metadata Raft state that aren't local yet.
         let meta_node = self.metadata_raft_node.read().await.clone();
         if let Some(ref meta_node) = meta_node {
             let state = meta_node.read_state().await;
-            let mut result: Vec<CollectionMetadata> = state.collections.values().cloned().collect();
-            result.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(result)
-        } else {
-            Ok(Vec::new())
+            for meta in state.collections.values() {
+                if seen.insert(meta.name.clone()) {
+                    result.push(meta.clone());
+                }
+            }
         }
+
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
     }
 
-    /// Check if a collection exists locally.
+    /// Check if a collection exists locally or in the metadata Raft state.
     pub async fn collection_exists(&self, name: &str) -> bool {
-        self.collections.read().await.contains_key(name)
+        if self.collections.read().await.contains_key(name) {
+            return true;
+        }
+        // Check metadata Raft state (may have been replicated but not yet initialized locally).
+        let meta_node = self.metadata_raft_node.read().await.clone();
+        if let Some(ref meta_node) = meta_node {
+            let state = meta_node.read_state().await;
+            if state.collections.contains_key(name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove local collection context without proposing to metadata Raft.
+    /// Used by the metadata Raft callback when DropCollection is replicated.
+    pub(crate) async fn remove_collection_ctx(&self, name: &str) {
+        if name == "default" {
+            return;
+        }
+        let ctx = self.collections.write().await.remove(name);
+        if let Some(ctx) = ctx {
+            if let Err(e) = ctx.store.delete_all_in_namespace() {
+                tracing::warn!("Failed to delete collection data for '{name}': {e}");
+            }
+            for entry in ctx.shard_raft_nodes.iter() {
+                self.raft_nodes.remove(entry.key());
+            }
+            info!("Removed local collection context: {name}");
+        }
     }
 
     /// Initialize a local collection context (index + store + Raft nodes).
@@ -411,12 +461,15 @@ impl Coordinator {
         for shard in 0..num_shards {
             let state = rekha_raft::ReplicatedState::new(shard);
             let node_id = &self.config.cluster.node_id;
+            let bind_port = self.config.cluster.bind_addr.split(':').nth(1).unwrap_or("");
             let peers: Vec<String> = self
                 .config
                 .cluster
                 .seed_nodes
                 .iter()
-                .filter(|s| !s.starts_with(node_id))
+                .filter(|s| {
+                    !s.starts_with(node_id) && !s.ends_with(&format!(":{bind_port}"))
+                })
                 .cloned()
                 .collect();
             let is_single_node = peers.is_empty();
@@ -473,7 +526,7 @@ impl Coordinator {
     }
 
     /// Get a collection context by name.
-    pub(crate) async fn get_collection(
+    pub async fn get_collection(
         &self,
         name: &str,
     ) -> Result<Arc<CollectionCtx>, RekhaError> {
@@ -731,7 +784,7 @@ impl Coordinator {
         }
 
         // Phase 3: Re-rank with exact distances.
-        candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+        candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
         candidates.truncate(k * 2);
 
         let metric = DistanceMetric::L2;
@@ -742,7 +795,7 @@ impl Coordinator {
                 candidate.score = exact_dist;
             }
         }
-        candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+        candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
         candidates.truncate(k);
 
         stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;

@@ -1,7 +1,7 @@
 use rekha_core::{
-    ClusterTopology, CollectionConfig, CollectionMeta, DistanceMetric, IndexBufferHandle,
-    NodeInfo, NodeStatus, Payload, RekhaError, ScoredPoint, SearchParams, SearchStats,
-    VectorIndex, VectorStoreBackend,
+    ClusterTopology, CollectionConfig, CollectionMeta, DistanceMetric, IndexBufferHandle, NodeInfo,
+    NodeStatus, Payload, RekhaError, ScoredPoint, SearchParams, SearchStats, VectorIndex,
+    VectorStoreBackend,
 };
 use rekha_index::RekhaIndex;
 use rekha_partition::PartitionManager;
@@ -331,7 +331,10 @@ impl Coordinator {
             ));
             raft_nodes.insert(shard, raft_node);
         }
-        info!("Created {} Raft nodes for collection '{}'", num_shards, name);
+        info!(
+            "Created {} Raft nodes for collection '{}'",
+            num_shards, name
+        );
 
         let state = CollectionState {
             config: config.clone(),
@@ -351,9 +354,10 @@ impl Coordinator {
 
     /// Drop a collection and all its data.
     pub async fn drop_collection(&self, name: &str) -> Result<(), RekhaError> {
-        let state = self.collections.remove(name).ok_or_else(|| {
-            RekhaError::NotFound(format!("collection '{name}' not found"))
-        })?;
+        let state = self
+            .collections
+            .remove(name)
+            .ok_or_else(|| RekhaError::NotFound(format!("collection '{name}' not found")))?;
 
         if let Err(e) = state.1.store.delete_all_in_namespace() {
             warn!("Failed to delete all data in collection '{name}': {e}");
@@ -367,12 +371,10 @@ impl Coordinator {
 
     /// List all collections.
     pub async fn list_collections(&self) -> Vec<CollectionMeta> {
-        self.store
-            .list_collections()
-            .unwrap_or_else(|e| {
-                warn!("Failed to list collections: {e}");
-                Vec::new()
-            })
+        self.store.list_collections().unwrap_or_else(|e| {
+            warn!("Failed to list collections: {e}");
+            Vec::new()
+        })
     }
 
     /// Check if a collection exists by name.
@@ -388,9 +390,7 @@ impl Coordinator {
 
     /// Get collection config.
     pub fn collection_config(&self, name: &str) -> Option<CollectionConfig> {
-        self.collections
-            .get(name)
-            .map(|s| s.config.clone())
+        self.collections.get(name).map(|s| s.config.clone())
     }
 
     /// Get a collection's namespaced store.
@@ -442,8 +442,7 @@ impl Coordinator {
             let name = meta.name.clone();
             let config = meta.config.clone();
             let namespaced_store = self.namespaced_store(&name);
-            let raft_log_store =
-                RaftLogStore::with_namespace(self.store.clone(), name.clone());
+            let raft_log_store = RaftLogStore::with_namespace(self.store.clone(), name.clone());
             let dim = (config.dim_group_size as usize) * (config.num_dim_groups as usize);
 
             let index = match RekhaIndex::new(
@@ -476,7 +475,10 @@ impl Coordinator {
             info!("Recovered collection '{}' from storage", name);
         }
         *self.initialized.write().await = true;
-        info!("Coordinator initialized with {} collections", collections.len());
+        info!(
+            "Coordinator initialized with {} collections",
+            collections.len()
+        );
     }
 
     pub async fn is_initialized(&self) -> bool {
@@ -608,7 +610,12 @@ impl Coordinator {
     }
 
     /// Register a Raft node for a specific collection + partition.
-    pub fn register_raft_node(&self, collection_name: &str, partition_id: u64, node: Arc<RaftNode>) {
+    pub fn register_raft_node(
+        &self,
+        collection_name: &str,
+        partition_id: u64,
+        node: Arc<RaftNode>,
+    ) {
         if let Some(state) = self.collections.get(collection_name) {
             state.raft_nodes.insert(partition_id, node);
         }
@@ -1130,14 +1137,14 @@ mod tests {
             .unwrap();
 
         let store_a = coord.collection_store("srch_a").unwrap();
-        let mut index_a = RekhaIndex::new(
-            64, 4, 16, 4, (*store_a).clone(), DistanceMetric::L2,
-        )
-        .unwrap();
+        let mut index_a =
+            RekhaIndex::new(64, 4, 16, 4, (*store_a).clone(), DistanceMetric::L2).unwrap();
         for i in 0..5 {
             let v: Vec<f32> = (0..64).map(|d| (i * 10 + d) as f32).collect();
             index_a.add_vector_for_test(i, v);
-            store_a.put_vector(i, &(0..64).map(|d| (i * 10 + d) as f32).collect::<Vec<_>>()).unwrap();
+            store_a
+                .put_vector(i, &(0..64).map(|d| (i * 10 + d) as f32).collect::<Vec<_>>())
+                .unwrap();
         }
         index_a.build().unwrap();
         if let Some(state) = coord.collections.get("srch_a") {
@@ -1179,10 +1186,7 @@ mod tests {
             .insert_into_collection("del_col", 1, vec![1.0], None)
             .await
             .unwrap();
-        let count = coord
-            .delete_from_collection("del_col", &[1])
-            .await
-            .unwrap();
+        let count = coord.delete_from_collection("del_col", &[1]).await.unwrap();
         assert_eq!(count, 1);
         let store = coord.collection_store("del_col").unwrap();
         assert!(store.get_vector(1).unwrap().is_none());
@@ -1204,7 +1208,12 @@ mod tests {
             .await
             .unwrap();
         coord
-            .insert_into_collection("fetch_col", 10, vec![1.0, 2.0], Some(Payload::from_bytes(b"data".to_vec())))
+            .insert_into_collection(
+                "fetch_col",
+                10,
+                vec![1.0, 2.0],
+                Some(Payload::from_bytes(b"data".to_vec())),
+            )
             .await
             .unwrap();
         let results = coord

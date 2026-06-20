@@ -45,7 +45,11 @@ impl RekhaService {
     }
 
     fn collection_name(req: &str) -> &str {
-        if req.is_empty() { "default" } else { req }
+        if req.is_empty() {
+            "default"
+        } else {
+            req
+        }
     }
 }
 
@@ -678,7 +682,10 @@ mod tests {
         let cmd = super::proto_raft_command_to_internal(proto_cmd);
         match cmd {
             rekha_raft::state::RaftCommand::Insert {
-                id, vector, payload, ..
+                id,
+                vector,
+                payload,
+                ..
             } => {
                 assert_eq!(id, 42);
                 assert_eq!(vector, vec![1.0, 2.0, 3.0]);
@@ -724,17 +731,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_collection_handler() {
-        let config = crate::config::ServerConfig::dev_default("test-node",
-            "/tmp/rekha_svc_create_test");
+        let config =
+            crate::config::ServerConfig::dev_default("test-node", "/tmp/rekha_svc_create_test");
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open("/tmp/rekha_svc_create_db").unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(
-            config, store, pm,
-        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         let service = RekhaService::new(coord);
 
         let req = tonic::Request::new(CreateCollectionRequest {
@@ -770,9 +775,7 @@ mod tests {
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(
-            config, store, pm,
-        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         let service = RekhaService::new(coord);
 
         let req = tonic::Request::new(ListCollectionsRequest {});
@@ -804,17 +807,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_collection_exists_handler() {
-        let config = crate::config::ServerConfig::dev_default("test-node",
-            "/tmp/rekha_svc_exists_test");
+        let config =
+            crate::config::ServerConfig::dev_default("test-node", "/tmp/rekha_svc_exists_test");
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open("/tmp/rekha_svc_exists_db").unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(
-            config, store, pm,
-        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         let service = RekhaService::new(coord);
 
         // Non-existent collection
@@ -857,17 +858,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_with_collection() {
-        let config = crate::config::ServerConfig::dev_default("test-node",
-            "/tmp/rekha_svc_ins_test");
+        let config =
+            crate::config::ServerConfig::dev_default("test-node", "/tmp/rekha_svc_ins_test");
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open("/tmp/rekha_svc_ins_db").unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(
-            config, store, pm,
-        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         coord.create_default_collection().await.unwrap();
         let service = RekhaService::new(coord);
 
@@ -883,17 +882,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_collection_handler() {
-        let config = crate::config::ServerConfig::dev_default("test-node",
-            "/tmp/rekha_svc_drop_test");
+        let config =
+            crate::config::ServerConfig::dev_default("test-node", "/tmp/rekha_svc_drop_test");
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open("/tmp/rekha_svc_drop_db").unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(
-            config, store, pm,
-        ));
+        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
         let service = RekhaService::new(coord);
 
         // Create then drop

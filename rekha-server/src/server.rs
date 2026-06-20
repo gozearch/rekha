@@ -151,12 +151,9 @@ impl ServerInstance {
                     match tonic::transport::Channel::from_shared(endpoint) {
                         Ok(ch) => match ch.connect().await {
                             Ok(ch) => {
-                                let mut client =
-                                    crate::proto::rekha_client::RekhaClient::new(ch);
+                                let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
                                 let (raft_term, commit_idx) =
-                                    if let Some(raft_node) =
-                                        coordinator.raft_node("default", 0)
-                                    {
+                                    if let Some(raft_node) = coordinator.raft_node("default", 0) {
                                         (
                                             raft_node.current_term().await,
                                             raft_node.commit_index().await,
@@ -246,18 +243,18 @@ impl ServerInstance {
 
                                 for peer_addr in &peers {
                                     let endpoint = format!("http://{}", peer_addr);
-                                    let ch =
-                                        match tonic::transport::Channel::from_shared(endpoint) {
-                                            Ok(e) => match e
-                                                .connect_timeout(Duration::from_secs(2))
-                                                .connect()
-                                                .await
-                                            {
-                                                Ok(ch) => ch,
-                                                Err(_) => continue,
-                                            },
+                                    let ch = match tonic::transport::Channel::from_shared(endpoint)
+                                    {
+                                        Ok(e) => match e
+                                            .connect_timeout(Duration::from_secs(2))
+                                            .connect()
+                                            .await
+                                        {
+                                            Ok(ch) => ch,
                                             Err(_) => continue,
-                                        };
+                                        },
+                                        Err(_) => continue,
+                                    };
                                     let mut client =
                                         crate::proto::rekha_client::RekhaClient::new(ch);
                                     let req = tonic::Request::new(RaftVoteRequest {
@@ -324,15 +321,15 @@ impl ServerInstance {
                             let endpoint = format!("http://{}", peer_addr);
                             let ch = match tonic::transport::Channel::from_shared(endpoint) {
                                 Ok(e) => {
-                                    match e.connect_timeout(Duration::from_secs(2)).connect().await {
+                                    match e.connect_timeout(Duration::from_secs(2)).connect().await
+                                    {
                                         Ok(ch) => ch,
                                         Err(_) => continue,
                                     }
                                 }
                                 Err(_) => continue,
                             };
-                            let mut client =
-                                crate::proto::rekha_client::RekhaClient::new(ch);
+                            let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
                             let req = tonic::Request::new(crate::proto::AppendEntriesRequest {
                                 partition_id: pid,
                                 leader_term: term,
@@ -380,16 +377,14 @@ impl ServerInstance {
                 .as_ref()
                 .ok_or_else(|| "TLS enabled but key_path not configured".to_string())?;
 
-            let cert =
-                std::fs::read(cert_path).map_err(|e| format!("failed to read cert: {e}"))?;
-            let key =
-                std::fs::read(key_path).map_err(|e| format!("failed to read key: {e}"))?;
+            let cert = std::fs::read(cert_path).map_err(|e| format!("failed to read cert: {e}"))?;
+            let key = std::fs::read(key_path).map_err(|e| format!("failed to read key: {e}"))?;
             let identity = Identity::from_pem(cert, key);
 
             let mut tls_config = ServerTlsConfig::new().identity(identity);
             if let Some(ca_path) = &self.config.tls.ca_cert_path {
-                let ca_cert = std::fs::read(ca_path)
-                    .map_err(|e| format!("failed to read CA cert: {e}"))?;
+                let ca_cert =
+                    std::fs::read(ca_path).map_err(|e| format!("failed to read CA cert: {e}"))?;
                 tls_config =
                     tls_config.client_ca_root(tonic::transport::Certificate::from_pem(ca_cert));
             }

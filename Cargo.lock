@@ -1619,6 +1619,7 @@ name = "rekha-storage"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "bincode",
  "byteorder",
  "proptest",
  "rand 0.8.6",

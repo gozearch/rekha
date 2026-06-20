@@ -139,12 +139,13 @@ impl RocksVectorStore {
         let value = bincode::serialize(meta).map_err(|e| RekhaError::Internal {
             detail: format!("failed to serialize collection meta: {e}"),
         })?;
-        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_METADATA.into(),
                 source: "handle not found".into(),
-            }
-        })?;
+            })?;
         self.db.put_cf(&cf, key, value).map_err(|e| {
             StorageError::Write {
                 source: e.to_string(),
@@ -156,19 +157,19 @@ impl RocksVectorStore {
     /// Load collection metadata by name.
     pub fn load_collection_meta(&self, name: &str) -> Result<Option<CollectionMeta>, RekhaError> {
         let key = Self::collection_meta_key(name);
-        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_METADATA.into(),
                 source: "handle not found".into(),
-            }
-        })?;
+            })?;
         match self.db.get_cf(&cf, key) {
             Ok(Some(bytes)) => {
-                let meta: CollectionMeta = bincode::deserialize(&bytes).map_err(|e| {
-                    RekhaError::Internal {
+                let meta: CollectionMeta =
+                    bincode::deserialize(&bytes).map_err(|e| RekhaError::Internal {
                         detail: format!("failed to deserialize collection meta: {e}"),
-                    }
-                })?;
+                    })?;
                 Ok(Some(meta))
             }
             Ok(None) => Ok(None),
@@ -183,19 +184,17 @@ impl RocksVectorStore {
     /// List all collection names by scanning the metadata CF with prefix `collection:`.
     pub fn list_collections(&self) -> Result<Vec<CollectionMeta>, RekhaError> {
         let prefix = b"collection:";
-        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_METADATA.into(),
                 source: "handle not found".into(),
-            }
-        })?;
+            })?;
         let mut collections = Vec::new();
         let iter = self.db.iterator_cf(
             &cf,
-            rocksdb::IteratorMode::From(
-                prefix,
-                rocksdb::Direction::Forward,
-            ),
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
         );
         for result in iter {
             let (key, value) = result.map_err(|e| RekhaError::Internal {
@@ -214,12 +213,13 @@ impl RocksVectorStore {
     /// Delete collection metadata by name.
     pub fn delete_collection_meta(&self, name: &str) -> Result<(), RekhaError> {
         let key = Self::collection_meta_key(name);
-        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
-            StorageError::ColumnFamily {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StorageError::ColumnFamily {
                 name: CF_METADATA.into(),
                 source: "handle not found".into(),
-            }
-        })?;
+            })?;
         self.db.delete_cf(&cf, key).map_err(|e| {
             StorageError::Write {
                 source: e.to_string(),

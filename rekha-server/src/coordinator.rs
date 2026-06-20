@@ -847,6 +847,14 @@ impl Coordinator {
             RekhaError::NotFound(format!("collection '{collection_name}' not found"))
         })?;
 
+        let expected_dim = state.config.dim as usize;
+        if vector.len() != expected_dim {
+            return Err(RekhaError::InvalidDimension {
+                expected: expected_dim,
+                actual: vector.len(),
+            });
+        }
+
         let id = if id == 0 {
             state.next_auto_id.fetch_add(1, Ordering::SeqCst)
         } else {

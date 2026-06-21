@@ -309,9 +309,14 @@ impl RekhaClient {
                 top_k: top_k as u32,
                 params: Some(proto::SearchParams {
                     ef_search: params.ef_search as u32,
-                    beam_width: params.beam_width as u32,
+                    nprobe: params.nprobe as u32,
                     include_payloads: params.include_payloads,
                     partition_hint: params.partition_hint,
+                    plan: match params.plan {
+                        rekha_core::PlanType::DimensionBased => 1,
+                        rekha_core::PlanType::Hybrid => 2,
+                        _ => 0,
+                    },
                 }),
                 local_only,
             });

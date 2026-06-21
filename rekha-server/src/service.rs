@@ -182,7 +182,12 @@ impl Rekha for RekhaService {
 
         let search_params = SearchParams {
             ef_search: params.ef_search as usize,
-            beam_width: params.beam_width as usize,
+            nprobe: params.nprobe as usize,
+            plan: match params.plan {
+                1 => rekha_core::PlanType::DimensionBased,
+                2 => rekha_core::PlanType::Hybrid,
+                _ => rekha_core::PlanType::VectorBased,
+            },
             include_payloads: params.include_payloads,
             partition_hint: params.partition_hint,
             local_only: req.local_only,
@@ -232,7 +237,12 @@ impl Rekha for RekhaService {
 
         let search_params = SearchParams {
             ef_search: params.ef_search as usize,
-            beam_width: params.beam_width as usize,
+            nprobe: params.nprobe as usize,
+            plan: match params.plan {
+                1 => rekha_core::PlanType::DimensionBased,
+                2 => rekha_core::PlanType::Hybrid,
+                _ => rekha_core::PlanType::VectorBased,
+            },
             include_payloads: params.include_payloads,
             partition_hint: params.partition_hint,
             local_only: req.local_only,
@@ -940,8 +950,8 @@ mod tests {
                 replication_factor: 1,
                 num_dim_groups: 1,
                 dim_group_size: 8,
-                graph_degree: 32,
-                search_list_size: 100,
+                nlist: 16,
+                nprobe: 4,
                 pq_num_sub_vectors: 4,
                 pq_num_centroids: 256,
                 re_rank_k: 200,

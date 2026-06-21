@@ -98,9 +98,10 @@ message FetchResponse {
 
 message SearchParams {
     uint32 ef_search = 1;
-    uint32 beam_width = 2;
+    uint32 nprobe = 2;
     bool include_payloads = 3;
     optional uint64 partition_hint = 4;
+    uint32 plan = 5;
 }
 
 message SearchRequest {
@@ -230,8 +231,8 @@ message CollectionConfig {
     uint64 replication_factor = 3;
     uint32 num_dim_groups = 4;
     uint32 dim_group_size = 5;
-    uint32 graph_degree = 6;
-    uint32 search_list_size = 7;
+    uint32 nlist = 6;
+    uint32 nprobe = 7;
     uint32 pq_num_sub_vectors = 8;
     uint32 pq_num_centroids = 9;
     uint32 re_rank_k = 10;

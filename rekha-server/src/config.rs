@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Top-level server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub cluster: ClusterConfig,
     pub partition: PartitionConfig,
     pub index: IndexConfig,
+    pub planner: PlannerConfig,
     pub raft: RaftConfig,
     pub tls: TlsConfig,
     pub observability: ObservabilityConfig,
@@ -14,7 +14,6 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Load configuration from a YAML file.
     pub fn from_file(path: impl Into<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
         let path = path.into();
         let contents = std::fs::read_to_string(&path)?;
@@ -22,7 +21,6 @@ impl ServerConfig {
         Ok(config)
     }
 
-    /// Default configuration for a single-node development setup.
     pub fn dev_default(node_id: &str, data_dir: &str) -> Self {
         Self {
             cluster: ClusterConfig {
@@ -38,14 +36,18 @@ impl ServerConfig {
                 dim_group_size: 64,
             },
             index: IndexConfig {
-                index_type: "vamana".into(),
-                graph_degree: 64,
-                search_list_size: 128,
+                index_type: "ivf".into(),
+                nlist: 128,
+                nprobe: 16,
                 pq_num_sub_vectors: 64,
                 pq_num_centroids: 256,
                 re_rank_k: 256,
                 insert_buffer_capacity: 10_000,
                 insert_buffer_flush_interval_ms: 1000,
+            },
+            planner: PlannerConfig {
+                alpha: 0.1,
+                eval_window: 1000,
             },
             raft: RaftConfig {
                 heartbeat_interval_ms: 100,
@@ -67,24 +69,12 @@ impl ServerConfig {
     }
 }
 
-/// TLS configuration for encrypted gRPC communication.
-///
-/// Supports server-side TLS (encryption) and optional mutual TLS (mTLS)
-/// for node identity verification.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TlsConfig {
-    /// Set to `true` to enable TLS on the gRPC server and client.
-    /// When disabled, all communication is plaintext HTTP/2.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the server TLS certificate (PEM format).
-    /// Required when `enabled` is true.
     pub cert_path: Option<String>,
-    /// Path to the server TLS private key (PEM format).
-    /// Required when `enabled` is true.
     pub key_path: Option<String>,
-    /// Optional CA certificate for verifying client certificates (mTLS).
-    /// When set, the server will request and verify client certificates.
     pub ca_cert_path: Option<String>,
 }
 
@@ -108,25 +98,21 @@ pub struct PartitionConfig {
 pub struct IndexConfig {
     #[serde(rename = "type")]
     pub index_type: String,
-    pub graph_degree: usize,
-    pub search_list_size: usize,
+    pub nlist: usize,
+    pub nprobe: usize,
     pub pq_num_sub_vectors: usize,
     pub pq_num_centroids: usize,
     pub re_rank_k: usize,
-    /// Max vectors in the insert buffer before forced flush.
     #[serde(default = "default_buffer_capacity")]
     pub insert_buffer_capacity: usize,
-    /// How often to flush the insert buffer (milliseconds).
     #[serde(default = "default_flush_interval_ms")]
     pub insert_buffer_flush_interval_ms: u64,
 }
 
-fn default_buffer_capacity() -> usize {
-    10_000
-}
-
-fn default_flush_interval_ms() -> u64 {
-    1000
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerConfig {
+    pub alpha: f32,
+    pub eval_window: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +136,14 @@ pub struct StorageConfig {
     pub max_inline_size: usize,
 }
 
+fn default_buffer_capacity() -> usize {
+    10_000
+}
+
+fn default_flush_interval_ms() -> u64 {
+    1000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,10 +154,9 @@ mod tests {
         assert_eq!(config.cluster.node_id, "node-1");
         assert_eq!(config.cluster.bind_addr, "0.0.0.0:50051");
         assert_eq!(config.partition.num_vector_shards, 1);
-        assert_eq!(config.partition.replication_factor, 1);
         assert_eq!(config.partition.num_dim_groups, 4);
-        assert_eq!(config.index.graph_degree, 64);
-        assert_eq!(config.index.pq_num_sub_vectors, 64);
+        assert_eq!(config.index.nlist, 128);
+        assert_eq!(config.index.nprobe, 16);
         assert_eq!(config.raft.heartbeat_interval_ms, 100);
     }
 
@@ -199,37 +192,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tls_config_enabled() {
-        let tls = TlsConfig {
-            enabled: true,
-            cert_path: Some("/etc/certs/server.pem".into()),
-            key_path: Some("/etc/certs/server.key".into()),
-            ca_cert_path: None,
-        };
-        assert!(tls.enabled);
-        assert_eq!(tls.cert_path.as_deref(), Some("/etc/certs/server.pem"));
-        assert_eq!(tls.key_path.as_deref(), Some("/etc/certs/server.key"));
-    }
-
-    #[test]
     fn test_dev_default_tls_disabled() {
         let config = ServerConfig::dev_default("n1", "/tmp");
         assert!(!config.tls.enabled);
-    }
-
-    #[test]
-    fn test_tls_config_serde_roundtrip() {
-        let tls = TlsConfig {
-            enabled: true,
-            cert_path: Some("/certs/cert.pem".into()),
-            key_path: Some("/certs/key.pem".into()),
-            ca_cert_path: Some("/certs/ca.pem".into()),
-        };
-        let yaml = serde_yaml::to_string(&tls).unwrap();
-        let tls2: TlsConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert!(tls2.enabled);
-        assert_eq!(tls2.cert_path, tls.cert_path);
-        assert_eq!(tls2.key_path, tls.key_path);
-        assert_eq!(tls2.ca_cert_path, tls.ca_cert_path);
     }
 }

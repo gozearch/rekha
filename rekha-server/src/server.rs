@@ -101,9 +101,10 @@ impl ServerInstance {
         let dim = config.partition.dim_group_size * config.partition.num_dim_groups as usize;
         let index = RekhaIndex::new(
             dim,
+            config.index.nlist,
+            config.index.nprobe,
             config.index.pq_num_sub_vectors,
             config.index.pq_num_centroids,
-            config.index.graph_degree,
             (*store).clone(),
             rekha_core::DistanceMetric::L2,
         )?;
@@ -421,6 +422,7 @@ impl ServerInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rekha_core::VectorIndex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -449,11 +451,11 @@ mod tests {
         let server = ServerInstance::from_config(config).await.unwrap();
         let store = rekha_storage::RocksVectorStore::open(temp_dir()).unwrap();
         let mut index =
-            rekha_index::RekhaIndex::new(8, 4, 16, 4, store, rekha_core::DistanceMetric::L2)
+            rekha_index::RekhaIndex::new(8, 4, 2, 4, 16, store, rekha_core::DistanceMetric::L2)
                 .unwrap();
         for i in 0..5 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.add_vector_for_test(i, v);
+            index.insert(i, &v).unwrap();
         }
         index.build().unwrap();
         let server = server.with_index(index).await;

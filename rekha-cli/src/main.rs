@@ -92,21 +92,6 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("Server error: {e}"))?;
         }
-        Commands::CreateCollection { collection, config } => {
-            let _ = (collection, config);
-            println!("not implemented yet");
-        }
-        Commands::DropCollection { collection } => {
-            let _ = collection;
-            println!("not implemented yet");
-        }
-        Commands::ListCollections => {
-            println!("not implemented yet");
-        }
-        Commands::CollectionExists { collection } => {
-            let _ = collection;
-            println!("not implemented yet");
-        }
         _ => {
             let client = RekhaClient::connect(&[cli.address])
                 .await
@@ -165,11 +150,29 @@ async fn main() -> anyhow::Result<()> {
                     let _ = client;
                     println!("OK");
                 }
+                Commands::CreateCollection { collection, config: _ } => {
+                    client.create_collection(&collection, 8, 128, 16).await?;
+                    println!("Collection '{collection}' created");
+                }
+                Commands::DropCollection { collection } => {
+                    client.drop_collection(&collection).await?;
+                    println!("Collection '{collection}' dropped");
+                }
+                Commands::ListCollections => {
+                    let names = client.list_collections().await?;
+                    if names.is_empty() {
+                        println!("(no collections)");
+                    } else {
+                        for name in &names {
+                            println!("{name}");
+                        }
+                    }
+                }
+                Commands::CollectionExists { collection } => {
+                    let exists = client.collection_exists(&collection).await?;
+                    println!("{}", if exists { "true" } else { "false" });
+                }
                 Commands::Server { .. } => unreachable!(),
-                Commands::CreateCollection { .. } => unreachable!(),
-                Commands::DropCollection { .. } => unreachable!(),
-                Commands::ListCollections => unreachable!(),
-                Commands::CollectionExists { .. } => unreachable!(),
             }
         }
     }

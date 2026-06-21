@@ -8,8 +8,9 @@ use tracing::info;
 use tonic::transport::ClientTlsConfig;
 
 use crate::proto::{
-    self, rekha_client::RekhaClient as GrpcClient, FetchRequest, InsertRequest, SearchRequest,
-    SearchResponse,
+    self, rekha_client::RekhaClient as GrpcClient, CollectionExistsRequest,
+    CreateCollectionRequest, DropCollectionRequest, FetchRequest, InsertRequest,
+    ListCollectionsRequest, SearchRequest, SearchResponse,
 };
 
 /// A user-friendly client for the Rekha distributed vector database.
@@ -311,12 +312,6 @@ impl RekhaClient {
                     ef_search: params.ef_search as u32,
                     nprobe: params.nprobe as u32,
                     include_payloads: params.include_payloads,
-                    partition_hint: params.partition_hint,
-                    plan: match params.plan {
-                        rekha_core::PlanType::DimensionBased => 1,
-                        rekha_core::PlanType::Hybrid => 2,
-                        _ => 0,
-                    },
                 }),
                 local_only,
             });
@@ -416,6 +411,74 @@ impl RekhaClient {
     /// Get cluster topology information.
     pub async fn cluster_info(&self) -> Result<(), RekhaError> {
         Ok(())
+    }
+
+    pub async fn create_collection(
+        &self, name: &str, dim: u32, nlist: u32, nprobe: u32,
+    ) -> Result<bool, RekhaError> {
+        let ch = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("create_collection", move || {
+            let request = tonic::Request::new(CreateCollectionRequest {
+                name: name.clone(),
+                config: Some(crate::proto::CollectionConfig {
+                    dim,
+                    num_vector_shards: 1,
+                    replication_factor: 1,
+                    num_dim_groups: 4,
+                    dim_group_size: dim / 4,
+                    nlist,
+                    nprobe,
+                    pq_num_sub_vectors: 4,
+                    pq_num_centroids: 256,
+                    re_rank_k: 256,
+                }),
+            });
+            let mut client = GrpcClient::new(ch.clone());
+            async move {
+                client.create_collection(request).await
+                    .map(|r| r.into_inner().success)
+            }
+        }).await
+    }
+
+    pub async fn list_collections(&self) -> Result<Vec<String>, RekhaError> {
+        let ch = self.channel.read().await.clone();
+        self.with_retry("list_collections", move || {
+            let request = tonic::Request::new(ListCollectionsRequest {});
+            let mut client = GrpcClient::new(ch.clone());
+            async move {
+                client.list_collections(request).await.map(|r| {
+                    r.into_inner().collections.into_iter().map(|c| c.name).collect()
+                })
+            }
+        }).await
+    }
+
+    pub async fn collection_exists(&self, name: &str) -> Result<bool, RekhaError> {
+        let ch = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("collection_exists", move || {
+            let request = tonic::Request::new(CollectionExistsRequest { name: name.clone() });
+            let mut client = GrpcClient::new(ch.clone());
+            async move {
+                client.collection_exists(request).await
+                    .map(|r| r.into_inner().exists)
+            }
+        }).await
+    }
+
+    pub async fn drop_collection(&self, name: &str) -> Result<bool, RekhaError> {
+        let ch = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("drop_collection", move || {
+            let request = tonic::Request::new(DropCollectionRequest { name: name.clone() });
+            let mut client = GrpcClient::new(ch.clone());
+            async move {
+                client.drop_collection(request).await
+                    .map(|r| r.into_inner().success)
+            }
+        }).await
     }
 }
 

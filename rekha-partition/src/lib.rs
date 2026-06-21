@@ -1,5 +1,5 @@
 pub mod manager;
-pub mod strategy;
+pub mod ring;
 
 pub use manager::PartitionManager;
-pub use strategy::MultiGranularityStrategy;
+pub use ring::ConsistentHashRing;

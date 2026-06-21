@@ -1,17 +1,13 @@
 use rekha_core::{NodeInfo, NodeStatus, OwnedRange, PartitionError, RekhaError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-/// Manages partition-to-node assignments and cluster topology.
-///
-/// Tracks:
-/// - Which nodes own which (vector_shard, dim_group) pairs
-/// - Node health and leadership status
-/// - Dimension ranges assigned to each dimension group
+use crate::ring::ConsistentHashRing;
+
 pub struct PartitionManager {
     nodes: HashMap<String, NodeInfo>,
     topology: HashMap<(u64, u32), Vec<String>>,
     owned_ranges: HashMap<String, Vec<OwnedRange>>,
-    node_ring: Vec<String>,
+    ring: ConsistentHashRing,
     num_dim_groups: u32,
     dims_per_group: usize,
 }
@@ -29,7 +25,7 @@ impl PartitionManager {
             nodes,
             topology: HashMap::new(),
             owned_ranges: HashMap::new(),
-            node_ring: Vec::new(),
+            ring: ConsistentHashRing::new(128),
             num_dim_groups,
             dims_per_group,
         };
@@ -128,48 +124,36 @@ impl PartitionManager {
         &self.nodes
     }
 
-    pub fn healthy_ring_nodes(&self) -> Vec<&str> {
-        self.node_ring
-            .iter()
-            .filter(|id| {
-                self.nodes
-                    .get(*id)
-                    .map(|n| matches!(n.status, NodeStatus::Healthy))
-                    .unwrap_or(false)
-            })
-            .map(|s| s.as_str())
-            .collect()
-    }
-
     pub fn replicas_for(&self, shard: u64, rf: usize) -> Vec<&NodeInfo> {
-        let healthy = self.healthy_ring_nodes();
-        if healthy.is_empty() {
-            return vec![];
-        }
-        let n = healthy.len();
-        let start_idx = (shard as usize) % n;
-        let count = rf.min(n);
-        let mut replicas = Vec::with_capacity(count);
-        for i in 0..count {
-            let idx = (start_idx + i) % n;
-            if let Some(info) = self.nodes.get(healthy[idx]) {
-                replicas.push(info);
-            }
-        }
-        replicas
+        let healthy: HashSet<&str> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n.status, NodeStatus::Healthy))
+            .map(|(id, _)| id.as_str())
+            .collect();
+
+        let ids = self.ring.replicas_for(shard, rf, &healthy);
+        ids.iter()
+            .filter_map(|id| self.nodes.get(id))
+            .collect()
     }
 
     pub fn mark_node_down(&mut self, node_id: &str) {
         if let Some(info) = self.nodes.get_mut(node_id) {
             info.status = NodeStatus::Unreachable;
         }
-        self.rebuild_ring();
+        self.ring.remove_node(node_id);
     }
 
     fn rebuild_ring(&mut self) {
-        let mut sorted: Vec<String> = self.nodes.keys().cloned().collect();
-        sorted.sort();
-        self.node_ring = sorted;
+        self.ring = ConsistentHashRing::new(128);
+        for node_id in self.nodes.keys() {
+            self.ring.add_node(node_id);
+        }
+    }
+
+    pub fn node_ring_contains(&self, node_id: &str) -> bool {
+        self.nodes.contains_key(node_id)
     }
 }
 
@@ -441,8 +425,10 @@ mod tests {
         let manager = PartitionManager::new(nodes, 4, 768);
         let replicas = manager.replicas_for(0, 2);
         assert_eq!(replicas.len(), 2);
-        assert_eq!(replicas[0].node_id, "n0");
-        assert_eq!(replicas[1].node_id, "n1");
+        let mut ids: Vec<&str> = replicas.iter().map(|n| n.node_id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 2);
     }
 
     #[test]
@@ -469,8 +455,8 @@ mod tests {
         manager.mark_node_down("n1");
         let replicas = manager.replicas_for(0, 2);
         assert_eq!(replicas.len(), 2);
-        assert_eq!(replicas[0].node_id, "n0");
-        assert_eq!(replicas[1].node_id, "n2");
+        let ids: Vec<&str> = replicas.iter().map(|n| n.node_id.as_str()).collect();
+        assert!(!ids.contains(&"n1"));
     }
 
     #[test]
@@ -556,14 +542,12 @@ mod tests {
             },
         );
         let manager = PartitionManager::new(nodes, 4, 768);
-        // Ring should be sorted: [node-a, node-b]
-        let ring = manager.healthy_ring_nodes();
-        assert_eq!(ring, vec!["node-a", "node-b"]);
-        // shard 0 → node-a, shard 1 → node-b
         let replicas_0 = manager.replicas_for(0, 1);
-        assert_eq!(replicas_0[0].node_id, "node-a");
+        assert_eq!(replicas_0.len(), 1);
+        assert!(["node-a", "node-b"].contains(&replicas_0[0].node_id.as_str()));
         let replicas_1 = manager.replicas_for(1, 1);
-        assert_eq!(replicas_1[0].node_id, "node-b");
+        assert_eq!(replicas_1.len(), 1);
+        assert!(["node-a", "node-b"].contains(&replicas_1[0].node_id.as_str()));
     }
 
     #[test]
@@ -586,12 +570,14 @@ mod tests {
         );
         let mut manager = PartitionManager::new(nodes, 4, 768);
         manager.mark_node_down("n0");
-        assert!(manager.healthy_ring_nodes().is_empty());
+        let replicas = manager.replicas_for(0, 1);
+        assert!(replicas.is_empty());
     }
 
     #[test]
-    fn test_healthy_ring_nodes_empty() {
+    fn test_replicas_empty_when_no_nodes() {
         let manager = PartitionManager::new(HashMap::new(), 4, 768);
-        assert!(manager.healthy_ring_nodes().is_empty());
+        let replicas = manager.replicas_for(0, 1);
+        assert!(replicas.is_empty());
     }
 }

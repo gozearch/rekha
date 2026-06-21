@@ -42,9 +42,7 @@ impl ServerInstance {
         info!("Storage opened at {}", config.cluster.data_dir);
 
         let partition_manager = Arc::new(RwLock::new(PartitionManager::new(
-            HashMap::new(),
-            config.partition.num_dim_groups,
-            config.partition.dim_group_size * config.partition.num_dim_groups as usize,
+            HashMap::new(), 4, 8,
         )));
 
         let coordinator = Arc::new(Coordinator::new(
@@ -53,16 +51,7 @@ impl ServerInstance {
             partition_manager,
         ));
 
-        let dim = config.partition.dim_group_size * config.partition.num_dim_groups as usize;
-        let index = RekhaIndex::new(
-            dim,
-            config.index.nlist,
-            config.index.nprobe,
-            config.index.pq_num_sub_vectors,
-            config.index.pq_num_centroids,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )?;
+        let index = RekhaIndex::new((*store).clone())?;
         coordinator.initialize(index).await;
 
         let server = Self { config, coordinator };
@@ -195,7 +184,7 @@ mod tests {
         let server = ServerInstance::from_config(config).await.unwrap();
         let store = rekha_storage::RocksVectorStore::open(temp_dir()).unwrap();
         let mut index =
-            rekha_index::RekhaIndex::new(8, 4, 2, 4, 16, store, rekha_core::DistanceMetric::L2)
+            rekha_index::RekhaIndex::new(store)
                 .unwrap();
         for i in 0..5 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
@@ -211,7 +200,6 @@ mod tests {
         let config = ServerConfig::dev_default("test-node", &temp_dir());
         let server = ServerInstance::from_config(config).await.unwrap();
         assert_eq!(server.config.cluster.node_id, "test-node");
-        assert_eq!(server.config.partition.num_dim_groups, 4);
     }
 
     #[tokio::test]

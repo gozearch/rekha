@@ -115,39 +115,12 @@ impl std::str::FromStr for DistanceMetric {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum PartitionKey {
-    VectorId(u64),
-    DimensionRange(u32, u32),
-    Hybrid { vector_shard: u64, dim_group: u32 },
-}
-
-impl PartitionKey {
-    pub fn vector_shard(&self, num_shards: u64) -> u64 {
-        match self {
-            Self::VectorId(id) => id % num_shards,
-            Self::DimensionRange(_, _) => 0,
-            Self::Hybrid { vector_shard, .. } => *vector_shard % num_shards,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-pub enum PlanType {
-    #[default]
-    VectorBased,
-    DimensionBased,
-    Hybrid,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchParams {
     pub ef_search: usize,
     pub nprobe: usize,
-    pub plan: PlanType,
     pub include_payloads: bool,
     pub local_only: bool,
-    pub partition_hint: Option<u64>,
 }
 
 impl Default for SearchParams {
@@ -155,10 +128,8 @@ impl Default for SearchParams {
         Self {
             ef_search: 128,
             nprobe: 16,
-            plan: PlanType::default(),
             include_payloads: true,
             local_only: false,
-            partition_hint: None,
         }
     }
 }
@@ -300,23 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_key_vector_shard() {
-        let pk = PartitionKey::VectorId(42);
-        assert_eq!(pk.vector_shard(4), 2);
-        let pk = PartitionKey::DimensionRange(0, 128);
-        assert_eq!(pk.vector_shard(4), 0);
-        let pk = PartitionKey::Hybrid { vector_shard: 10, dim_group: 1 };
-        assert_eq!(pk.vector_shard(4), 2);
-    }
-
-    #[test]
     fn test_search_params_default() {
         let p = SearchParams::default();
         assert_eq!(p.ef_search, 128);
         assert_eq!(p.nprobe, 16);
-        assert_eq!(p.plan, PlanType::VectorBased);
         assert!(p.include_payloads);
-        assert!(p.partition_hint.is_none());
     }
 
     #[test]
@@ -325,11 +284,6 @@ mod tests {
         assert_eq!(r.dim_count(), 128);
         let r = OwnedRange { vector_shard: 1, dim_start: 128, dim_end: 64 };
         assert_eq!(r.dim_count(), 0);
-    }
-
-    #[test]
-    fn test_plan_type_default() {
-        assert_eq!(PlanType::default(), PlanType::VectorBased);
     }
 
     #[test]

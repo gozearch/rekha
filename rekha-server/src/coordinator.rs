@@ -1,5 +1,5 @@
 use rekha_core::{
-    ClusterTopology, DistanceMetric, NodeInfo, NodeStatus, Payload, PlanType,
+    ClusterTopology, CollectionConfig, DistanceMetric, NodeInfo, NodeStatus, Payload,
     RekhaError, ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
 };
 use rekha_index::RekhaIndex;
@@ -15,8 +15,6 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::config::ServerConfig;
-use crate::pipeline::DimensionPipeline;
-use crate::planner::QueryPlanner;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -150,7 +148,6 @@ pub struct Coordinator {
     peers: Arc<RwLock<HashMap<String, PeerState>>>,
     peer_pool: Arc<RwLock<PeerPool>>,
     next_auto_id: AtomicU64,
-    planner: Arc<RwLock<QueryPlanner>>,
 }
 
 impl Coordinator {
@@ -160,8 +157,6 @@ impl Coordinator {
             partition_manager: Arc<RwLock<PartitionManager>>,
         ) -> Self {
             let starting_id = Self::starting_auto_id(&store);
-            let alpha = config.planner.alpha;
-            let eval_window = config.planner.eval_window;
             Self {
                 config: config.clone(),
                 index: Arc::new(RwLock::new(None)),
@@ -176,7 +171,6 @@ impl Coordinator {
                 peers: Arc::new(RwLock::new(HashMap::new())),
                 peer_pool: Arc::new(RwLock::new(PeerPool::new("default"))),
                 next_auto_id: AtomicU64::new(starting_id),
-                planner: Arc::new(RwLock::new(QueryPlanner::new(alpha, eval_window))),
             }
     }
 
@@ -193,12 +187,32 @@ impl Coordinator {
             *idx = Some(index);
         }
         *self.initialized.write().await = true;
+
+        let default_key = "collection:default".to_string();
+        if self.store.get_metadata(&default_key).unwrap_or(None).is_none() {
+            let cfg = CollectionConfig {
+                dim: 8,
+                num_vector_shards: 6,
+                replication_factor: 1,
+                num_dim_groups: 4,
+                dim_group_size: 2,
+                nlist: 128,
+                nprobe: 16,
+                pq_num_sub_vectors: 4,
+                pq_num_centroids: 256,
+                re_rank_k: 256,
+            };
+            if let Ok(json) = serde_json::to_vec(&cfg) {
+                let _ = self.store.put_metadata(&default_key, &json);
+            }
+        }
+
         self.spawn_flush_loop();
         info!("Coordinator initialized");
     }
 
     fn spawn_flush_loop(&self) {
-        let flush_ms = self.config.index.insert_buffer_flush_interval_ms;
+        let flush_ms = 1000;
         let index = self.index.clone();
 
         tokio::spawn(async move {
@@ -220,11 +234,17 @@ impl Coordinator {
         });
     }
 
+    fn collection_dim(&self) -> Result<usize, RekhaError> {
+        let key = "collection:default".to_string();
+        let data = self.store.get_metadata(&key)?
+            .ok_or_else(|| RekhaError::NotFound("no default collection".into()))?;
+        let cfg: CollectionConfig = serde_json::from_slice(&data)
+            .map_err(|e| RekhaError::InvalidArgument(format!("bad collection config: {e}")))?;
+        Ok(cfg.dim as usize)
+    }
+
     pub async fn search(
-        &self,
-        query: Vec<f32>,
-        k: usize,
-        params: SearchParams,
+        &self, query: Vec<f32>, k: usize, params: SearchParams,
     ) -> Result<(Vec<ScoredPoint>, SearchStats), RekhaError> {
         let start = std::time::Instant::now();
         let mut stats = SearchStats::default();
@@ -234,55 +254,21 @@ impl Coordinator {
             detail: "index not initialized".into(),
         })?;
 
-        let num_groups = self.config.partition.num_dim_groups;
-        let load_variance = self.compute_load_variance().await;
-        let plan = self
-            .planner
-            .write()
-            .await
-            .select_plan(
-                load_variance,
-                query.len(),
-                num_groups,
-                self.config.partition.num_vector_shards,
-            );
-
-        let mut params = params;
-        params.plan = plan;
+        let expected = self.collection_dim()?;
+        if query.len() != expected {
+            return Err(RekhaError::InvalidDimension { expected, actual: query.len() });
+        }
 
         let mut candidates: Vec<ScoredPoint> = Vec::new();
-        let mut local_nodes = 0u32;
 
-        match plan {
-            PlanType::VectorBased => {
-                if let Ok((ids, dists)) = index.search(&query, k * 2, &params) {
-                    local_nodes = 1;
-                    for (i, id) in ids.iter().enumerate() {
-                        let score = dists.get(i).copied().unwrap_or(f32::MAX);
-                        let payload = self.maybe_load_payload(params.include_payloads, *id);
-                        candidates.push(ScoredPoint {
-                            id: *id,
-                            score,
-                            payload,
-                        });
-                    }
-                }
-            }
-            PlanType::DimensionBased | PlanType::Hybrid => {
-                if let Some(ivf) = index.ivf() {
-                    let pipeline = DimensionPipeline::new(num_groups, query.len());
-                    if let Ok((mut piped_candidates, piped_stats)) =
-                        pipeline.execute(&query, ivf, k * 2, params.nprobe.max(index.nprobe))
-                    {
-                        local_nodes = piped_stats.nodes_contacted;
-                        for sp in &mut piped_candidates {
-                            sp.payload =
-                                self.maybe_load_payload(params.include_payloads, sp.id);
-                        }
-                        candidates.extend(piped_candidates);
-                    }
-                }
-            }
+        let (ids, dists) = index.search(&query, k * 2, &params).map_err(|e| {
+            stats.warnings.push(format!("local search failed: {e}"));
+            e
+        })?;
+        for (i, id) in ids.iter().enumerate() {
+            let score = dists.get(i).copied().unwrap_or(f32::MAX);
+            let payload = self.maybe_load_payload(params.include_payloads, *id);
+            candidates.push(ScoredPoint { id: *id, score, payload });
         }
 
         if !params.local_only {
@@ -291,14 +277,14 @@ impl Coordinator {
                 let mut pool = self.peer_pool.write().await;
                 let (peer_results, peer_stats) =
                     pool.search_fan_out(&query, k, &params).await;
-                stats.nodes_contacted = local_nodes + peer_stats.nodes_contacted;
+                stats.nodes_contacted = 1 + peer_stats.nodes_contacted;
                 stats.warnings.extend(peer_stats.warnings);
                 candidates.extend(peer_results);
             } else {
-                stats.nodes_contacted = local_nodes;
+                stats.nodes_contacted = 1;
             }
         } else {
-            stats.nodes_contacted = local_nodes;
+            stats.nodes_contacted = 1;
         }
 
         candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
@@ -331,22 +317,6 @@ impl Coordinator {
         } else {
             None
         }
-    }
-
-    async fn compute_load_variance(&self) -> f32 {
-        let peers = self.peers.read().await;
-        if peers.is_empty() {
-            return 0.0;
-        }
-        let storage_counts: Vec<f32> =
-            peers.values().map(|p| p.info.storage_bytes as f32).collect();
-        let mean: f32 = storage_counts.iter().sum::<f32>() / storage_counts.len() as f32;
-        let variance: f32 = storage_counts
-            .iter()
-            .map(|v| (v - mean).powi(2))
-            .sum::<f32>()
-            / storage_counts.len() as f32;
-        variance.sqrt()
     }
 
     pub async fn insert(
@@ -400,7 +370,7 @@ impl Coordinator {
             node_id: self.config.cluster.node_id.clone(),
             address: self.config.cluster.bind_addr.clone(),
             partition_id: 0,
-            dim_groups: (0..self.config.partition.num_dim_groups).collect(),
+            dim_groups: (0..4).collect(),
             is_leader: true,
             raft_term: 1,
             commit_index: 0,
@@ -531,7 +501,7 @@ mod tests {
     }
 
     fn test_coordinator() -> Coordinator {
-        let config = ServerConfig::dev_default("test-node", "/tmp/rekha_coord_test");
+        let mut config = ServerConfig::dev_default("test-node", "/tmp/rekha_coord_test");
         let store = temp_store();
         let pm = Arc::new(RwLock::new(rekha_partition::PartitionManager::new(
             HashMap::new(),
@@ -551,10 +521,7 @@ mod tests {
     async fn test_coordinator_initialize() {
         let coord = test_coordinator();
         let store = (*coord.store()).clone();
-        let mut index = rekha_index::RekhaIndex::new(
-            8, 4, 2, 4, 16, (*store).clone(), rekha_core::DistanceMetric::L2,
-        )
-        .unwrap();
+        let mut index = rekha_index::RekhaIndex::new((*store).clone()).unwrap();
         for i in 0..10 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             index.buffer_insert_internal(i, v);

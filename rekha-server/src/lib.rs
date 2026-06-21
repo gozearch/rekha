@@ -1,7 +1,5 @@
 pub mod config;
 pub mod coordinator;
-pub mod pipeline;
-pub mod planner;
 pub mod server;
 pub mod service;
 

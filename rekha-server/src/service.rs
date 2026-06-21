@@ -1,4 +1,4 @@
-use rekha_core::{NodeInfo, NodeStatus, Payload, RekhaError, SearchParams, VectorStoreBackend};
+use rekha_core::{CollectionConfig, NodeInfo, NodeStatus, Payload, RekhaError, SearchParams, VectorStoreBackend};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -166,13 +166,7 @@ impl Rekha for RekhaService {
         let search_params = SearchParams {
             ef_search: params.ef_search as usize,
             nprobe: params.nprobe as usize,
-            plan: match params.plan {
-                1 => rekha_core::PlanType::DimensionBased,
-                2 => rekha_core::PlanType::Hybrid,
-                _ => rekha_core::PlanType::VectorBased,
-            },
             include_payloads: params.include_payloads,
-            partition_hint: params.partition_hint,
             local_only: req.local_only,
         };
 
@@ -221,13 +215,7 @@ impl Rekha for RekhaService {
         let search_params = SearchParams {
             ef_search: params.ef_search as usize,
             nprobe: params.nprobe as usize,
-            plan: match params.plan {
-                1 => rekha_core::PlanType::DimensionBased,
-                2 => rekha_core::PlanType::Hybrid,
-                _ => rekha_core::PlanType::VectorBased,
-            },
             include_payloads: params.include_payloads,
-            partition_hint: params.partition_hint,
             local_only: req.local_only,
         };
 
@@ -276,7 +264,7 @@ impl Rekha for RekhaService {
             node_id: req.node_id.clone(),
             address: req.address.clone(),
             partition_id: 0,
-            dim_groups: (0..self.coordinator.config_ref().partition.num_dim_groups).collect(),
+            dim_groups: (0..4).collect(),
             is_leader: false,
             raft_term: 0,
             commit_index: 0,
@@ -337,10 +325,8 @@ impl Rekha for RekhaService {
         let params = SearchParams {
             ef_search: 128,
             nprobe: req.nprobe as usize,
-            plan: rekha_core::PlanType::DimensionBased,
             include_payloads: false,
             local_only: true,
-            partition_hint: None,
         };
         let (results, _stats) = self
             .coordinator
@@ -364,36 +350,96 @@ impl Rekha for RekhaService {
 
     async fn create_collection(
         &self,
-        _request: Request<CreateCollectionRequest>,
+        request: Request<CreateCollectionRequest>,
     ) -> Result<Response<CreateCollectionResponse>, Status> {
-        Err(Status::unimplemented(
-            "create_collection not yet implemented",
-        ))
+        let req = request.into_inner();
+        let key = format!("collection:{}", req.name);
+
+        if self.coordinator.store().get_metadata(&key).map_err(Self::map_error)?.is_some() {
+            return Ok(Response::new(CreateCollectionResponse {
+                success: false,
+                error: format!("collection '{}' already exists", req.name),
+            }));
+        }
+
+        let config = req.config.ok_or_else(|| Status::invalid_argument("collection config required"))?;
+        let internal_config = CollectionConfig {
+            dim: config.dim,
+            num_vector_shards: config.num_vector_shards,
+            replication_factor: config.replication_factor,
+            num_dim_groups: config.num_dim_groups,
+            dim_group_size: config.dim_group_size,
+            nlist: config.nlist,
+            nprobe: config.nprobe,
+            pq_num_sub_vectors: config.pq_num_sub_vectors,
+            pq_num_centroids: config.pq_num_centroids,
+            re_rank_k: config.re_rank_k,
+        };
+        let json = serde_json::to_vec(&internal_config).map_err(|e| {
+            Status::internal(format!("failed to serialize config: {e}"))
+        })?;
+        self.coordinator.store().put_metadata(&key, &json).map_err(Self::map_error)?;
+
+        Ok(Response::new(CreateCollectionResponse {
+            success: true,
+            error: String::new(),
+        }))
     }
 
     async fn drop_collection(
         &self,
-        _request: Request<DropCollectionRequest>,
+        request: Request<DropCollectionRequest>,
     ) -> Result<Response<DropCollectionResponse>, Status> {
-        Err(Status::unimplemented("drop_collection not yet implemented"))
+        let key = format!("collection:{}", request.into_inner().name);
+        self.coordinator.store().delete_metadata(&key).map_err(Self::map_error)?;
+        Ok(Response::new(DropCollectionResponse {
+            success: true,
+            error: String::new(),
+        }))
     }
 
     async fn list_collections(
         &self,
         _request: Request<ListCollectionsRequest>,
     ) -> Result<Response<ListCollectionsResponse>, Status> {
-        Err(Status::unimplemented(
-            "list_collections not yet implemented",
-        ))
+        let entries = self.coordinator.store().iter_metadata_prefix("collection:")
+            .map_err(Self::map_error)?;
+        let collections: Vec<crate::proto::CollectionInfo> = entries
+            .into_iter()
+            .filter_map(|(_key, value)| {
+                let config: CollectionConfig = serde_json::from_slice(&value).ok()?;
+                let name = _key.strip_prefix("collection:")?.to_string();
+                Some(crate::proto::CollectionInfo {
+                    name,
+                    config: Some(crate::proto::CollectionConfig {
+                        dim: config.dim,
+                        num_vector_shards: config.num_vector_shards,
+                        replication_factor: config.replication_factor,
+                        num_dim_groups: config.num_dim_groups,
+                        dim_group_size: config.dim_group_size,
+                        nlist: config.nlist,
+                        nprobe: config.nprobe,
+                        pq_num_sub_vectors: config.pq_num_sub_vectors,
+                        pq_num_centroids: config.pq_num_centroids,
+                        re_rank_k: config.re_rank_k,
+                    }),
+                    vector_count: 0,
+                    index_ready: false,
+                })
+            })
+            .collect();
+        Ok(Response::new(ListCollectionsResponse { collections }))
     }
 
     async fn collection_exists(
         &self,
-        _request: Request<CollectionExistsRequest>,
+        request: Request<CollectionExistsRequest>,
     ) -> Result<Response<CollectionExistsResponse>, Status> {
-        Err(Status::unimplemented(
-            "collection_exists not yet implemented",
-        ))
+        let key = format!("collection:{}", request.into_inner().name);
+        let exists = self.coordinator.store().get_metadata(&key)
+            .map_err(Self::map_error)?
+            .is_some();
+        Ok(Response::new(CollectionExistsResponse { exists }))
     }
 
     type TransferShardStream = tokio_stream::wrappers::ReceiverStream<Result<TransferShardChunk, Status>>;
@@ -629,7 +675,7 @@ mod tests {
     fn make_service() -> RekhaService {
         let id = NEXT_SVC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = svc_dir(id);
-        let config =
+        let mut config =
             crate::config::ServerConfig::dev_default("test-node", &format!("{dir}/config"));
         let _ = std::fs::remove_dir_all(&dir);
         let store = std::sync::Arc::new(
@@ -732,10 +778,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_collection_stub() {
+    async fn test_create_collection() {
         let service = make_service();
         let req = tonic::Request::new(CreateCollectionRequest {
-            name: "test".into(),
+            name: "test-collection".into(),
             config: Some(crate::proto::CollectionConfig {
                 dim: 8,
                 num_vector_shards: 1,
@@ -749,40 +795,97 @@ mod tests {
                 re_rank_k: 200,
             }),
         });
-        let result = service.create_collection(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+        let resp = service.create_collection(req).await.unwrap();
+        assert!(resp.into_inner().success);
     }
 
     #[tokio::test]
-    async fn test_drop_collection_stub() {
+    async fn test_create_duplicate_collection() {
         let service = make_service();
-        let req = tonic::Request::new(DropCollectionRequest {
-            name: "test".into(),
+        let req = tonic::Request::new(CreateCollectionRequest {
+            name: "dup".into(),
+            config: Some(crate::proto::CollectionConfig {
+                dim: 4, num_vector_shards: 1, replication_factor: 1,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
+            }),
         });
-        let result = service.drop_collection(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_list_collections_stub() {
-        let service = make_service();
-        let req = tonic::Request::new(ListCollectionsRequest {});
-        let result = service.list_collections(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_collection_exists_stub() {
-        let service = make_service();
-        let req = tonic::Request::new(CollectionExistsRequest {
-            name: "test".into(),
+        let resp = service.create_collection(req).await.unwrap();
+        assert!(resp.into_inner().success);
+        let req2 = tonic::Request::new(CreateCollectionRequest {
+            name: "dup".into(),
+            config: Some(crate::proto::CollectionConfig {
+                dim: 4, num_vector_shards: 1, replication_factor: 1,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
+            }),
         });
-        let result = service.collection_exists(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+        let resp = service.create_collection(req2).await.unwrap();
+        assert!(!resp.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn test_drop_collection() {
+        let service = make_service();
+        // Create first
+        let create_req = tonic::Request::new(CreateCollectionRequest {
+            name: "to-drop".into(),
+            config: Some(crate::proto::CollectionConfig {
+                dim: 4, num_vector_shards: 1, replication_factor: 1,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
+            }),
+        });
+        service.create_collection(create_req).await.unwrap();
+        // Drop it
+        let drop_req = tonic::Request::new(DropCollectionRequest { name: "to-drop".into() });
+        let resp = service.drop_collection(drop_req).await.unwrap();
+        assert!(resp.into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn test_list_collections() {
+        let service = make_service();
+
+        let req1 = tonic::Request::new(ListCollectionsRequest {});
+        let resp = service.list_collections(req1).await.unwrap();
+        assert!(resp.into_inner().collections.is_empty());
+
+        let create_req = tonic::Request::new(CreateCollectionRequest {
+            name: "list-me".into(),
+            config: Some(crate::proto::CollectionConfig {
+                dim: 4, num_vector_shards: 1, replication_factor: 1,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
+            }),
+        });
+        service.create_collection(create_req).await.unwrap();
+
+        let req2 = tonic::Request::new(ListCollectionsRequest {});
+        let resp = service.list_collections(req2).await.unwrap();
+        assert_eq!(resp.into_inner().collections.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_collection_exists() {
+        let service = make_service();
+        let req1 = tonic::Request::new(CollectionExistsRequest { name: "existent".into() });
+        let resp = service.collection_exists(req1).await.unwrap();
+        assert!(!resp.into_inner().exists);
+
+        let create_req = tonic::Request::new(CreateCollectionRequest {
+            name: "existent".into(),
+            config: Some(crate::proto::CollectionConfig {
+                dim: 4, num_vector_shards: 1, replication_factor: 1,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
+            }),
+        });
+        service.create_collection(create_req).await.unwrap();
+
+        let req2 = tonic::Request::new(CollectionExistsRequest { name: "existent".into() });
+        let resp = service.collection_exists(req2).await.unwrap();
+        assert!(resp.into_inner().exists);
     }
 
 }

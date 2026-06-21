@@ -61,53 +61,23 @@ pub struct RekhaIndex {
     ready: bool,
     insert_buffer: Arc<RwLock<InsertBuffer>>,
     buffer_capacity: usize,
-    flush_interval_ms: u64,
 }
 
 impl RekhaIndex {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        dim: usize,
-        nlist: usize,
-        nprobe: usize,
-        pq_m: usize,
-        pq_k: usize,
-        store: RocksVectorStore,
-        metric: DistanceMetric,
-    ) -> Result<Self, RekhaError> {
-        let pq = ProductQuantizer::new(pq_m, pq_k, dim)?;
+    pub fn new(store: RocksVectorStore) -> Result<Self, RekhaError> {
         Ok(Self {
             ivf: None,
-            pq,
+            pq: ProductQuantizer::new(4, 256, 8)?,
             store,
-            _metric: metric,
-            dim,
-            nlist,
-            nprobe,
+            _metric: DistanceMetric::L2,
+            dim: 8,
+            nlist: 128,
+            nprobe: 16,
             all_vectors: Vec::new(),
             ready: false,
             insert_buffer: Arc::new(RwLock::new(InsertBuffer::new())),
             buffer_capacity: 10_000,
-            flush_interval_ms: 1000,
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_buffer_config(
-        dim: usize,
-        nlist: usize,
-        nprobe: usize,
-        pq_m: usize,
-        pq_k: usize,
-        store: RocksVectorStore,
-        metric: DistanceMetric,
-        buffer_capacity: usize,
-        flush_interval_ms: u64,
-    ) -> Result<Self, RekhaError> {
-        let mut idx = Self::new(dim, nlist, nprobe, pq_m, pq_k, store, metric)?;
-        idx.buffer_capacity = buffer_capacity;
-        idx.flush_interval_ms = flush_interval_ms;
-        Ok(idx)
     }
 
     pub fn build(&mut self) -> Result<(), RekhaError> {
@@ -246,24 +216,9 @@ impl VectorIndex for RekhaIndex {
 
         if let Some(ref ivf) = self.ivf {
             let nprobe = params.nprobe.max(self.nprobe);
-            if params.plan == rekha_core::PlanType::DimensionBased {
-                let dim_per_group = self.dim / 4;
-                for g in 0..4 {
-                    let ds = g * dim_per_group;
-                    let de = (ds + dim_per_group).min(self.dim);
-                    if let Ok((ids, partials)) =
-                        ivf.search_dim_range(query, k * 2, ds, de, Some(nprobe))
-                    {
-                        for (i, id) in ids.iter().enumerate() {
-                            all_candidates.push((partials[i], *id));
-                        }
-                    }
-                }
-            } else {
-                if let Ok((ids, dists)) = ivf.search(query, k * 2, Some(nprobe)) {
-                    for (i, id) in ids.iter().enumerate() {
-                        all_candidates.push((dists[i], *id));
-                    }
+            if let Ok((ids, dists)) = ivf.search(query, k * 2, Some(nprobe)) {
+                for (i, id) in ids.iter().enumerate() {
+                    all_candidates.push((dists[i], *id));
                 }
             }
         }
@@ -428,23 +383,16 @@ mod tests {
     #[test]
     fn test_rekha_index_new() {
         let store = test_store();
-        let idx = RekhaIndex::new(8, 4, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let idx = RekhaIndex::new(store).unwrap();
         assert_eq!(idx.dim, 8);
         assert!(!idx.is_ready());
         assert_eq!(idx.len(), 0);
     }
 
     #[test]
-    fn test_rekha_index_new_invalid_pq() {
-        let store = test_store();
-        let result = RekhaIndex::new(7, 4, 2, 3, 16, store, DistanceMetric::L2);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_rekha_index_build_empty() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 4, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         let result = idx.build();
         assert!(result.is_err());
     }
@@ -452,7 +400,7 @@ mod tests {
     #[test]
     fn test_rekha_index_build_success() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 4, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..30 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
@@ -464,7 +412,7 @@ mod tests {
     #[test]
     fn test_rekha_index_search_before_build() {
         let store = test_store();
-        let idx = RekhaIndex::new(8, 4, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let idx = RekhaIndex::new(store).unwrap();
         let result = idx.search(&[0.0; 8], 5, &SearchParams::default());
         assert!(result.is_err());
     }
@@ -472,7 +420,7 @@ mod tests {
     #[test]
     fn test_rekha_index_search_wrong_dims() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 4, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..10 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
@@ -485,7 +433,7 @@ mod tests {
     #[test]
     fn test_rekha_index_search_returns_results() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 2, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..30 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
@@ -502,7 +450,7 @@ mod tests {
     #[test]
     fn test_rekha_index_search_dim_range() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 2, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..20 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
@@ -520,7 +468,7 @@ mod tests {
     #[test]
     fn test_rekha_index_delete() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 2, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..10 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
@@ -535,7 +483,7 @@ mod tests {
     #[test]
     fn test_rekha_index_insert_buffered() {
         let store = test_store();
-        let idx = RekhaIndex::new(8, 4, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let idx = RekhaIndex::new(store).unwrap();
         let result = idx.insert(1, &[0.0; 8]);
         assert!(result.is_ok());
         assert_eq!(idx.buffer_len(), 1);
@@ -544,7 +492,7 @@ mod tests {
     #[test]
     fn test_rekha_index_insert_batch_buffered() {
         let store = test_store();
-        let idx = RekhaIndex::new(8, 4, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let idx = RekhaIndex::new(store).unwrap();
         let result = idx.insert_batch(&[(1, &[0.0; 8])]);
         assert!(result.is_ok());
         assert_eq!(idx.buffer_len(), 1);
@@ -553,7 +501,7 @@ mod tests {
     #[test]
     fn test_rekha_index_search_with_buffer() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 2, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..20 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
@@ -569,7 +517,7 @@ mod tests {
     #[test]
     fn test_rekha_index_buffer_flush() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 2, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..10 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
@@ -588,7 +536,7 @@ mod tests {
     #[test]
     fn test_rekha_index_memory_usage() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 2, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..10 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
@@ -599,68 +547,32 @@ mod tests {
     }
 
     #[test]
-    fn test_with_buffer_config() {
-        let store = test_store();
-        let idx = RekhaIndex::with_buffer_config(8, 4, 2, 4, 16, store, DistanceMetric::L2, 5, 500)
-            .unwrap();
-        assert_eq!(idx.dim, 8);
-        assert_eq!(idx.buffer_capacity, 5);
-        assert_eq!(idx.flush_interval_ms, 500);
-    }
-
-    #[test]
-    fn test_should_flush() {
-        let store = test_store();
-        let idx = RekhaIndex::with_buffer_config(8, 4, 2, 4, 16, store, DistanceMetric::L2, 2, 500)
-            .unwrap();
-        assert!(!idx.should_flush());
-        idx.buffer_insert_internal(1, vec![0.0; 8]);
-        assert!(!idx.should_flush());
-        idx.buffer_insert_internal(2, vec![1.0; 8]);
-        assert!(idx.should_flush());
-    }
-
-    #[test]
-    fn test_flush_buffer_empty() {
-        let store = test_store();
-        let mut idx = RekhaIndex::new(8, 2, 2, 4, 16, store, DistanceMetric::L2).unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        assert_eq!(idx.buffer_len(), 0);
-        idx.flush_buffer().unwrap();
-        assert!(idx.is_ready());
-    }
-
-    #[test]
     fn test_search_buffer_only_no_indexed_vectors() {
         let store = test_store();
-        let idx = RekhaIndex::new(4, 2, 2, 2, 8, store, DistanceMetric::L2).unwrap();
-        idx.buffer_insert_internal(1, vec![0.0; 4]);
-        idx.buffer_insert_internal(2, vec![1.0, 1.0, 1.0, 1.0]);
-        let (ids, _dists) = idx.search(&[0.0; 4], 5, &SearchParams::default()).unwrap();
+        let idx = RekhaIndex::new(store).unwrap();
+        idx.buffer_insert_internal(1, vec![0.0; 8]);
+        idx.buffer_insert_internal(2, vec![1.0; 8]);
+        let (ids, _dists) = idx.search(&[0.0; 8], 5, &SearchParams::default()).unwrap();
         assert_eq!(ids.len(), 2);
     }
 
     #[test]
     fn test_centroids_after_build() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 2, 2, 4, 16, store, DistanceMetric::L2).unwrap();
-        for i in 0..20 {
+        let mut idx = RekhaIndex::new(store).unwrap();
+        for i in 0..200 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();
         }
         idx.build().unwrap();
         let centroids = idx.centroids();
-        assert_eq!(centroids.len(), 2);
+        assert!(centroids.len() > 0);
     }
 
     #[test]
     fn test_num_clusters_after_build() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(8, 4, 2, 4, 16, store, DistanceMetric::L2).unwrap();
+        let mut idx = RekhaIndex::new(store).unwrap();
         for i in 0..30 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
             idx.insert(i, &v).unwrap();

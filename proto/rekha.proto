@@ -3,34 +3,24 @@ syntax = "proto3";
 package rekha;
 
 service Rekha {
-    // ── Collection management ────────────────────────────────
     rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
     rpc DropCollection(DropCollectionRequest) returns (DropCollectionResponse);
     rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
     rpc CollectionExists(CollectionExistsRequest) returns (CollectionExistsResponse);
 
-    // ── Data operations ──────────────────────────────────────
     rpc Insert(InsertRequest) returns (InsertResponse);
     rpc InsertBatch(stream InsertRequest) returns (InsertBatchResponse);
     rpc Delete(DeleteRequest) returns (DeleteResponse);
     rpc Fetch(FetchRequest) returns (FetchResponse);
 
-    // ── Search ───────────────────────────────────────────────
     rpc Search(SearchRequest) returns (SearchResponse);
     rpc SearchStream(SearchRequest) returns (stream ScoredPoint);
+    rpc SearchDimRange(SearchDimRangeRequest) returns (SearchDimRangeResponse);
 
-    // ── Cluster management (internal) ────────────────────────
     rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
     rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
-    rpc TransferShard(TransferRequest) returns (TransferResponse);
-
-    // ── Raft replication (internal) ──────────────────────────
-    rpc RaftAppendEntries(AppendEntriesRequest) returns (RaftAck);
-    rpc RaftRequestVote(RaftVoteRequest) returns (RaftVoteResponse);
-    rpc RaftInstallSnapshot(stream RaftSnapshotChunk) returns (RaftAck);
+    rpc TransferShard(TransferShardRequest) returns (stream TransferShardChunk);
 }
-
-// ── Core Data Types ─────────────────────────────────────────
 
 message Vector {
     uint64 id = 1;
@@ -38,7 +28,7 @@ message Vector {
 }
 
 message Payload {
-    string content_type = 1;    // "json", "text", "raw"
+    string content_type = 1;
     bytes data = 2;
 }
 
@@ -48,13 +38,12 @@ message ScoredPoint {
     optional Payload payload = 3;
 }
 
-// ── Insert ──────────────────────────────────────────────────
-
 message InsertRequest {
     uint64 id = 1;
     repeated float vector = 2;
     optional Payload payload = 3;
     string collection_name = 4;
+    bool is_replication = 5;
 }
 
 message InsertResponse {
@@ -68,8 +57,6 @@ message InsertBatchResponse {
     repeated string errors = 2;
 }
 
-// ── Delete ──────────────────────────────────────────────────
-
 message DeleteRequest {
     repeated uint64 ids = 1;
     string collection_name = 2;
@@ -79,8 +66,6 @@ message DeleteResponse {
     uint64 deleted_count = 1;
     string error = 2;
 }
-
-// ── Fetch ───────────────────────────────────────────────────
 
 message FetchRequest {
     repeated uint64 ids = 1;
@@ -94,13 +79,10 @@ message FetchResponse {
     string error = 3;
 }
 
-// ── Search ──────────────────────────────────────────────────
-
 message SearchParams {
     uint32 ef_search = 1;
-    uint32 beam_width = 2;
+    uint32 nprobe = 2;
     bool include_payloads = 3;
-    optional uint64 partition_hint = 4;
 }
 
 message SearchRequest {
@@ -123,18 +105,26 @@ message SearchResponse {
     SearchStats stats = 2;
 }
 
-// ── Cluster Management ──────────────────────────────────────
+message SearchDimRangeRequest {
+    repeated float query_vector = 1;
+    uint32 top_k = 2;
+    uint32 dim_start = 3;
+    uint32 dim_end = 4;
+    uint32 nprobe = 5;
+    string collection_name = 6;
+}
+
+message SearchDimRangeResponse {
+    repeated ScoredPoint results = 1;
+}
 
 message NodeInfo {
     string node_id = 1;
     string address = 2;
     uint64 partition_id = 3;
     repeated uint32 dim_groups = 4;
-    bool is_leader = 5;
-    uint64 raft_term = 6;
-    uint64 commit_index = 7;
-    uint64 storage_bytes = 8;
-    string status = 9;
+    uint64 storage_bytes = 5;
+    string status = 6;
 }
 
 message HandshakeRequest {
@@ -150,79 +140,39 @@ message HandshakeResponse {
 
 message HeartbeatRequest {
     string node_id = 1;
-    string address = 5;
-    uint64 raft_term = 2;
-    uint64 commit_index = 3;
-    uint64 storage_bytes = 4;
+    string address = 2;
+    uint64 storage_bytes = 3;
 }
 
 message HeartbeatResponse {
     bool success = 1;
-    string leader_hint = 2;
-    uint64 leader_term = 3;
 }
 
-message TransferRequest {
-    uint64 partition_id = 1;
-    string target_node = 2;
-    repeated uint64 vector_ids = 3;
+message TransferShardRequest {
+    uint64 shard_id = 1;
+    string collection_name = 2;
+    string target_node_id = 3;
 }
 
-message TransferResponse {
-    bool success = 1;
-    uint64 transferred_count = 2;
-    string error = 3;
+message TransferShardChunk {
+    repeated Vector centroids = 1;
+    uint32 nlist = 2;
+    uint32 nprobe = 3;
+    uint32 total_dim = 4;
+    repeated VectorBatch vector_batches = 5;
+    bool final_chunk = 6;
 }
 
-// ── Raft ────────────────────────────────────────────────────
-
-message RaftEntry {
-    uint64 term = 1;
-    uint64 index = 2;
-    RaftCommand command = 3;
+message VectorBatch {
+    repeated VectorWithCluster vectors = 1;
 }
 
-message RaftCommand {
-    oneof cmd {
-        InsertRequest insert = 1;
-        DeleteRequest delete = 2;
-        bytes custom = 3;
-    }
+message VectorWithCluster {
+    uint64 id = 1;
+    repeated float data = 2;
+    uint32 cluster_id = 3;
+    optional bytes payload = 4;
 }
-
-message RaftAck {
-    bool success = 1;
-    uint64 current_term = 2;
-    uint64 commit_index = 3;
-    string error = 4;
-}
-
-message AppendEntriesRequest {
-    string collection_name = 8;
-    uint64 partition_id = 1;
-    uint64 leader_term = 2;
-    string leader_id = 3;
-    uint64 prev_log_index = 4;
-    uint64 prev_log_term = 5;
-    repeated RaftEntry entries = 6;
-    uint64 leader_commit = 7;
-}
-
-message RaftVoteRequest {
-    string collection_name = 6;
-    uint64 term = 1;
-    string candidate_id = 2;
-    uint64 last_log_index = 3;
-    uint64 last_log_term = 4;
-    uint64 partition_id = 5;
-}
-
-message RaftVoteResponse {
-    uint64 term = 1;
-    bool vote_granted = 2;
-}
-
-// ── Collection Management ─────────────────────────────────────
 
 message CollectionConfig {
     uint32 dim = 1;
@@ -230,8 +180,8 @@ message CollectionConfig {
     uint64 replication_factor = 3;
     uint32 num_dim_groups = 4;
     uint32 dim_group_size = 5;
-    uint32 graph_degree = 6;
-    uint32 search_list_size = 7;
+    uint32 nlist = 6;
+    uint32 nprobe = 7;
     uint32 pq_num_sub_vectors = 8;
     uint32 pq_num_centroids = 9;
     uint32 re_rank_k = 10;
@@ -247,6 +197,7 @@ message CollectionInfo {
 message CreateCollectionRequest {
     string name = 1;
     CollectionConfig config = 2;
+    bool is_replication = 3;
 }
 
 message CreateCollectionResponse {
@@ -275,12 +226,4 @@ message CollectionExistsRequest {
 
 message CollectionExistsResponse {
     bool exists = 1;
-}
-
-message RaftSnapshotChunk {
-    uint64 term = 1;
-    uint64 last_included_index = 2;
-    uint64 last_included_term = 3;
-    bytes data = 4;
-    bool done = 5;
 }

@@ -8,7 +8,6 @@ rekha-core = { path = "../rekha-core" }
 rekha-storage = { path = "../rekha-storage" }
 rekha-index = { path = "../rekha-index" }
 rekha-partition = { path = "../rekha-partition" }
-rekha-raft = { path = "../rekha-raft" }
 rekha-client = { path = "../rekha-client" }
 tonic = { version = "0.12", features = ["tls", "tls-webpki-roots"] }
 prost = "0.13"

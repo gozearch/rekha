@@ -1,22 +1,14 @@
 use rekha_core::{NodeInfo, NodeStatus, OwnedRange, PartitionError, RekhaError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-/// Manages partition-to-node assignments and cluster topology.
-///
-/// Tracks:
-/// - Which nodes own which (vector_shard, dim_group) pairs
-/// - Node health and leadership status
-/// - Dimension ranges assigned to each dimension group
+use crate::ring::ConsistentHashRing;
+
 pub struct PartitionManager {
-    /// Node ID -> NodeInfo mapping.
     nodes: HashMap<String, NodeInfo>,
-    /// (vector_shard, dim_group) -> list of node IDs that own this partition.
     topology: HashMap<(u64, u32), Vec<String>>,
-    /// Node ID -> list of owned ranges.
     owned_ranges: HashMap<String, Vec<OwnedRange>>,
-    /// Number of dimension groups.
+    ring: ConsistentHashRing,
     num_dim_groups: u32,
-    /// Dimensions per group.
     dims_per_group: usize,
 }
 
@@ -33,6 +25,7 @@ impl PartitionManager {
             nodes,
             topology: HashMap::new(),
             owned_ranges: HashMap::new(),
+            ring: ConsistentHashRing::new(128),
             num_dim_groups,
             dims_per_group,
         };
@@ -45,6 +38,7 @@ impl PartitionManager {
     fn rebuild_topology(&mut self) {
         self.topology.clear();
         self.owned_ranges.clear();
+        self.rebuild_ring();
 
         for (node_id, info) in &self.nodes {
             let range = OwnedRange {
@@ -126,9 +120,40 @@ impl PartitionManager {
         self.nodes.len()
     }
 
-    /// All registered nodes.
     pub fn all_nodes(&self) -> &HashMap<String, NodeInfo> {
         &self.nodes
+    }
+
+    pub fn replicas_for(&self, shard: u64, rf: usize) -> Vec<&NodeInfo> {
+        let healthy: HashSet<&str> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n.status, NodeStatus::Healthy))
+            .map(|(id, _)| id.as_str())
+            .collect();
+
+        let ids = self.ring.replicas_for(shard, rf, &healthy);
+        ids.iter()
+            .filter_map(|id| self.nodes.get(id))
+            .collect()
+    }
+
+    pub fn mark_node_down(&mut self, node_id: &str) {
+        if let Some(info) = self.nodes.get_mut(node_id) {
+            info.status = NodeStatus::Unreachable;
+        }
+        self.ring.remove_node(node_id);
+    }
+
+    fn rebuild_ring(&mut self) {
+        self.ring = ConsistentHashRing::new(128);
+        for node_id in self.nodes.keys() {
+            self.ring.add_node(node_id);
+        }
+    }
+
+    pub fn node_ring_contains(&self, node_id: &str) -> bool {
+        self.nodes.contains_key(node_id)
     }
 }
 
@@ -375,5 +400,184 @@ mod tests {
         }
         let manager = PartitionManager::new(nodes, 4, 768);
         assert_eq!(manager.node_count(), 3);
+    }
+
+    #[test]
+    fn test_replicas_rf2_3_nodes() {
+        let mut nodes = HashMap::new();
+        for i in 0..3 {
+            nodes.insert(
+                format!("n{}", i),
+                NodeInfo {
+                    node_id: format!("n{}", i),
+                    address: format!("addr{}", i),
+                    partition_id: i as u64,
+                    dim_groups: vec![0],
+                    is_leader: false,
+                    raft_term: 0,
+                    commit_index: 0,
+                    storage_bytes: 0,
+                    status: NodeStatus::Healthy,
+                    last_heartbeat: 0,
+                },
+            );
+        }
+        let manager = PartitionManager::new(nodes, 4, 768);
+        let replicas = manager.replicas_for(0, 2);
+        assert_eq!(replicas.len(), 2);
+        let mut ids: Vec<&str> = replicas.iter().map(|n| n.node_id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn test_replicas_skips_unreachable() {
+        let mut nodes = HashMap::new();
+        for i in 0..3 {
+            nodes.insert(
+                format!("n{}", i),
+                NodeInfo {
+                    node_id: format!("n{}", i),
+                    address: format!("addr{}", i),
+                    partition_id: i as u64,
+                    dim_groups: vec![0],
+                    is_leader: false,
+                    raft_term: 0,
+                    commit_index: 0,
+                    storage_bytes: 0,
+                    status: if i == 1 { NodeStatus::Unreachable } else { NodeStatus::Healthy },
+                    last_heartbeat: 0,
+                },
+            );
+        }
+        let mut manager = PartitionManager::new(nodes, 4, 768);
+        manager.mark_node_down("n1");
+        let replicas = manager.replicas_for(0, 2);
+        assert_eq!(replicas.len(), 2);
+        let ids: Vec<&str> = replicas.iter().map(|n| n.node_id.as_str()).collect();
+        assert!(!ids.contains(&"n1"));
+    }
+
+    #[test]
+    fn test_replicas_rf_exceeds_nodes() {
+        let mut nodes = HashMap::new();
+        for i in 0..2 {
+            nodes.insert(
+                format!("n{}", i),
+                NodeInfo {
+                    node_id: format!("n{}", i),
+                    address: format!("addr{}", i),
+                    partition_id: i as u64,
+                    dim_groups: vec![0],
+                    is_leader: false,
+                    raft_term: 0,
+                    commit_index: 0,
+                    storage_bytes: 0,
+                    status: NodeStatus::Healthy,
+                    last_heartbeat: 0,
+                },
+            );
+        }
+        let manager = PartitionManager::new(nodes, 4, 768);
+        let replicas = manager.replicas_for(0, 5);
+        assert_eq!(replicas.len(), 2);
+    }
+
+    #[test]
+    fn test_replicas_no_healthy_nodes() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "n0".into(),
+            NodeInfo {
+                node_id: "n0".into(),
+                address: "addr".into(),
+                partition_id: 0,
+                dim_groups: vec![0],
+                is_leader: false,
+                raft_term: 0,
+                commit_index: 0,
+                storage_bytes: 0,
+                status: NodeStatus::Unreachable,
+                last_heartbeat: 0,
+            },
+        );
+        let mut manager = PartitionManager::new(nodes, 4, 768);
+        manager.mark_node_down("n0");
+        let replicas = manager.replicas_for(0, 3);
+        assert!(replicas.is_empty());
+    }
+
+    #[test]
+    fn test_replicas_ring_order() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "node-b".into(),
+            NodeInfo {
+                node_id: "node-b".into(),
+                address: "b".into(),
+                partition_id: 1,
+                dim_groups: vec![0],
+                is_leader: false,
+                raft_term: 0,
+                commit_index: 0,
+                storage_bytes: 0,
+                status: NodeStatus::Healthy,
+                last_heartbeat: 0,
+            },
+        );
+        nodes.insert(
+            "node-a".into(),
+            NodeInfo {
+                node_id: "node-a".into(),
+                address: "a".into(),
+                partition_id: 0,
+                dim_groups: vec![0],
+                is_leader: true,
+                raft_term: 0,
+                commit_index: 0,
+                storage_bytes: 0,
+                status: NodeStatus::Healthy,
+                last_heartbeat: 0,
+            },
+        );
+        let manager = PartitionManager::new(nodes, 4, 768);
+        let replicas_0 = manager.replicas_for(0, 1);
+        assert_eq!(replicas_0.len(), 1);
+        assert!(["node-a", "node-b"].contains(&replicas_0[0].node_id.as_str()));
+        let replicas_1 = manager.replicas_for(1, 1);
+        assert_eq!(replicas_1.len(), 1);
+        assert!(["node-a", "node-b"].contains(&replicas_1[0].node_id.as_str()));
+    }
+
+    #[test]
+    fn test_mark_node_down() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "n0".into(),
+            NodeInfo {
+                node_id: "n0".into(),
+                address: "addr".into(),
+                partition_id: 0,
+                dim_groups: vec![0],
+                is_leader: false,
+                raft_term: 0,
+                commit_index: 0,
+                storage_bytes: 0,
+                status: NodeStatus::Healthy,
+                last_heartbeat: 0,
+            },
+        );
+        let mut manager = PartitionManager::new(nodes, 4, 768);
+        manager.mark_node_down("n0");
+        let replicas = manager.replicas_for(0, 1);
+        assert!(replicas.is_empty());
+    }
+
+    #[test]
+    fn test_replicas_empty_when_no_nodes() {
+        let manager = PartitionManager::new(HashMap::new(), 4, 768);
+        let replicas = manager.replicas_for(0, 1);
+        assert!(replicas.is_empty());
     }
 }

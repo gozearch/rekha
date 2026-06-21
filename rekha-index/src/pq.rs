@@ -137,6 +137,17 @@ impl ProductQuantizer {
         }
         dist
     }
+
+    pub fn clone_for_ref(&self) -> Self {
+        Self {
+            m: self.m,
+            k: self.k,
+            dim: self.dim,
+            d: self.d,
+            centroids: self.centroids.clone(),
+            trained: self.trained,
+        }
+    }
 }
 
 /// K-means clustering on a set of sub-vectors.

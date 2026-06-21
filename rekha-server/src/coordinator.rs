@@ -1,13 +1,11 @@
 use rekha_core::{
-    ClusterTopology, DistanceMetric, IndexBufferHandle, NodeInfo, NodeStatus, Payload, PlanType,
+    ClusterTopology, DistanceMetric, NodeInfo, NodeStatus, Payload, PlanType,
     RekhaError, ScoredPoint, SearchParams, SearchStats, VectorIndex, VectorStoreBackend,
 };
 use rekha_index::RekhaIndex;
 use rekha_partition::PartitionManager;
-use rekha_raft::{RaftLogStore, RaftNode};
 use rekha_storage::RocksVectorStore;
 
-use dashmap::DashMap;
 use rekha_client::RekhaClient as PeerRekhaClient;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -147,7 +145,6 @@ pub struct Coordinator {
     store: Arc<RocksVectorStore>,
     #[allow(dead_code)]
     partition_manager: Arc<RwLock<PartitionManager>>,
-    pub raft_nodes: DashMap<u64, Arc<RaftNode>>,
     topology: Arc<RwLock<ClusterTopology>>,
     initialized: Arc<RwLock<bool>>,
     peers: Arc<RwLock<HashMap<String, PeerState>>>,
@@ -166,22 +163,21 @@ impl Coordinator {
             let alpha = config.planner.alpha;
             let eval_window = config.planner.eval_window;
             Self {
-            config,
-            index: Arc::new(RwLock::new(None)),
-            store,
-            partition_manager,
-            raft_nodes: DashMap::new(),
-            topology: Arc::new(RwLock::new(ClusterTopology {
-                cluster_id: String::new(),
-                nodes: HashMap::new(),
-                partition_map: HashMap::new(),
-            })),
-            initialized: Arc::new(RwLock::new(false)),
-            peers: Arc::new(RwLock::new(HashMap::new())),
-            peer_pool: Arc::new(RwLock::new(PeerPool::new("default"))),
-            next_auto_id: AtomicU64::new(starting_id),
-            planner: Arc::new(RwLock::new(QueryPlanner::new(alpha, eval_window))),
-        }
+                config: config.clone(),
+                index: Arc::new(RwLock::new(None)),
+                store,
+                partition_manager,
+                topology: Arc::new(RwLock::new(ClusterTopology {
+                    cluster_id: String::new(),
+                    nodes: HashMap::new(),
+                    partition_map: HashMap::new(),
+                })),
+                initialized: Arc::new(RwLock::new(false)),
+                peers: Arc::new(RwLock::new(HashMap::new())),
+                peer_pool: Arc::new(RwLock::new(PeerPool::new("default"))),
+                next_auto_id: AtomicU64::new(starting_id),
+                planner: Arc::new(RwLock::new(QueryPlanner::new(alpha, eval_window))),
+            }
     }
 
     fn starting_auto_id(store: &RocksVectorStore) -> u64 {
@@ -197,50 +193,8 @@ impl Coordinator {
             *idx = Some(index);
         }
         *self.initialized.write().await = true;
-        let _ = self.recover_index_buffer().await;
         self.spawn_flush_loop();
         info!("Coordinator initialized");
-    }
-
-    async fn recover_index_buffer(&self) -> Result<(), RekhaError> {
-        let mut idx = self.index.write().await;
-        let index = idx.as_mut().ok_or_else(|| RekhaError::Internal {
-            detail: "index not initialized for recovery".into(),
-        })?;
-
-        let mut recovered = 0usize;
-        for item in self.raft_nodes.iter() {
-            let raft_node = item.value();
-            let state = raft_node.read_state().await;
-            for (id, bytes) in state.vectors.iter() {
-                if index.centroids().is_empty() {
-                    let vec: Vec<f32> = bytes
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                        .collect();
-                    index.buffer_insert(*id, vec);
-                    recovered += 1;
-                }
-            }
-        }
-
-        if recovered > 0 {
-            info!("Recovered {recovered} vectors into insert buffer from Raft state");
-            if index.should_flush() {
-                let flush_result = {
-                    let mut idx = self.index.write().await;
-                    if let Some(ref mut idx) = *idx {
-                        idx.flush_buffer()
-                    } else {
-                        Ok(())
-                    }
-                };
-                if let Err(e) = flush_result {
-                    tracing::warn!("Immediate flush failed after recovery: {e}");
-                }
-            }
-        }
-        Ok(())
     }
 
     fn spawn_flush_loop(&self) {
@@ -407,15 +361,11 @@ impl Coordinator {
             id
         };
 
-        if let Some(raft_node) = self.raft_node(0) {
-            let cmd = rekha_raft::state::RaftCommand::Insert {
-                id,
-                vector,
-                payload: payload.map(|p| p.data),
-            };
-            raft_node.propose(cmd).await?;
-            return Ok(id);
+        let idx = self.index.read().await;
+        if let Some(ref index) = *idx {
+            index.buffer_insert_internal(id, vector.clone());
         }
+        drop(idx);
 
         self.store.put_vector(id, &vector)?;
         if let Some(ref p) = payload {
@@ -563,35 +513,6 @@ impl Coordinator {
         &self.config
     }
 
-    pub fn register_raft_node(&self, partition_id: u64, node: Arc<RaftNode>) {
-        self.raft_nodes.insert(partition_id, node);
-    }
-
-    pub fn raft_node(&self, partition_id: u64) -> Option<Arc<RaftNode>> {
-        self.raft_nodes.get(&partition_id).map(|n| n.clone())
-    }
-
-    pub fn raft_log_store(&self) -> RaftLogStore {
-        RaftLogStore::new(self.store.clone())
-    }
-}
-
-impl IndexBufferHandle for Coordinator {
-    fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
-        if let Ok(idx) = self.index.try_read() {
-            if let Some(ref idx) = *idx {
-                idx.buffer_insert(id, vector);
-            }
-        }
-    }
-
-    fn buffer_delete(&self, ids: &[u64]) {
-        if let Ok(idx) = self.index.try_read() {
-            if let Some(ref idx) = *idx {
-                idx.buffer_delete(ids);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -636,7 +557,7 @@ mod tests {
         .unwrap();
         for i in 0..10 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.buffer_insert(i, v);
+            index.buffer_insert_internal(i, v);
         }
         index.build().unwrap();
         coord.initialize(index).await;

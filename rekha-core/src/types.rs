@@ -254,18 +254,6 @@ impl OwnedRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub struct RaftIndex {
-    pub term: u64,
-    pub index: u64,
-}
-
-impl RaftIndex {
-    pub fn zero() -> Self {
-        Self { term: 0, index: 0 }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,22 +325,6 @@ mod tests {
         assert_eq!(r.dim_count(), 128);
         let r = OwnedRange { vector_shard: 1, dim_start: 128, dim_end: 64 };
         assert_eq!(r.dim_count(), 0);
-    }
-
-    #[test]
-    fn test_raft_index_zero() {
-        let ri = RaftIndex::zero();
-        assert_eq!(ri.term, 0);
-        assert_eq!(ri.index, 0);
-    }
-
-    #[test]
-    fn test_raft_index_ordering() {
-        let a = RaftIndex { term: 1, index: 5 };
-        let b = RaftIndex { term: 2, index: 3 };
-        assert!(a < b);
-        let c = RaftIndex { term: 1, index: 10 };
-        assert!(a < c);
     }
 
     #[test]

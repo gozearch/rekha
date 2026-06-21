@@ -47,11 +47,6 @@ pub trait PartitionStrategy: Send + Sync {
     fn num_vector_shards(&self) -> u64;
 }
 
-pub trait IndexBufferHandle: Send + Sync {
-    fn buffer_insert(&self, id: u64, vector: Vec<f32>);
-    fn buffer_delete(&self, ids: &[u64]);
-}
-
 pub trait VectorStoreBackend: Send + Sync {
     fn put_vector(&self, id: u64, data: &[f32]) -> Result<(), RekhaError>;
     fn get_vector(&self, id: u64) -> Result<Option<Vec<f32>>, RekhaError>;

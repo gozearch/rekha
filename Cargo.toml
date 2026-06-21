@@ -5,7 +5,6 @@ default-members = [
     "rekha-storage",
     "rekha-index",
     "rekha-partition",
-    "rekha-raft",
     "rekha-server",
     "rekha-client",
     "rekha-cli",
@@ -16,7 +15,6 @@ members = [
     "rekha-storage",
     "rekha-index",
     "rekha-partition",
-    "rekha-raft",
     "rekha-server",
     "rekha-client",
     "rekha-cli",
@@ -27,5 +25,3 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-
-# Root workspace — no package, just aggregates all crates

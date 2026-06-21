@@ -6,8 +6,8 @@ pub struct ServerConfig {
     pub cluster: ClusterConfig,
     pub partition: PartitionConfig,
     pub index: IndexConfig,
+    #[serde(default)]
     pub planner: PlannerConfig,
-    pub raft: RaftConfig,
     pub tls: TlsConfig,
     pub observability: ObservabilityConfig,
     pub storage: StorageConfig,
@@ -36,7 +36,6 @@ impl ServerConfig {
                 dim_group_size: 64,
             },
             index: IndexConfig {
-                index_type: "ivf".into(),
                 nlist: 128,
                 nprobe: 16,
                 pq_num_sub_vectors: 64,
@@ -45,16 +44,7 @@ impl ServerConfig {
                 insert_buffer_capacity: 10_000,
                 insert_buffer_flush_interval_ms: 1000,
             },
-            planner: PlannerConfig {
-                alpha: 0.1,
-                eval_window: 1000,
-            },
-            raft: RaftConfig {
-                heartbeat_interval_ms: 100,
-                election_timeout_min_ms: 300,
-                election_timeout_max_ms: 500,
-                snapshot_interval: 10_000,
-            },
+            planner: PlannerConfig::default(),
             tls: TlsConfig::default(),
             observability: ObservabilityConfig {
                 metrics: "prometheus".into(),
@@ -96,8 +86,6 @@ pub struct PartitionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexConfig {
-    #[serde(rename = "type")]
-    pub index_type: String,
     pub nlist: usize,
     pub nprobe: usize,
     pub pq_num_sub_vectors: usize,
@@ -111,16 +99,19 @@ pub struct IndexConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannerConfig {
+    #[serde(default = "default_alpha")]
     pub alpha: f32,
+    #[serde(default = "default_eval_window")]
     pub eval_window: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RaftConfig {
-    pub heartbeat_interval_ms: u64,
-    pub election_timeout_min_ms: u64,
-    pub election_timeout_max_ms: u64,
-    pub snapshot_interval: u64,
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            alpha: 0.1,
+            eval_window: 1000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +135,14 @@ fn default_flush_interval_ms() -> u64 {
     1000
 }
 
+fn default_alpha() -> f32 {
+    0.1
+}
+
+fn default_eval_window() -> usize {
+    1000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,7 +156,6 @@ mod tests {
         assert_eq!(config.partition.num_dim_groups, 4);
         assert_eq!(config.index.nlist, 128);
         assert_eq!(config.index.nprobe, 16);
-        assert_eq!(config.raft.heartbeat_interval_ms, 100);
     }
 
     #[test]
@@ -195,5 +193,12 @@ mod tests {
     fn test_dev_default_tls_disabled() {
         let config = ServerConfig::dev_default("n1", "/tmp");
         assert!(!config.tls.enabled);
+    }
+
+    #[test]
+    fn test_planner_default() {
+        let p = PlannerConfig::default();
+        assert!((p.alpha - 0.1).abs() < 1e-6);
+        assert_eq!(p.eval_window, 1000);
     }
 }

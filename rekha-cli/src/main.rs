@@ -162,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
                     client.cluster_info().await?;
                 }
                 Commands::Health => {
-                    println!("Health check...");
+                    let _ = client;
                     println!("OK");
                 }
                 Commands::Server { .. } => unreachable!(),

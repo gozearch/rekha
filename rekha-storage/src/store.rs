@@ -169,6 +169,11 @@ impl RocksVectorStore {
         }
         Ok(count)
     }
+
+    /// Return an estimate of storage usage (number of vectors).
+    pub fn get_storage_estimate(&self) -> Result<u64, RekhaError> {
+        self.iter_ids().map(|ids| ids.len() as u64)
+    }
 }
 
 impl VectorStoreBackend for RocksVectorStore {

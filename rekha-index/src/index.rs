@@ -1,5 +1,5 @@
 use rekha_core::{
-    distance::l2_squared, DistanceMetric, IndexBufferHandle, IndexError, RekhaError, SearchParams,
+    distance::l2_squared, DistanceMetric, IndexError, RekhaError, SearchParams,
     VectorIndex, VectorStoreBackend,
 };
 use rekha_storage::RocksVectorStore;
@@ -207,21 +207,21 @@ impl RekhaIndex {
 
 impl VectorIndex for RekhaIndex {
     fn insert(&self, id: u64, vector: &[f32]) -> Result<(), RekhaError> {
-        self.buffer_insert(id, vector.to_vec());
+        self.buffer_insert_internal(id, vector.to_vec());
         self.store.put_vector(id, vector)?;
         Ok(())
     }
 
     fn insert_batch(&self, vectors: &[(u64, &[f32])]) -> Result<(), RekhaError> {
         for (id, vec) in vectors {
-            self.buffer_insert(*id, vec.to_vec());
+            self.buffer_insert_internal(*id, vec.to_vec());
             self.store.put_vector(*id, vec)?;
         }
         Ok(())
     }
 
     fn delete(&self, ids: &[u64]) -> Result<(), RekhaError> {
-        self.buffer_delete(ids);
+        self.buffer_delete_internal(ids);
         self.store.delete(ids)?;
         Ok(())
     }
@@ -396,16 +396,14 @@ impl RekhaIndex {
     pub fn ivf(&self) -> Option<&IvfIndex> {
         self.ivf.as_ref()
     }
-}
 
-impl IndexBufferHandle for RekhaIndex {
-    fn buffer_insert(&self, id: u64, vector: Vec<f32>) {
+    pub fn buffer_insert_internal(&self, id: u64, vector: Vec<f32>) {
         if let Ok(mut buf) = self.insert_buffer.write() {
             buf.push(id, vector);
         }
     }
 
-    fn buffer_delete(&self, ids: &[u64]) {
+    pub fn buffer_delete_internal(&self, ids: &[u64]) {
         if let Ok(mut buf) = self.insert_buffer.write() {
             buf.mark_deleted(ids);
         }
@@ -528,7 +526,7 @@ mod tests {
             idx.insert(i, &v).unwrap();
         }
         idx.build().unwrap();
-        idx.buffer_insert(10, (0..8).map(|d| (10 * 8 + d) as f32).collect());
+        idx.buffer_insert_internal(10, (0..8).map(|d| (10 * 8 + d) as f32).collect());
         assert_eq!(idx.len(), 11);
         idx.delete(&[0, 1]).unwrap();
         assert_eq!(idx.len(), 11);
@@ -562,7 +560,7 @@ mod tests {
         }
         idx.build().unwrap();
         let query = vec![0.0; 8];
-        idx.buffer_insert(50, query.clone());
+        idx.buffer_insert_internal(50, query.clone());
         let (ids, dists) = idx.search(&query, 5, &SearchParams::default()).unwrap();
         assert!(!ids.is_empty());
         assert_eq!(ids.len(), dists.len());
@@ -579,7 +577,7 @@ mod tests {
         idx.build().unwrap();
         for i in 10..15 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.buffer_insert(i, v);
+            idx.buffer_insert_internal(i, v);
         }
         assert_eq!(idx.buffer_len(), 5);
         idx.flush_buffer().unwrap();
@@ -616,9 +614,9 @@ mod tests {
         let idx = RekhaIndex::with_buffer_config(8, 4, 2, 4, 16, store, DistanceMetric::L2, 2, 500)
             .unwrap();
         assert!(!idx.should_flush());
-        idx.buffer_insert(1, vec![0.0; 8]);
+        idx.buffer_insert_internal(1, vec![0.0; 8]);
         assert!(!idx.should_flush());
-        idx.buffer_insert(2, vec![1.0; 8]);
+        idx.buffer_insert_internal(2, vec![1.0; 8]);
         assert!(idx.should_flush());
     }
 
@@ -640,8 +638,8 @@ mod tests {
     fn test_search_buffer_only_no_indexed_vectors() {
         let store = test_store();
         let idx = RekhaIndex::new(4, 2, 2, 2, 8, store, DistanceMetric::L2).unwrap();
-        idx.buffer_insert(1, vec![0.0; 4]);
-        idx.buffer_insert(2, vec![1.0, 1.0, 1.0, 1.0]);
+        idx.buffer_insert_internal(1, vec![0.0; 4]);
+        idx.buffer_insert_internal(2, vec![1.0, 1.0, 1.0, 1.0]);
         let (ids, _dists) = idx.search(&[0.0; 4], 5, &SearchParams::default()).unwrap();
         assert_eq!(ids.len(), 2);
     }

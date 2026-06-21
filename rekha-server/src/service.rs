@@ -56,10 +56,17 @@ impl Rekha for RekhaService {
             data: p.data,
         });
 
-        let actual_id = self.coordinator
-            .insert(req.id, req.vector, payload)
-            .await
-            .map_err(Self::map_error)?;
+        let actual_id = if req.is_replication {
+            self.coordinator
+                .replica_insert(&req.collection_name, req.id, &req.vector, &payload)
+                .await
+                .map_err(Self::map_error)?
+        } else {
+            self.coordinator
+                .insert(&req.collection_name, req.id, req.vector, payload)
+                .await
+                .map_err(Self::map_error)?
+        };
 
         Ok(Response::new(InsertResponse {
             id: actual_id,
@@ -86,7 +93,7 @@ impl Rekha for RekhaService {
                 data: p.data,
             });
 
-            match self.coordinator.insert(item.id, item.vector, payload).await {
+            match self.coordinator.insert(&item.collection_name, item.id, item.vector, payload).await {
                 Ok(_actual_id) => count += 1,
                 Err(e) => errors.push(format!("id {}: {}", item.id, e)),
             }
@@ -172,7 +179,7 @@ impl Rekha for RekhaService {
 
         match self
             .coordinator
-            .search(req.query_vector, req.top_k as usize, search_params)
+            .search(&req.collection_name, req.query_vector, req.top_k as usize, search_params)
             .await
         {
             Ok((results, stats)) => {
@@ -223,8 +230,9 @@ impl Rekha for RekhaService {
         let coordinator = self.coordinator.clone();
 
         tokio::spawn(async move {
+            let coll = req.collection_name.clone();
             match coordinator
-                .search(req.query_vector, req.top_k as usize, search_params.clone())
+                .search(&coll, req.query_vector, req.top_k as usize, search_params.clone())
                 .await
             {
                 Ok((results, _stats)) => {
@@ -330,7 +338,7 @@ impl Rekha for RekhaService {
         };
         let (results, _stats) = self
             .coordinator
-            .search(req.query_vector, req.top_k as usize, params)
+            .search(&req.collection_name, req.query_vector, req.top_k as usize, params)
             .await
             .map_err(Self::map_error)?;
         Ok(Response::new(SearchDimRangeResponse {
@@ -349,40 +357,22 @@ impl Rekha for RekhaService {
     }
 
     async fn create_collection(
-        &self,
-        request: Request<CreateCollectionRequest>,
+        &self, request: Request<CreateCollectionRequest>,
     ) -> Result<Response<CreateCollectionResponse>, Status> {
         let req = request.into_inner();
-        let key = format!("collection:{}", req.name);
-
-        if self.coordinator.store().get_metadata(&key).map_err(Self::map_error)?.is_some() {
-            return Ok(Response::new(CreateCollectionResponse {
-                success: false,
-                error: format!("collection '{}' already exists", req.name),
-            }));
-        }
-
-        let config = req.config.ok_or_else(|| Status::invalid_argument("collection config required"))?;
-        let internal_config = CollectionConfig {
-            dim: config.dim,
-            num_vector_shards: config.num_vector_shards,
-            replication_factor: config.replication_factor,
-            num_dim_groups: config.num_dim_groups,
-            dim_group_size: config.dim_group_size,
-            nlist: config.nlist,
-            nprobe: config.nprobe,
-            pq_num_sub_vectors: config.pq_num_sub_vectors,
-            pq_num_centroids: config.pq_num_centroids,
-            re_rank_k: config.re_rank_k,
+        let config = req.config.ok_or_else(|| Status::invalid_argument("config required"))?;
+        let success = if req.is_replication {
+            self.coordinator
+                .replicate_collection(&req.name, &config).await
+                .map_err(Self::map_error)?
+        } else {
+            self.coordinator
+                .create_collection(&req.name, config.dim, config.nlist, config.nprobe, config.replication_factor).await
+                .map_err(Self::map_error)?
         };
-        let json = serde_json::to_vec(&internal_config).map_err(|e| {
-            Status::internal(format!("failed to serialize config: {e}"))
-        })?;
-        self.coordinator.store().put_metadata(&key, &json).map_err(Self::map_error)?;
-
         Ok(Response::new(CreateCollectionResponse {
-            success: true,
-            error: String::new(),
+            success,
+            error: if success { String::new() } else { format!("collection '{}' exists", req.name) },
         }))
     }
 
@@ -446,19 +436,73 @@ impl Rekha for RekhaService {
 
     async fn transfer_shard(
         &self,
-        _request: Request<TransferShardRequest>,
+        request: Request<TransferShardRequest>,
     ) -> Result<Response<Self::TransferShardStream>, Status> {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let _ = tx
-            .send(Ok(TransferShardChunk {
-                centroids: vec![],
-                nlist: 0,
-                nprobe: 0,
-                total_dim: 0,
-                vector_batches: vec![],
-                final_chunk: true,
-            }))
-            .await;
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        let coordinator = self.coordinator.clone();
+        tokio::spawn(async move {
+            let cfg_key = format!("collection:{}", req.collection_name);
+            let cfg_bytes = match coordinator.store().get_metadata(&cfg_key) {
+                Ok(Some(d)) => d,
+                _ => { let _ = tx.send(Err(Status::not_found("collection not found"))).await; return; }
+            };
+            let cfg: CollectionConfig = match serde_json::from_slice(&cfg_bytes) {
+                Ok(c) => c,
+                Err(_) => { let _ = tx.send(Err(Status::internal("bad config"))).await; return; }
+            };
+
+            let centroids: Vec<crate::proto::Vector> = Vec::new(); // centroids rebuilt on receiver
+            let nlist = cfg.nlist;
+            let nprobe = cfg.nprobe;
+
+            let col_store = coordinator.store().as_ref().clone().with_namespace(req.collection_name.clone());
+            let ids = match col_store.iter_ids() {
+                Ok(d) => d,
+                Err(e) => { let _ = tx.send(Err(Status::internal(e.to_string()))).await; return; }
+            };
+
+            let shard_ids: Vec<u64> = ids.into_iter()
+                .filter(|id| id % cfg.num_vector_shards == req.shard_id)
+                .collect();
+
+            let mut batch = Vec::new();
+            let batch_size = 500u64;
+
+            for (i, vid) in shard_ids.iter().enumerate() {
+                let vec_data = match col_store.get_vector(*vid) {
+                    Ok(Some(v)) => v,
+                    _ => continue,
+                };
+                let payload = match col_store.get_payload(*vid) {
+                    Ok(Some(p)) => Some(p),
+                    _ => None,
+                };
+                batch.push(crate::proto::VectorWithCluster {
+                    id: *vid,
+                    data: vec_data,
+                    cluster_id: 0,
+                    payload,
+                });
+
+                let last_idx = shard_ids.len().saturating_sub(1);
+                if batch.len() as u64 >= batch_size || i == last_idx {
+                    let chunk = TransferShardChunk {
+                        centroids: centroids.clone(),
+                        nlist,
+                        nprobe,
+                        total_dim: cfg.dim,
+                        vector_batches: vec![crate::proto::VectorBatch {
+                            vectors: std::mem::take(&mut batch),
+                        }],
+                        final_chunk: i == last_idx,
+                    };
+                    if tx.send(Ok(chunk)).await.is_err() { break; }
+                }
+            }
+        });
+
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }
@@ -574,6 +618,7 @@ mod tests {
 
         // Test "json" content type
         let req = tonic::Request::new(InsertRequest {
+            is_replication: false,
             id: 0,
             vector: vec![0.1],
             payload: Some(crate::proto::Payload {
@@ -587,6 +632,7 @@ mod tests {
 
         // Test "text" content type
         let req = tonic::Request::new(InsertRequest {
+            is_replication: false,
             id: 0,
             vector: vec![0.2],
             payload: Some(crate::proto::Payload {
@@ -600,6 +646,7 @@ mod tests {
 
         // Test unknown content type (maps to Raw)
         let req = tonic::Request::new(InsertRequest {
+            is_replication: false,
             id: 0,
             vector: vec![0.3],
             payload: Some(crate::proto::Payload {
@@ -613,6 +660,7 @@ mod tests {
 
         // Test no payload (None path)
         let req = tonic::Request::new(InsertRequest {
+            is_replication: false,
             id: 0,
             vector: vec![0.4],
             payload: None,
@@ -782,6 +830,7 @@ mod tests {
         let service = make_service();
         let req = tonic::Request::new(CreateCollectionRequest {
             name: "test-collection".into(),
+            is_replication: false,
             config: Some(crate::proto::CollectionConfig {
                 dim: 8,
                 num_vector_shards: 1,
@@ -804,6 +853,7 @@ mod tests {
         let service = make_service();
         let req = tonic::Request::new(CreateCollectionRequest {
             name: "dup".into(),
+            is_replication: false,
             config: Some(crate::proto::CollectionConfig {
                 dim: 4, num_vector_shards: 1, replication_factor: 1,
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
@@ -814,6 +864,7 @@ mod tests {
         assert!(resp.into_inner().success);
         let req2 = tonic::Request::new(CreateCollectionRequest {
             name: "dup".into(),
+            is_replication: false,
             config: Some(crate::proto::CollectionConfig {
                 dim: 4, num_vector_shards: 1, replication_factor: 1,
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
@@ -830,6 +881,7 @@ mod tests {
         // Create first
         let create_req = tonic::Request::new(CreateCollectionRequest {
             name: "to-drop".into(),
+            is_replication: false,
             config: Some(crate::proto::CollectionConfig {
                 dim: 4, num_vector_shards: 1, replication_factor: 1,
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
@@ -853,6 +905,7 @@ mod tests {
 
         let create_req = tonic::Request::new(CreateCollectionRequest {
             name: "list-me".into(),
+            is_replication: false,
             config: Some(crate::proto::CollectionConfig {
                 dim: 4, num_vector_shards: 1, replication_factor: 1,
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
@@ -875,6 +928,7 @@ mod tests {
 
         let create_req = tonic::Request::new(CreateCollectionRequest {
             name: "existent".into(),
+            is_replication: false,
             config: Some(crate::proto::CollectionConfig {
                 dim: 4, num_vector_shards: 1, replication_factor: 1,
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,

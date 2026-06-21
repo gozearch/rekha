@@ -51,7 +51,7 @@ impl ServerInstance {
             partition_manager,
         ));
 
-        let index = RekhaIndex::new((*store).clone())?;
+        let index = RekhaIndex::new()?;
         coordinator.initialize(index).await;
 
         let server = Self { config, coordinator };
@@ -183,14 +183,14 @@ mod tests {
         let config = ServerConfig::dev_default("test-node", &temp_dir());
         let server = ServerInstance::from_config(config).await.unwrap();
         let store = rekha_storage::RocksVectorStore::open(temp_dir()).unwrap();
-        let mut index =
-            rekha_index::RekhaIndex::new(store)
-                .unwrap();
+        let index =
+            rekha_index::RekhaIndex::new().unwrap();
+        index.create_collection("default", 8, 4, 2).unwrap();
         for i in 0..5 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.insert(i, &v).unwrap();
+            index.insert("default", i, &v).unwrap();
         }
-        index.build().unwrap();
+        index.flush_buffer("default").unwrap();
         let server = server.with_index(index).await;
         assert!(server.coordinator.is_initialized().await);
     }

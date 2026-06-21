@@ -51,10 +51,11 @@ enum Commands {
     },
     /// Create a new collection
     CreateCollection {
-        /// Collection name
         #[arg(short, long, default_value = "default")]
         collection: String,
-        /// Optional configuration (JSON or YAML string)
+        /// Replication factor
+        #[arg(long, default_value_t = 1)]
+        rf: u64,
         #[arg(long)]
         config: Option<String>,
     },
@@ -150,9 +151,19 @@ async fn main() -> anyhow::Result<()> {
                     let _ = client;
                     println!("OK");
                 }
-                Commands::CreateCollection { collection, config: _ } => {
-                    client.create_collection(&collection, 8, 128, 16).await?;
-                    println!("Collection '{collection}' created");
+                Commands::CreateCollection { collection, rf, config } => {
+                    let (dim, nlist, nprobe) = if let Some(json) = &config {
+                        match serde_json::from_str::<serde_json::Value>(json) {
+                            Ok(v) => (
+                                v.get("dim").and_then(|d| d.as_u64()).unwrap_or(8) as u32,
+                                v.get("nlist").and_then(|d| d.as_u64()).unwrap_or(128) as u32,
+                                v.get("nprobe").and_then(|d| d.as_u64()).unwrap_or(16) as u32,
+                            ),
+                            Err(_) => { eprintln!("Warning: invalid config JSON, using defaults"); (8u32, 128u32, 16u32) }
+                        }
+                    } else { (8u32, 128u32, 16u32) };
+                    client.create_collection(&collection, dim, nlist, nprobe, rf).await?;
+                    println!("Collection '{collection}' created (dim={dim} rf={rf})");
                 }
                 Commands::DropCollection { collection } => {
                     client.drop_collection(&collection).await?;
@@ -293,7 +304,7 @@ mod tests {
     fn test_cli_parse_create_collection() {
         let cli = Cli::try_parse_from(["rekha", "create-collection", "-c", "new_col"]).unwrap();
         match cli.command {
-            Commands::CreateCollection { collection, config } => {
+            Commands::CreateCollection { collection, config, .. } => {
                 assert_eq!(collection, "new_col");
                 assert!(config.is_none());
             }
@@ -313,7 +324,7 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::CreateCollection { collection, config } => {
+            Commands::CreateCollection { collection, config, .. } => {
                 assert_eq!(collection, "new_col");
                 assert_eq!(config, Some("{\"dim\":128}".into()));
             }

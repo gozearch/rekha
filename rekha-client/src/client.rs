@@ -205,6 +205,37 @@ impl RekhaClient {
 
     /// Insert a vector with optional payload.
     /// Automatically follows leader redirects.
+    pub async fn replica_insert(
+        &self,
+        id: u64,
+        vector: Vec<f32>,
+        collection_name: &str,
+        payload: Option<Vec<u8>>,
+    ) -> Result<u64, RekhaError> {
+        let ch = self.channel.read().await.clone();
+        let v = vector.clone();
+        let p = payload.clone();
+        let cn = collection_name.to_string();
+        self.with_retry("replica_insert", move || {
+            let request = tonic::Request::new(InsertRequest {
+                id,
+                vector: v.clone(),
+                collection_name: cn.clone(),
+                payload: p.clone().map(|data| proto::Payload {
+                    content_type: "raw".into(),
+                    data,
+                }),
+                is_replication: true,
+            });
+            let mut client = GrpcClient::new(ch.clone());
+            async move {
+                let resp = client.insert(request).await?.into_inner();
+                if resp.success { Ok(resp.id) }
+                else { Err(tonic::Status::internal(resp.error)) }
+            }
+        }).await
+    }
+
     pub async fn insert(
         &self,
         id: u64,
@@ -229,6 +260,7 @@ impl RekhaClient {
                             content_type: "raw".into(),
                             data,
                         }),
+                        is_replication: false,
                     });
                     let mut client = GrpcClient::new(ch.clone());
                     async move {
@@ -414,7 +446,7 @@ impl RekhaClient {
     }
 
     pub async fn create_collection(
-        &self, name: &str, dim: u32, nlist: u32, nprobe: u32,
+        &self, name: &str, dim: u32, nlist: u32, nprobe: u32, rf: u64,
     ) -> Result<bool, RekhaError> {
         let ch = self.channel.read().await.clone();
         let name = name.to_string();
@@ -422,17 +454,35 @@ impl RekhaClient {
             let request = tonic::Request::new(CreateCollectionRequest {
                 name: name.clone(),
                 config: Some(crate::proto::CollectionConfig {
-                    dim,
-                    num_vector_shards: 1,
-                    replication_factor: 1,
+                    dim, nlist, nprobe,
+                    num_vector_shards: 6,
+                    replication_factor: rf,
                     num_dim_groups: 4,
                     dim_group_size: dim / 4,
-                    nlist,
-                    nprobe,
                     pq_num_sub_vectors: 4,
                     pq_num_centroids: 256,
                     re_rank_k: 256,
                 }),
+                is_replication: false,
+            });
+            let mut client = GrpcClient::new(ch.clone());
+            async move {
+                client.create_collection(request).await
+                    .map(|r| r.into_inner().success)
+            }
+        }).await
+    }
+
+    pub async fn replica_create_collection(
+        &self, name: &str, config: crate::proto::CollectionConfig,
+    ) -> Result<bool, RekhaError> {
+        let ch = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("replica_create_collection", move || {
+            let request = tonic::Request::new(CreateCollectionRequest {
+                name: name.clone(),
+                config: Some(config),
+                is_replication: true,
             });
             let mut client = GrpcClient::new(ch.clone());
             async move {

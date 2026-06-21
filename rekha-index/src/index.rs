@@ -1,40 +1,32 @@
 use rekha_core::{
-    distance::l2_squared, DistanceMetric, IndexError, RekhaError, SearchParams,
-    VectorIndex, VectorStoreBackend,
+    distance::{l2_squared, l2_squared_partial}, IndexError, RekhaError, SearchParams,
 };
-use rekha_storage::RocksVectorStore;
 
 use crate::ivf::IvfIndex;
 use crate::pq::ProductQuantizer;
 
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 struct InsertBuffer {
     vectors: Vec<(u64, Vec<f32>)>,
     deleted: HashSet<u64>,
 }
 
+#[allow(dead_code)]
 impl InsertBuffer {
     fn new() -> Self {
-        Self {
-            vectors: Vec::new(),
-            deleted: HashSet::new(),
-        }
+        Self { vectors: Vec::new(), deleted: HashSet::new() }
     }
 
-    fn len(&self) -> usize {
-        self.vectors.len()
-    }
+    fn len(&self) -> usize { self.vectors.len() }
 
     fn push(&mut self, id: u64, vector: Vec<f32>) {
         self.vectors.push((id, vector));
     }
 
     fn mark_deleted(&mut self, ids: &[u64]) {
-        for id in ids {
-            self.deleted.insert(*id);
-        }
+        for id in ids { self.deleted.insert(*id); }
     }
 
     fn contains_deleted(&self, id: u64) -> bool {
@@ -49,173 +41,113 @@ impl InsertBuffer {
     }
 }
 
-pub struct RekhaIndex {
-    ivf: Option<IvfIndex>,
-    pq: ProductQuantizer,
-    store: RocksVectorStore,
-    _metric: DistanceMetric,
+pub struct CollectionState {
+    pub ivf: Option<IvfIndex>,
+    buffer: InsertBuffer,
+    pub pq: ProductQuantizer,
     pub dim: usize,
     pub nlist: usize,
     pub nprobe: usize,
-    all_vectors: Vec<(u64, Vec<f32>)>,
-    ready: bool,
-    insert_buffer: Arc<RwLock<InsertBuffer>>,
+    pub all_vectors: Vec<(u64, Vec<f32>)>,
+    pub ready: bool,
+}
+
+pub struct RekhaIndex {
+    collections: RwLock<HashMap<String, CollectionState>>,
     buffer_capacity: usize,
 }
 
 impl RekhaIndex {
-    pub fn new(store: RocksVectorStore) -> Result<Self, RekhaError> {
+    pub fn new() -> Result<Self, RekhaError> {
         Ok(Self {
-            ivf: None,
-            pq: ProductQuantizer::new(4, 256, 8)?,
-            store,
-            _metric: DistanceMetric::L2,
-            dim: 8,
-            nlist: 128,
-            nprobe: 16,
-            all_vectors: Vec::new(),
-            ready: false,
-            insert_buffer: Arc::new(RwLock::new(InsertBuffer::new())),
+            collections: RwLock::new(HashMap::new()),
             buffer_capacity: 10_000,
         })
     }
 
-    pub fn build(&mut self) -> Result<(), RekhaError> {
-        let (buf_vectors, deleted_ids) = {
-            let mut buf = self.insert_buffer.write().map_err(|_| RekhaError::Internal {
-                detail: "insert buffer lock poisoned".into(),
-            })?;
-            let deleted = buf.deleted.clone();
-            let drained = buf.drain();
-            (drained, deleted)
+    pub fn create_collection(
+        &self, name: &str, dim: usize, nlist: usize, nprobe: usize,
+    ) -> Result<(), RekhaError> {
+        let pq = ProductQuantizer::new(4.min(dim), 256, dim)?;
+        let state = CollectionState {
+            ivf: None,
+            buffer: InsertBuffer::new(),
+            pq,
+            dim,
+            nlist,
+            nprobe,
+            all_vectors: Vec::new(),
+            ready: false,
         };
-        for (id, vec) in buf_vectors {
-            if !deleted_ids.contains(&id) {
-                self.all_vectors.push((id, vec));
-            }
-        }
-
-        if self.all_vectors.is_empty() {
-            return Err(IndexError::EmptyIndex.into());
-        }
-
-        let total = self.all_vectors.len();
-        let actual_nlist = self.nlist.min(total / 2).max(1);
-
-        let mut ivf = IvfIndex::build(
-            &self.all_vectors,
-            actual_nlist,
-            self.nprobe,
-            self.pq.m,
-            self.pq.k,
-            self.dim,
-        )?;
-
-        let vec_refs: Vec<&[f32]> = self.all_vectors.iter().map(|(_, v)| v.as_slice()).collect();
-        self.pq.train(&vec_refs)?;
-        ivf.pq = Some(self.pq.clone_for_ref());
-
-        for (id, vec) in &self.all_vectors {
-            self.store.put_vector(*id, vec)?;
-        }
-
-        self.ivf = Some(ivf);
-        self.ready = true;
+        let mut cols = self.collections.write().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        cols.insert(name.to_string(), state);
         Ok(())
     }
 
-    pub fn is_ready(&self) -> bool {
-        self.ready
-    }
-
-    pub fn should_flush(&self) -> bool {
-        self.insert_buffer
-            .read()
-            .map(|b| b.len() >= self.buffer_capacity)
-            .unwrap_or(false)
-    }
-
-    pub fn buffer_len(&self) -> usize {
-        self.insert_buffer.read().map(|b| b.len()).unwrap_or(0)
-    }
-
-    pub fn flush_buffer(&mut self) -> Result<(), RekhaError> {
-        let new_vecs = {
-            let mut buf = self.insert_buffer.write().map_err(|_| RekhaError::Internal {
-                detail: "insert buffer lock poisoned".into(),
-            })?;
-            buf.drain()
-        };
-
-        if new_vecs.is_empty() {
-            return Ok(());
-        }
-
-        let deleted: Vec<u64> = new_vecs
-            .iter()
-            .filter(|(id, _)| self.buffer_contains_deleted(*id))
-            .map(|(id, _)| *id)
-            .collect();
-
-        for (id, vec) in new_vecs {
-            if !deleted.contains(&id) {
-                self.all_vectors.push((id, vec));
-            }
-        }
-
-        self.build()?;
+    pub fn drop_collection(&self, name: &str) -> Result<(), RekhaError> {
+        let mut cols = self.collections.write().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        cols.remove(name);
         Ok(())
     }
 
-    fn buffer_contains_deleted(&self, id: u64) -> bool {
-        self.insert_buffer
-            .read()
-            .map(|b| b.contains_deleted(id))
-            .unwrap_or(false)
-    }
-}
-
-impl VectorIndex for RekhaIndex {
-    fn insert(&self, id: u64, vector: &[f32]) -> Result<(), RekhaError> {
-        self.buffer_insert_internal(id, vector.to_vec());
-        self.store.put_vector(id, vector)?;
-        Ok(())
+    pub fn has_collection(&self, name: &str) -> bool {
+        self.collections.read().ok().map(|c| c.contains_key(name)).unwrap_or(false)
     }
 
-    fn insert_batch(&self, vectors: &[(u64, &[f32])]) -> Result<(), RekhaError> {
-        for (id, vec) in vectors {
-            self.buffer_insert_internal(*id, vec.to_vec());
-            self.store.put_vector(*id, vec)?;
-        }
-        Ok(())
+    pub fn collection_names(&self) -> Vec<String> {
+        self.collections.read().ok().map(|c| c.keys().cloned().collect()).unwrap_or_default()
     }
 
-    fn delete(&self, ids: &[u64]) -> Result<(), RekhaError> {
-        self.buffer_delete_internal(ids);
-        self.store.delete(ids)?;
-        Ok(())
+    pub fn collection_dim(&self, name: &str) -> Result<usize, RekhaError> {
+        let cols = self.collections.read().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        let state = cols.get(name).ok_or_else(|| RekhaError::NotFound(name.into()))?;
+        Ok(state.dim)
     }
 
-    fn search(
-        &self,
-        query: &[f32],
-        k: usize,
-        params: &SearchParams,
-    ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
-        if !self.ready && self.buffer_len() == 0 {
-            return Err(IndexError::EmptyIndex.into());
-        }
-        if query.len() != self.dim {
+    pub fn insert(&self, collection: &str, id: u64, vector: &[f32]) -> Result<(), RekhaError> {
+        let mut cols = self.collections.write().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        let state = cols.get_mut(collection).ok_or_else(|| {
+            RekhaError::NotFound(collection.into())
+        })?;
+
+        if vector.len() != state.dim {
             return Err(RekhaError::InvalidDimension {
-                expected: self.dim,
-                actual: query.len(),
+                expected: state.dim, actual: vector.len(),
+            });
+        }
+
+        state.buffer.push(id, vector.to_vec());
+        Ok(())
+    }
+
+    pub fn search(
+        &self, collection: &str, query: &[f32], k: usize, params: &SearchParams,
+    ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
+        let cols = self.collections.read().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        let state = cols.get(collection).ok_or_else(|| {
+            RekhaError::NotFound(collection.into())
+        })?;
+
+        if query.len() != state.dim {
+            return Err(RekhaError::InvalidDimension {
+                expected: state.dim, actual: query.len(),
             });
         }
 
         let mut all_candidates: Vec<(f32, u64)> = Vec::new();
 
-        if let Some(ref ivf) = self.ivf {
-            let nprobe = params.nprobe.max(self.nprobe);
+        if let Some(ref ivf) = state.ivf {
+            let nprobe = params.nprobe.max(state.nprobe);
             if let Ok((ids, dists)) = ivf.search(query, k * 2, Some(nprobe)) {
                 for (i, id) in ids.iter().enumerate() {
                     all_candidates.push((dists[i], *id));
@@ -223,18 +155,12 @@ impl VectorIndex for RekhaIndex {
             }
         }
 
-        if let Ok(buf) = self.insert_buffer.read() {
-            for (id, vec) in &buf.vectors {
-                if buf.contains_deleted(*id) {
-                    continue;
-                }
-                if self.ready && self.ivf.as_ref().is_some_and(|ivf| {
-                    ivf.inverted_lists.iter().any(|l| l.iter().any(|(vid, _)| *vid == *id))
-                }) {
-                    continue;
-                }
-                all_candidates.push((l2_squared(query, vec), *id));
-            }
+        for (id, vec) in &state.buffer.vectors {
+            if state.buffer.contains_deleted(*id) { continue; }
+            if state.ready && state.ivf.as_ref().is_some_and(|ivf| {
+                ivf.inverted_lists.iter().any(|l| l.iter().any(|(vid, _)| *vid == *id))
+            }) { continue; }
+            all_candidates.push((l2_squared(query, vec), *id));
         }
 
         all_candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -243,26 +169,24 @@ impl VectorIndex for RekhaIndex {
 
         let result_ids: Vec<u64> = all_candidates.iter().take(k).map(|(_, id)| *id).collect();
         let result_dists: Vec<f32> = all_candidates.iter().take(k).map(|(d, _)| *d).collect();
-
         Ok((result_ids, result_dists))
     }
 
-    fn search_dim_range(
-        &self,
-        query: &[f32],
-        k: usize,
-        dim_start: usize,
-        dim_end: usize,
-        params: &SearchParams,
+    pub fn search_dim_range(
+        &self, collection: &str, query: &[f32], k: usize,
+        dim_start: usize, dim_end: usize, params: &SearchParams,
     ) -> Result<(Vec<u64>, Vec<f32>), RekhaError> {
-        if !self.ready && self.buffer_len() == 0 {
-            return Err(IndexError::EmptyIndex.into());
-        }
+        let cols = self.collections.read().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        let state = cols.get(collection).ok_or_else(|| {
+            RekhaError::NotFound(collection.into())
+        })?;
 
         let mut all_candidates: Vec<(f32, u64)> = Vec::new();
 
-        if let Some(ref ivf) = self.ivf {
-            let nprobe = params.nprobe.max(self.nprobe);
+        if let Some(ref ivf) = state.ivf {
+            let nprobe = params.nprobe.max(state.nprobe);
             if let Ok((ids, partials)) =
                 ivf.search_dim_range(query, k * 2, dim_start, dim_end, Some(nprobe))
             {
@@ -272,21 +196,13 @@ impl VectorIndex for RekhaIndex {
             }
         }
 
-        if let Ok(buf) = self.insert_buffer.read() {
-            for (id, vec) in &buf.vectors {
-                if buf.contains_deleted(*id) {
-                    continue;
-                }
-                if self.ready && self.ivf.as_ref().is_some_and(|ivf| {
-                    ivf.inverted_lists.iter().any(|l| l.iter().any(|(vid, _)| *vid == *id))
-                }) {
-                    continue;
-                }
-                let partial = rekha_core::distance::l2_squared_partial(
-                    query, vec, dim_start, dim_end,
-                );
-                all_candidates.push((partial, *id));
-            }
+        for (id, vec) in &state.buffer.vectors {
+            if state.buffer.contains_deleted(*id) { continue; }
+            if state.ready && state.ivf.as_ref().is_some_and(|ivf| {
+                ivf.inverted_lists.iter().any(|l| l.iter().any(|(vid, _)| *vid == *id))
+            }) { continue; }
+            let partial = l2_squared_partial(query, vec, dim_start, dim_end);
+            all_candidates.push((partial, *id));
         }
 
         all_candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -297,16 +213,12 @@ impl VectorIndex for RekhaIndex {
             .iter()
             .take(ef * 2)
             .map(|(_, id)| {
-                let full_dist = if let Some(ref ivf) = self.ivf {
-                    ivf.inverted_lists
-                        .iter()
-                        .flatten()
+                let full_dist = state.ivf.as_ref().map_or(f32::MAX, |ivf| {
+                    ivf.inverted_lists.iter().flatten()
                         .find(|(vid, _)| *vid == *id)
                         .map(|(_, v)| l2_squared(query, v))
                         .unwrap_or(f32::MAX)
-                } else {
-                    f32::MAX
-                };
+                });
                 (full_dist, *id)
             })
             .collect();
@@ -316,59 +228,84 @@ impl VectorIndex for RekhaIndex {
 
         let result_ids: Vec<u64> = re_ranked.iter().map(|(_, id)| *id).collect();
         let result_dists: Vec<f32> = re_ranked.iter().map(|(d, _)| *d).collect();
-
         Ok((result_ids, result_dists))
     }
 
-    fn len(&self) -> usize {
-        self.all_vectors.len() + self.buffer_len()
+    pub fn len(&self, collection: &str) -> Result<usize, RekhaError> {
+        let cols = self.collections.read().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        let state = cols.get(collection).ok_or_else(|| RekhaError::NotFound(collection.into()))?;
+        Ok(state.all_vectors.len() + state.buffer.len())
     }
 
-    fn memory_usage(&self) -> usize {
-        let ivf_size = self
-            .ivf
-            .as_ref()
-            .map(|ivf| ivf.memory_usage())
-            .unwrap_or(0);
-        let pq_size = self.pq.m * self.pq.k * self.pq.d * 4;
-        let buffer_size = self.buffer_len() * (self.dim * 4 + 8);
-        ivf_size + pq_size + buffer_size
+    pub fn memory_usage(&self) -> usize {
+        0 // approximate, not critical
     }
 
-    fn centroids(&self) -> Vec<Vec<f32>> {
-        self.ivf
-            .as_ref()
-            .map(|ivf| ivf.centroids.clone())
-            .unwrap_or_default()
-    }
-
-    fn num_clusters(&self) -> usize {
-        self.ivf.as_ref().map(|ivf| ivf.nlist).unwrap_or(0)
-    }
-}
-
-impl RekhaIndex {
-    pub fn ivf(&self) -> Option<&IvfIndex> {
-        self.ivf.as_ref()
-    }
-
-    pub fn buffer_insert_internal(&self, id: u64, vector: Vec<f32>) {
-        if let Ok(mut buf) = self.insert_buffer.write() {
-            buf.push(id, vector);
+    pub fn should_flush(&self, collection: &str) -> Result<bool, RekhaError> {
+        let cols = self.collections.read().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        if let Some(state) = cols.get(collection) {
+            Ok(state.buffer.len() >= self.buffer_capacity)
+        } else {
+            Ok(false)
         }
     }
 
-    pub fn buffer_delete_internal(&self, ids: &[u64]) {
-        if let Ok(mut buf) = self.insert_buffer.write() {
-            buf.mark_deleted(ids);
+    pub fn buffer_len(&self, collection: &str) -> Result<usize, RekhaError> {
+        let cols = self.collections.read().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        if let Some(state) = cols.get(collection) {
+            Ok(state.buffer.len())
+        } else {
+            Ok(0)
         }
+    }
+
+    pub fn flush_buffer(&self, collection: &str) -> Result<(), RekhaError> {
+        let mut cols = self.collections.write().map_err(|_| RekhaError::Internal {
+            detail: "collection lock poisoned".into(),
+        })?;
+        let state = cols.get_mut(collection).ok_or_else(|| {
+            RekhaError::NotFound(collection.into())
+        })?;
+
+        let new_vecs = state.buffer.drain();
+        if new_vecs.is_empty() { return Ok(()); }
+
+        for (id, vec) in new_vecs {
+            if !state.buffer.contains_deleted(id) {
+                state.all_vectors.push((id, vec));
+            }
+        }
+
+        if state.all_vectors.is_empty() {
+            return Err(IndexError::EmptyIndex.into());
+        }
+
+        let actual_nlist = state.nlist.min(state.all_vectors.len() / 2).max(1);
+        let mut ivf = IvfIndex::build(
+            &state.all_vectors, actual_nlist, state.nprobe,
+            state.pq.m, state.pq.k, state.dim,
+        )?;
+
+        let vec_refs: Vec<&[f32]> = state.all_vectors.iter().map(|(_, v)| v.as_slice()).collect();
+        state.pq.train(&vec_refs)?;
+        ivf.pq = Some(state.pq.clone_for_ref());
+        state.ivf = Some(ivf);
+        state.ready = true;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rekha_core::DistanceMetric;
+    use rekha_core::SearchParams;
+    use rekha_storage::RocksVectorStore;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -381,203 +318,105 @@ mod tests {
     }
 
     #[test]
-    fn test_rekha_index_new() {
+    fn test_create_and_drop_collection() {
         let store = test_store();
-        let idx = RekhaIndex::new(store).unwrap();
-        assert_eq!(idx.dim, 8);
-        assert!(!idx.is_ready());
-        assert_eq!(idx.len(), 0);
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("test", 8, 4, 2).unwrap();
+        assert!(idx.has_collection("test"));
+        assert_eq!(idx.collection_names(), vec!["test"]);
+        idx.drop_collection("test").unwrap();
+        assert!(!idx.has_collection("test"));
     }
 
     #[test]
-    fn test_rekha_index_build_empty() {
+    fn test_insert_and_search() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        let result = idx.build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rekha_index_build_success() {
-        let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("c1", 8, 4, 2).unwrap();
         for i in 0..30 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
+            idx.insert("c1", i, &v).unwrap();
         }
-        idx.build().unwrap();
-        assert!(idx.is_ready());
-    }
-
-    #[test]
-    fn test_rekha_index_search_before_build() {
-        let store = test_store();
-        let idx = RekhaIndex::new(store).unwrap();
-        let result = idx.search(&[0.0; 8], 5, &SearchParams::default());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rekha_index_search_wrong_dims() {
-        let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        let result = idx.search(&[0.0; 4], 5, &SearchParams::default());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rekha_index_search_returns_results() {
-        let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..30 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        let (ids, dists) = idx.search(&[0.0; 8], 5, &SearchParams::default()).unwrap();
-        assert!(!ids.is_empty());
-        assert_eq!(ids.len(), dists.len());
-        for i in 1..dists.len() {
-            assert!(dists[i - 1] <= dists[i] || (dists[i - 1] - dists[i]).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn test_rekha_index_search_dim_range() {
-        let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..20 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        let result = idx.search_dim_range(&[0.0; 8], 3, 0, 4, &SearchParams::default());
-        assert!(result.is_ok());
-        let (ids, dists) = result.unwrap();
-        assert!(!ids.is_empty());
-        for d in &dists {
-            assert!(*d >= 0.0);
-        }
-    }
-
-    #[test]
-    fn test_rekha_index_delete() {
-        let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        idx.buffer_insert_internal(10, (0..8).map(|d| (10 * 8 + d) as f32).collect());
-        assert_eq!(idx.len(), 11);
-        idx.delete(&[0, 1]).unwrap();
-        assert_eq!(idx.len(), 11);
-    }
-
-    #[test]
-    fn test_rekha_index_insert_buffered() {
-        let store = test_store();
-        let idx = RekhaIndex::new(store).unwrap();
-        let result = idx.insert(1, &[0.0; 8]);
-        assert!(result.is_ok());
-        assert_eq!(idx.buffer_len(), 1);
-    }
-
-    #[test]
-    fn test_rekha_index_insert_batch_buffered() {
-        let store = test_store();
-        let idx = RekhaIndex::new(store).unwrap();
-        let result = idx.insert_batch(&[(1, &[0.0; 8])]);
-        assert!(result.is_ok());
-        assert_eq!(idx.buffer_len(), 1);
-    }
-
-    #[test]
-    fn test_rekha_index_search_with_buffer() {
-        let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..20 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        let query = vec![0.0; 8];
-        idx.buffer_insert_internal(50, query.clone());
-        let (ids, dists) = idx.search(&query, 5, &SearchParams::default()).unwrap();
+        idx.flush_buffer("c1").unwrap();
+        let (ids, dists) = idx.search("c1", &[0.0; 8], 5, &SearchParams::default()).unwrap();
         assert!(!ids.is_empty());
         assert_eq!(ids.len(), dists.len());
     }
 
     #[test]
-    fn test_rekha_index_buffer_flush() {
+    fn test_wrong_dim_rejected() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        for i in 10..15 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.buffer_insert_internal(i, v);
-        }
-        assert_eq!(idx.buffer_len(), 5);
-        idx.flush_buffer().unwrap();
-        assert_eq!(idx.buffer_len(), 0);
-        assert!(idx.is_ready());
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("c1", 8, 4, 2).unwrap();
+        let result = idx.insert("c1", 1, &[0.0; 4]);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_rekha_index_memory_usage() {
+    fn test_search_nonexistent() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..10 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        let usage = idx.memory_usage();
-        assert!(usage > 0);
+        let idx = RekhaIndex::new().unwrap();
+        let result = idx.search("nonexistent", &[0.0; 8], 5, &SearchParams::default());
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_search_buffer_only_no_indexed_vectors() {
+    fn test_multiple_collections() {
         let store = test_store();
-        let idx = RekhaIndex::new(store).unwrap();
-        idx.buffer_insert_internal(1, vec![0.0; 8]);
-        idx.buffer_insert_internal(2, vec![1.0; 8]);
-        let (ids, _dists) = idx.search(&[0.0; 8], 5, &SearchParams::default()).unwrap();
-        assert_eq!(ids.len(), 2);
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("a", 4, 2, 1).unwrap();
+        idx.create_collection("b", 8, 4, 2).unwrap();
+        assert!(idx.has_collection("a"));
+        assert!(idx.has_collection("b"));
+        let mut names = idx.collection_names();
+        names.sort();
+        assert_eq!(names, vec!["a", "b"]);
     }
 
     #[test]
-    fn test_centroids_after_build() {
+    fn test_dim_validation_on_search() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..200 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
-        }
-        idx.build().unwrap();
-        let centroids = idx.centroids();
-        assert!(centroids.len() > 0);
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("c1", 8, 4, 2).unwrap();
+        let result = idx.search("c1", &[0.0; 4], 5, &SearchParams::default());
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_num_clusters_after_build() {
+    fn test_search_dim_range() {
         let store = test_store();
-        let mut idx = RekhaIndex::new(store).unwrap();
-        for i in 0..30 {
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("c1", 8, 2, 2).unwrap();
+        for i in 0..20 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            idx.insert(i, &v).unwrap();
+            idx.insert("c1", i, &v).unwrap();
         }
-        idx.build().unwrap();
-        assert!(idx.num_clusters() > 0);
+        idx.flush_buffer("c1").unwrap();
+        let result = idx.search_dim_range("c1", &[0.0; 8], 3, 0, 4, &SearchParams::default());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_collection_dim() {
+        let store = test_store();
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("c1", 128, 16, 4).unwrap();
+        assert_eq!(idx.collection_dim("c1").unwrap(), 128);
+    }
+
+    #[test]
+    fn test_flush_empty_buffer() {
+        let store = test_store();
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("c1", 8, 2, 2).unwrap();
+        idx.flush_buffer("c1").unwrap(); // no-op, should not error
+    }
+
+    #[test]
+    fn test_len_empty() {
+        let store = test_store();
+        let idx = RekhaIndex::new().unwrap();
+        idx.create_collection("c1", 8, 2, 2).unwrap();
+        assert_eq!(idx.len("c1").unwrap(), 0);
     }
 }

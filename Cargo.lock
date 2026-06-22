@@ -1466,6 +1466,7 @@ dependencies = [
  "rekha-core",
  "rekha-index",
  "rekha-partition",
+ "rekha-quant",
  "serde",
  "serde_json",
  "tokio",
@@ -1492,18 +1493,48 @@ dependencies = [
  "approx",
  "futures",
  "proptest",
- "prost",
  "rand 0.8.6",
  "rekha-core",
+ "rekha-proto",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-test",
  "tonic",
- "tonic-build",
+ "tracing",
+]
+
+[[package]]
+name = "rekha-cluster"
+version = "0.1.0"
+dependencies = [
+ "rekha-client",
+ "rekha-core",
+ "rekha-proto",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rekha-coordinator"
+version = "0.1.0"
+dependencies = [
+ "rekha-client",
+ "rekha-cluster",
+ "rekha-core",
+ "rekha-index",
+ "rekha-partition",
+ "rekha-proto",
+ "rekha-replication",
+ "rekha-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -1529,12 +1560,11 @@ dependencies = [
  "fnv",
  "log",
  "proptest",
- "rand 0.8.6",
  "rekha-core",
+ "rekha-quant",
  "rekha-storage",
  "serde",
  "tempfile",
- "thiserror",
 ]
 
 [[package]]
@@ -1548,7 +1578,36 @@ dependencies = [
  "rand 0.8.6",
  "rekha-core",
  "serde",
- "thiserror",
+]
+
+[[package]]
+name = "rekha-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "rekha-core",
+ "serde_json",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "rekha-quant"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "rand 0.8.6",
+ "rekha-core",
+]
+
+[[package]]
+name = "rekha-replication"
+version = "0.1.0"
+dependencies = [
+ "rekha-core",
+ "rekha-partition",
+ "rekha-storage",
+ "tempfile",
 ]
 
 [[package]]
@@ -1562,23 +1621,24 @@ dependencies = [
  "dashmap",
  "futures",
  "proptest",
- "prost",
  "rand 0.8.6",
  "rekha-client",
+ "rekha-cluster",
+ "rekha-coordinator",
  "rekha-core",
  "rekha-index",
  "rekha-partition",
+ "rekha-proto",
+ "rekha-replication",
  "rekha-storage",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-test",
  "tonic",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1597,7 +1657,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
 ]
 

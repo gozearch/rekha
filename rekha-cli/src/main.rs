@@ -145,15 +145,17 @@ async fn main() -> anyhow::Result<()> {
                     println!("Deleted {count} vectors");
                 }
                 Commands::Info => {
-                    let info = client.cluster_info().await?;
+                    let (cluster_id, peers) = client.cluster_info().await?;
                     println!("Rekha cluster info:");
-                    println!("  Node ID: {}", info.node_id);
-                    println!("  Address: {}", info.address);
-                    println!("  Status: {:?}", info.status);
+                    println!("  Cluster ID: {}", cluster_id);
+                    println!("  Peers ({}):", peers.len());
+                    for p in &peers {
+                        println!("    {} @ {}", p.node_id, p.address);
+                    }
                 }
                 Commands::Health => {
-                    let _ = client;
-                    println!("OK");
+                    let (cluster_id, _) = client.cluster_info().await?;
+                    println!("OK  cluster={}", cluster_id);
                 }
                 Commands::CreateCollection { collection, rf, config } => {
                     let (dim, nlist, nprobe) = if let Some(json) = &config {

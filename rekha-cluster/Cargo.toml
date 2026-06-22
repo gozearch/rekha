@@ -1,0 +1,20 @@
+[package]
+name = "rekha-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Cluster membership and peer communication for Rekha"
+keywords = ["vector-database", "cluster", "membership"]
+categories = ["database"]
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-proto = { path = "../rekha-proto" }
+rekha-client = { path = "../rekha-client" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

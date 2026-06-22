@@ -115,6 +115,35 @@ pub fn validate_dimensions(vectors: &[&[f32]], expected: usize) -> Result<(), cr
 }
 
 #[cfg(test)]
+mod proptests {
+    use proptest::prelude::*;
+    use crate::distance::*;
+
+    fn valid_vec() -> impl Strategy<Value = Vec<f32>> {
+        proptest::collection::vec(-1e10f32..1e10f32, 1..10usize)
+    }
+
+    proptest! {
+        #[test]
+        fn l2_squared_nonnegative(a in valid_vec(), b in valid_vec()) {
+            if a.len() == b.len() {
+                let d = l2_squared(&a, &b);
+                assert!(d >= 0.0 || d.is_nan());
+            }
+        }
+
+        #[test]
+        fn l2_squared_symmetric(a in valid_vec(), b in valid_vec()) {
+            if a.len() == b.len() {
+                let d1 = l2_squared(&a, &b);
+                let d2 = l2_squared(&b, &a);
+                assert!((d1 - d2).abs() < 1e-6, "l2_squared not symmetric: d1={d1}, d2={d2}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

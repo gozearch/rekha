@@ -1,6 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::Rng;
-use rekha_index::{IvfIndex, ProductQuantizer};
+use rekha_index::IvfIndex;
+use rekha_quant::ProductQuantizer;
 
 fn bench_pq_encode(c: &mut Criterion) {
     let dim = 768;

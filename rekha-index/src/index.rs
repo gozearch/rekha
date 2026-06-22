@@ -3,7 +3,7 @@ use rekha_core::{
 };
 
 use crate::ivf::IvfIndex;
-use crate::pq::ProductQuantizer;
+use rekha_quant::ProductQuantizer;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -165,7 +165,7 @@ impl RekhaIndex {
             all_candidates.push((l2_squared(query, vec), *id));
         }
 
-        all_candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        all_candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
         let ef = params.ef_search.max(k);
         all_candidates.truncate(ef);
 
@@ -207,7 +207,7 @@ impl RekhaIndex {
             all_candidates.push((partial, *id));
         }
 
-        all_candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        all_candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
         let ef = params.ef_search.max(k);
         all_candidates.truncate(ef);
 
@@ -225,7 +225,7 @@ impl RekhaIndex {
             })
             .collect();
 
-        re_ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        re_ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
         re_ranked.truncate(k);
 
         let result_ids: Vec<u64> = re_ranked.iter().map(|(_, id)| *id).collect();
@@ -310,21 +310,9 @@ impl RekhaIndex {
 mod tests {
     use super::*;
     use rekha_core::SearchParams;
-    use rekha_storage::RocksVectorStore;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn test_store() -> RocksVectorStore {
-        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("rekha_idx_test_{}", n));
-        let _ = std::fs::remove_dir_all(&dir);
-        RocksVectorStore::open(&dir).unwrap()
-    }
 
     #[test]
     fn test_create_and_drop_collection() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("test", 8, 4, 2).unwrap();
         assert!(idx.has_collection("test"));
@@ -335,7 +323,6 @@ mod tests {
 
     #[test]
     fn test_insert_and_search() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("c1", 8, 4, 2).unwrap();
         for i in 0..30 {
@@ -350,7 +337,6 @@ mod tests {
 
     #[test]
     fn test_wrong_dim_rejected() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("c1", 8, 4, 2).unwrap();
         let result = idx.insert("c1", 1, 0, &[0.0; 4]);
@@ -359,7 +345,6 @@ mod tests {
 
     #[test]
     fn test_search_nonexistent() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         let result = idx.search("nonexistent", &[0.0; 8], 5, &SearchParams::default());
         assert!(result.is_err());
@@ -367,7 +352,6 @@ mod tests {
 
     #[test]
     fn test_multiple_collections() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("a", 4, 2, 1).unwrap();
         idx.create_collection("b", 8, 4, 2).unwrap();
@@ -380,7 +364,6 @@ mod tests {
 
     #[test]
     fn test_dim_validation_on_search() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("c1", 8, 4, 2).unwrap();
         let result = idx.search("c1", &[0.0; 4], 5, &SearchParams::default());
@@ -389,7 +372,6 @@ mod tests {
 
     #[test]
     fn test_search_dim_range() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("c1", 8, 2, 2).unwrap();
         for i in 0..20 {
@@ -403,7 +385,6 @@ mod tests {
 
     #[test]
     fn test_collection_dim() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("c1", 128, 16, 4).unwrap();
         assert_eq!(idx.collection_dim("c1").unwrap(), 128);
@@ -411,7 +392,6 @@ mod tests {
 
     #[test]
     fn test_flush_empty_buffer() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("c1", 8, 2, 2).unwrap();
         idx.flush_buffer("c1").unwrap(); // no-op, should not error
@@ -419,7 +399,6 @@ mod tests {
 
     #[test]
     fn test_len_empty() {
-        let store = test_store();
         let idx = RekhaIndex::new().unwrap();
         idx.create_collection("c1", 8, 2, 2).unwrap();
         assert_eq!(idx.len("c1").unwrap(), 0);

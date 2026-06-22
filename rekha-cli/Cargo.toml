@@ -2,6 +2,12 @@
 name = "rekha-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Command-line interface for the Rekha vector database"
+keywords = ["vector-database", "ann", "cli", "nearest-neighbor"]
+categories = ["database", "data-structures"]
 
 [[bin]]
 name = "rekha"

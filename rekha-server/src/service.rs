@@ -1,9 +1,9 @@
-use rekha_core::{now_micros, CollectionConfig, CollectionMeta, ConsistencyLevel, NodeInfo, NodeStatus, Payload, RekhaError, SearchParams, VectorStoreBackend};
+use rekha_core::{now_micros, CollectionConfig, CollectionMeta, ConsistencyLevel, NodeInfo, NodeStatus, RekhaError, SearchParams, VectorStoreBackend};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::coordinator::Coordinator;
+use rekha_coordinator::Coordinator;
 use crate::proto::{
     self, rekha_server::Rekha, CollectionExistsRequest, CollectionExistsResponse,
     CreateCollectionRequest, CreateCollectionResponse, DeleteRequest, DeleteResponse,
@@ -48,14 +48,7 @@ impl Rekha for RekhaService {
         request: Request<InsertRequest>,
     ) -> Result<Response<InsertResponse>, Status> {
         let req = request.into_inner();
-        let payload = req.payload.map(|p| Payload {
-            content_type: match p.content_type.as_str() {
-                "json" => rekha_core::PayloadType::Json,
-                "text" => rekha_core::PayloadType::Text,
-                _ => rekha_core::PayloadType::Raw,
-            },
-            data: p.data,
-        });
+        let payload = req.payload.map(rekha_core::Payload::from);
 
         let actual_id = if req.is_replication {
             self.coordinator
@@ -92,14 +85,7 @@ impl Rekha for RekhaService {
         let mut errors = Vec::new();
 
         while let Some(item) = stream.message().await? {
-            let payload = item.payload.map(|p| Payload {
-                content_type: match p.content_type.as_str() {
-                    "json" => rekha_core::PayloadType::Json,
-                    "text" => rekha_core::PayloadType::Text,
-                    _ => rekha_core::PayloadType::Raw,
-                },
-                data: p.data,
-            });
+            let payload = item.payload.map(rekha_core::Payload::from);
 
             match self.coordinator.insert(
                 &item.collection_name,
@@ -210,25 +196,12 @@ impl Rekha for RekhaService {
             Ok((results, stats)) => {
                 let points: Vec<ScoredPoint> = results
                     .into_iter()
-                    .map(|r| ScoredPoint {
-                        id: r.id,
-                        score: r.score,
-                        payload: r.payload.map(|p| proto::Payload {
-                            content_type: p.content_type.to_string(),
-                            data: p.data,
-                        }),
-                        timestamp: r.timestamp,
-                    })
+                    .map(proto::ScoredPoint::from)
                     .collect();
 
                 Ok(Response::new(SearchResponse {
                     results: points,
-                    stats: Some(proto::SearchStats {
-                        total_ms: stats.total_ms,
-                        nodes_contacted: stats.nodes_contacted,
-                        vectors_scanned: stats.vectors_scanned,
-                        warnings: stats.warnings,
-                    }),
+                    stats: Some(proto::SearchStats::from(stats)),
                 }))
             }
             Err(e) => Err(Self::map_error(e)),
@@ -245,12 +218,8 @@ impl Rekha for RekhaService {
         let req = request.into_inner();
         let params = req.params.unwrap_or_default();
 
-        let search_params = SearchParams {
-            ef_search: params.ef_search as usize,
-            nprobe: params.nprobe as usize,
-            include_payloads: params.include_payloads,
-            local_only: req.local_only,
-        };
+        let mut search_params = rekha_core::SearchParams::from(params);
+        search_params.local_only = req.local_only;
 
         let consistency = self.coordinator.resolve_consistency(req.consistency);
 
@@ -260,20 +229,12 @@ impl Rekha for RekhaService {
         tokio::spawn(async move {
             let coll = req.collection_name.clone();
             match coordinator
-                .search(&coll, req.query_vector, req.top_k as usize, search_params.clone(), consistency)
+                .search(&coll, req.query_vector, req.top_k as usize, search_params, consistency)
                 .await
             {
                 Ok((results, _stats)) => {
                     for r in results {
-                        let point = ScoredPoint {
-                            id: r.id,
-                            score: r.score,
-                            payload: r.payload.map(|p| proto::Payload {
-                                content_type: p.content_type.to_string(),
-                                data: p.data,
-                            }),
-                            timestamp: r.timestamp,
-                        };
+                        let point = proto::ScoredPoint::from(r);
                         if tx.send(Ok(point)).await.is_err() {
                             break;
                         }
@@ -313,16 +274,9 @@ impl Rekha for RekhaService {
 
         // Return known peers list (minus the requester).
         let peers = self.coordinator.peers_for_handshake(&req.node_id).await;
-        let proto_peers = peers
+        let proto_peers: Vec<crate::proto::NodeInfo> = peers
             .into_iter()
-            .map(|n| crate::proto::NodeInfo {
-                node_id: n.node_id,
-                address: n.address,
-                partition_id: n.partition_id,
-                dim_groups: n.dim_groups,
-                storage_bytes: n.storage_bytes,
-                status: format!("{:?}", n.status).to_lowercase(),
-            })
+            .map(crate::proto::NodeInfo::from)
             .collect();
 
         Ok(Response::new(HandshakeResponse {
@@ -359,7 +313,7 @@ impl Rekha for RekhaService {
         request: Request<SearchDimRangeRequest>,
     ) -> Result<Response<SearchDimRangeResponse>, Status> {
         let req = request.into_inner();
-        let params = SearchParams {
+        let params = rekha_core::SearchParams {
             ef_search: 128,
             nprobe: req.nprobe as usize,
             include_payloads: false,
@@ -373,15 +327,7 @@ impl Rekha for RekhaService {
         Ok(Response::new(SearchDimRangeResponse {
             results: results
                 .into_iter()
-                .map(|r| ScoredPoint {
-                    id: r.id,
-                    score: r.score,
-                    payload: r.payload.map(|p| proto::Payload {
-                        content_type: p.content_type.to_string(),
-                        data: p.data,
-                    }),
-                    timestamp: r.timestamp,
-                })
+                .map(proto::ScoredPoint::from)
                 .collect(),
         }))
     }
@@ -441,18 +387,7 @@ impl Rekha for RekhaService {
                     if meta.is_deleted { return None; }
                     return Some(crate::proto::CollectionInfo {
                         name,
-                        config: Some(crate::proto::CollectionConfig {
-                            dim: meta.config.dim,
-                            num_vector_shards: meta.config.num_vector_shards,
-                            replication_factor: meta.config.replication_factor,
-                            num_dim_groups: meta.config.num_dim_groups,
-                            dim_group_size: meta.config.dim_group_size,
-                            nlist: meta.config.nlist,
-                            nprobe: meta.config.nprobe,
-                            pq_num_sub_vectors: meta.config.pq_num_sub_vectors,
-                            pq_num_centroids: meta.config.pq_num_centroids,
-                            re_rank_k: meta.config.re_rank_k,
-                        }),
+                        config: Some(crate::proto::CollectionConfig::from(meta.config)),
                         vector_count: meta.vector_count,
                         index_ready: false,
                         config_timestamp: meta.timestamp,
@@ -463,18 +398,7 @@ impl Rekha for RekhaService {
                 let config: CollectionConfig = serde_json::from_slice(&value).ok()?;
                 Some(crate::proto::CollectionInfo {
                     name,
-                    config: Some(crate::proto::CollectionConfig {
-                        dim: config.dim,
-                        num_vector_shards: config.num_vector_shards,
-                        replication_factor: config.replication_factor,
-                        num_dim_groups: config.num_dim_groups,
-                        dim_group_size: config.dim_group_size,
-                        nlist: config.nlist,
-                        nprobe: config.nprobe,
-                        pq_num_sub_vectors: config.pq_num_sub_vectors,
-                        pq_num_centroids: config.pq_num_centroids,
-                        re_rank_k: config.re_rank_k,
-                    }),
+                    config: Some(crate::proto::CollectionConfig::from(config)),
                     vector_count: 0,
                     index_ready: false,
                     config_timestamp: 0,
@@ -713,14 +637,15 @@ mod tests {
 
     #[test]
     fn test_new_service() {
-        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/rekha_svc_test");
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::config::ServerConfig::dev_default("test-node", dir.path().to_string_lossy().as_ref());
         let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open("/tmp/rekha_svc_test_db").unwrap(),
+            rekha_storage::RocksVectorStore::open(dir.path().join("db")).unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
         let service = RekhaService::new(coord);
         // service is initialized; verify by checking it doesn't panic
         let _ = service;
@@ -728,14 +653,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_payload_content_types() {
-        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/svc_ct_test");
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::config::ServerConfig::dev_default("test-node", dir.path().to_string_lossy().as_ref());
         let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open("/tmp/svc_ct_test_db").unwrap(),
+            rekha_storage::RocksVectorStore::open(dir.path().join("db")).unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
         let service = RekhaService::new(coord);
 
         // Test "json" content type
@@ -802,14 +728,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_before_init_returns_error() {
-        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/svc_search_err");
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = crate::config::ServerConfig::dev_default("test-node", dir.path().to_string_lossy().as_ref());
         let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open("/tmp/svc_search_err_db").unwrap(),
+            rekha_storage::RocksVectorStore::open(dir.path().join("db")).unwrap(),
         );
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
         let service = RekhaService::new(coord);
 
         let req = tonic::Request::new(SearchRequest {
@@ -834,7 +761,7 @@ mod tests {
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
         let service = RekhaService::new(coord);
 
         let req = tonic::Request::new(DeleteRequest {
@@ -857,7 +784,7 @@ mod tests {
     fn make_service() -> RekhaService {
         let id = NEXT_SVC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = svc_dir(id);
-        let mut config =
+        let config =
             crate::config::ServerConfig::dev_default("test-node", &format!("{dir}/config"));
         let _ = std::fs::remove_dir_all(&dir);
         let store = std::sync::Arc::new(
@@ -866,7 +793,7 @@ mod tests {
         let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
             rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
         ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
         RekhaService::new(coord)
     }
 

@@ -1,150 +1,82 @@
-use std::fmt;
-
-#[derive(Debug, Clone)]
-pub enum RekhaError {
-    NotFound(String),
-    InvalidArgument(String),
-    IndexFull { capacity: usize, attempted: usize },
-    InvalidDimension { expected: usize, actual: usize },
-    Storage(StorageError),
-    Index(IndexError),
-    Partition(PartitionError),
-    Timeout { operation: &'static str, elapsed_ms: u64 },
-    ClusterChanged { detail: String },
-    Unavailable { detail: String },
-    Internal { detail: String },
-}
-
-impl fmt::Display for RekhaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(s) => write!(f, "not found: {s}"),
-            Self::InvalidArgument(s) => write!(f, "invalid argument: {s}"),
-            Self::IndexFull { capacity, attempted } => {
-                write!(f, "index full: capacity={capacity}, attempted={attempted}")
-            }
-            Self::InvalidDimension { expected, actual } => {
-                write!(f, "invalid dimension: expected {expected}, got {actual}")
-            }
-            Self::Storage(e) => write!(f, "storage error: {e}"),
-            Self::Index(e) => write!(f, "index error: {e}"),
-            Self::Partition(e) => write!(f, "partition error: {e}"),
-            Self::Timeout { operation, elapsed_ms } => {
-                write!(f, "timeout on {operation} after {elapsed_ms}ms")
-            }
-            Self::ClusterChanged { detail } => write!(f, "cluster membership changed: {detail}"),
-            Self::Unavailable { detail } => write!(f, "service unavailable: {detail}"),
-            Self::Internal { detail } => write!(f, "internal error: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for RekhaError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Storage(e) => Some(e),
-            Self::Index(e) => Some(e),
-            Self::Partition(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<StorageError> for RekhaError {
-    fn from(e: StorageError) -> Self { Self::Storage(e) }
-}
-impl From<IndexError> for RekhaError {
-    fn from(e: IndexError) -> Self { Self::Index(e) }
-}
-impl From<PartitionError> for RekhaError {
-    fn from(e: PartitionError) -> Self { Self::Partition(e) }
-}
-
-#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum StorageError {
-    DbOpen { path: String, source: String },
-    ColumnFamily { name: String, source: String },
-    Read { key: Vec<u8>, source: String },
-    Write { source: String },
-    BatchWrite { committed: usize, failed: usize, source: String },
+    #[error("failed to open db at {path}: {msg}")]
+    DbOpen { path: String, msg: String },
+    #[error("column family {name}: {msg}")]
+    ColumnFamily { name: String, msg: String },
+    #[error("read error at key {key:?}: {msg}")]
+    Read { key: Vec<u8>, msg: String },
+    #[error("write error: {msg}")]
+    Write { msg: String },
+    #[error("batch write: committed {committed}, failed {failed}: {msg}")]
+    BatchWrite { committed: usize, failed: usize, msg: String },
+    #[error("corruption detected: {detail}")]
     Corruption { detail: String },
+    #[error("serialization error: {detail}")]
     Serialization { detail: String },
+    #[error("payload too large: {size} bytes (max {max})")]
     PayloadTooLarge { size: usize, max: usize },
 }
 
-impl fmt::Display for StorageError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DbOpen { path, source } => write!(f, "failed to open db at {path}: {source}"),
-            Self::ColumnFamily { name, source } => write!(f, "column family {name}: {source}"),
-            Self::Read { key, source } => write!(f, "read error at key {key:?}: {source}"),
-            Self::Write { source } => write!(f, "write error: {source}"),
-            Self::BatchWrite { committed, failed, source } => {
-                write!(f, "batch write: committed {committed}, failed {failed}: {source}")
-            }
-            Self::Corruption { detail } => write!(f, "corruption detected: {detail}"),
-            Self::Serialization { detail } => write!(f, "serialization error: {detail}"),
-            Self::PayloadTooLarge { size, max } => {
-                write!(f, "payload too large: {size} bytes (max {max})")
-            }
-        }
-    }
-}
-impl std::error::Error for StorageError {}
-
-#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum IndexError {
+    #[error("graph build failed: {detail}")]
     GraphBuild { detail: String },
+    #[error("search failed: {detail}")]
     Search { detail: String },
+    #[error("ef_search {ef} exceeds max {max}")]
     InvalidEfSearch { ef: usize, max: usize },
+    #[error("index is empty")]
     EmptyIndex,
+    #[error("{component} has not been trained")]
     NotTrained { component: &'static str },
+    #[error("expected dimension {expected}, got {actual}")]
     IncompatibleDimension { expected: usize, actual: usize },
 }
 
-impl fmt::Display for IndexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::GraphBuild { detail } => write!(f, "graph build failed: {detail}"),
-            Self::Search { detail } => write!(f, "search failed: {detail}"),
-            Self::InvalidEfSearch { ef, max } => write!(f, "ef_search {ef} exceeds max {max}"),
-            Self::EmptyIndex => write!(f, "index is empty"),
-            Self::NotTrained { component } => write!(f, "{component} has not been trained"),
-            Self::IncompatibleDimension { expected, actual } => {
-                write!(f, "expected dimension {expected}, got {actual}")
-            }
-        }
-    }
-}
-impl std::error::Error for IndexError {}
-
-#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PartitionError {
+    #[error("no available nodes for partition {partition_id}")]
     NoNodesAvailable { partition_id: u64 },
+    #[error("invalid topology: {detail}")]
     InvalidTopology { detail: String },
+    #[error("rebalance in progress for partition {partition_id}")]
     RebalanceInProgress { partition_id: u64 },
+    #[error("dimension group mismatch: expected {expected}, got {actual}")]
     DimensionGroupMismatch { expected: u32, actual: u32 },
+    #[error("shard {shard_id} not found")]
     ShardNotFound { shard_id: u64 },
 }
 
-impl fmt::Display for PartitionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoNodesAvailable { partition_id } => {
-                write!(f, "no available nodes for partition {partition_id}")
-            }
-            Self::InvalidTopology { detail } => write!(f, "invalid topology: {detail}"),
-            Self::RebalanceInProgress { partition_id } => {
-                write!(f, "rebalance in progress for partition {partition_id}")
-            }
-            Self::DimensionGroupMismatch { expected, actual } => {
-                write!(f, "dimension group mismatch: expected {expected}, got {actual}")
-            }
-            Self::ShardNotFound { shard_id } => write!(f, "shard {shard_id} not found"),
-        }
-    }
+#[non_exhaustive]
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RekhaError {
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("index full: capacity={capacity}, attempted={attempted}")]
+    IndexFull { capacity: usize, attempted: usize },
+    #[error("invalid dimension: expected {expected}, got {actual}")]
+    InvalidDimension { expected: usize, actual: usize },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Index(#[from] IndexError),
+    #[error(transparent)]
+    Partition(#[from] PartitionError),
+    #[error("timeout on {operation} after {elapsed_ms}ms")]
+    Timeout { operation: &'static str, elapsed_ms: u64 },
+    #[error("cluster membership changed: {detail}")]
+    ClusterChanged { detail: String },
+    #[error("service unavailable: {detail}")]
+    Unavailable { detail: String },
+    #[error("internal error: {detail}")]
+    Internal { detail: String },
 }
-impl std::error::Error for PartitionError {}
 
 #[cfg(test)]
 mod tests {
@@ -195,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_storage_error_display() {
-        let err = StorageError::DbOpen { path: "/data/db".into(), source: "permission denied".into() };
+        let err = StorageError::DbOpen { path: "/data/db".into(), msg: "permission denied".into() };
         assert_eq!(err.to_string(), "failed to open db at /data/db: permission denied");
         let err = StorageError::PayloadTooLarge { size: 2_000_000, max: 1_048_576 };
         assert_eq!(err.to_string(), "payload too large: 2000000 bytes (max 1048576)");
@@ -219,16 +151,16 @@ mod tests {
     fn test_error_source() {
         let err = StorageError::Corruption { detail: "bad block".into() };
         let re: RekhaError = err.clone().into();
-        assert!(re.source().is_some());
+        assert!(re.source().is_none(), "Corruption has no underlying source");
 
         let idx_err = IndexError::Search { detail: "failed".into() };
         let re2: RekhaError = idx_err.into();
-        assert!(re2.source().is_some());
+        assert!(re2.source().is_none(), "Search error has no underlying source");
     }
 
     #[test]
     fn test_into_conversions() {
-        let s = StorageError::Write { source: "disk full".into() };
+        let s = StorageError::Write { msg: "disk full".into() };
         let e: RekhaError = s.into();
         assert!(matches!(e, RekhaError::Storage(_)));
 
@@ -249,25 +181,25 @@ mod tests {
 
     #[test]
     fn test_storage_error_column_family() {
-        let err = StorageError::ColumnFamily { name: "vectors".into(), source: "handle not found".into() };
+        let err = StorageError::ColumnFamily { name: "vectors".into(), msg: "handle not found".into() };
         assert_eq!(err.to_string(), "column family vectors: handle not found");
     }
 
     #[test]
     fn test_storage_error_read() {
-        let err = StorageError::Read { key: vec![0, 0, 0, 0, 0, 0, 0, 42], source: "IO error".into() };
+        let err = StorageError::Read { key: vec![0, 0, 0, 0, 0, 0, 0, 42], msg: "IO error".into() };
         assert_eq!(err.to_string(), "read error at key [0, 0, 0, 0, 0, 0, 0, 42]: IO error");
     }
 
     #[test]
     fn test_storage_error_write() {
-        let err = StorageError::Write { source: "disk full".into() };
+        let err = StorageError::Write { msg: "disk full".into() };
         assert_eq!(err.to_string(), "write error: disk full");
     }
 
     #[test]
     fn test_storage_error_batch_write() {
-        let err = StorageError::BatchWrite { committed: 5, failed: 2, source: "timeout".into() };
+        let err = StorageError::BatchWrite { committed: 5, failed: 2, msg: "timeout".into() };
         assert_eq!(err.to_string(), "batch write: committed 5, failed 2: timeout");
     }
 

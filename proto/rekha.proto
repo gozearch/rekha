@@ -207,6 +207,7 @@ message CreateCollectionResponse {
 
 message DropCollectionRequest {
     string name = 1;
+    bool is_replication = 2;
 }
 
 message DropCollectionResponse {

@@ -522,7 +522,20 @@ impl RekhaClient {
         let ch = self.channel.read().await.clone();
         let name = name.to_string();
         self.with_retry("drop_collection", move || {
-            let request = tonic::Request::new(DropCollectionRequest { name: name.clone() });
+            let request = tonic::Request::new(DropCollectionRequest { name: name.clone(), is_replication: false });
+            let mut client = GrpcClient::new(ch.clone());
+            async move {
+                client.drop_collection(request).await
+                    .map(|r| r.into_inner().success)
+            }
+        }).await
+    }
+
+    pub async fn replica_drop_collection(&self, name: &str) -> Result<bool, RekhaError> {
+        let ch = self.channel.read().await.clone();
+        let name = name.to_string();
+        self.with_retry("replica_drop_collection", move || {
+            let request = tonic::Request::new(DropCollectionRequest { name: name.clone(), is_replication: true });
             let mut client = GrpcClient::new(ch.clone());
             async move {
                 client.drop_collection(request).await

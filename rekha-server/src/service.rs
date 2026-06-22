@@ -380,12 +380,15 @@ impl Rekha for RekhaService {
         &self,
         request: Request<DropCollectionRequest>,
     ) -> Result<Response<DropCollectionResponse>, Status> {
-        let key = format!("collection:{}", request.into_inner().name);
-        self.coordinator.store().delete_metadata(&key).map_err(Self::map_error)?;
-        Ok(Response::new(DropCollectionResponse {
-            success: true,
-            error: String::new(),
-        }))
+        let req = request.into_inner();
+        let success = if req.is_replication {
+            self.coordinator.replicate_drop_collection(&req.name).await
+                .map_err(Self::map_error)?
+        } else {
+            self.coordinator.drop_collection(&req.name).await
+                .map_err(Self::map_error)?
+        };
+        Ok(Response::new(DropCollectionResponse { success, error: String::new() }))
     }
 
     async fn list_collections(
@@ -890,7 +893,7 @@ mod tests {
         });
         service.create_collection(create_req).await.unwrap();
         // Drop it
-        let drop_req = tonic::Request::new(DropCollectionRequest { name: "to-drop".into() });
+        let drop_req = tonic::Request::new(DropCollectionRequest { name: "to-drop".into(), is_replication: false });
         let resp = service.drop_collection(drop_req).await.unwrap();
         assert!(resp.into_inner().success);
     }

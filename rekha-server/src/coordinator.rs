@@ -87,6 +87,11 @@ impl PeerClient {
             .replica_create_collection(name, client_cfg)
             .await
     }
+
+    async fn try_remote_drop_collection(&mut self, name: &str) -> Result<bool, RekhaError> {
+        self.last_used = Instant::now();
+        self.client.replica_drop_collection(name).await
+    }
 }
 
 pub(crate) struct PeerPool {
@@ -351,6 +356,32 @@ impl Coordinator {
         let idx = self.index.read().await;
         if let Some(ref index) = *idx {
             let _ = index.create_collection(name, cfg.dim as usize, cfg.nlist as usize, cfg.nprobe as usize);
+        }
+        Ok(true)
+    }
+
+    pub async fn replicate_drop_collection(&self, name: &str) -> Result<bool, RekhaError> {
+        let key = format!("collection:{name}");
+        self.store.delete_metadata(&key)?;
+        let idx = self.index.read().await;
+        if let Some(ref index) = *idx {
+            let _ = index.drop_collection(name);
+        }
+        Ok(true)
+    }
+
+    pub async fn drop_collection(&self, name: &str) -> Result<bool, RekhaError> {
+        self.replicate_drop_collection(name).await?;
+
+        let peer_ids: Vec<String> = {
+            let pool = self.peer_pool.read().await;
+            pool.clients.keys().cloned().collect()
+        };
+        for node_id in &peer_ids {
+            let mut pool = self.peer_pool.write().await;
+            if let Some(client) = pool.clients.get_mut(node_id) {
+                let _ = client.try_remote_drop_collection(name).await;
+            }
         }
         Ok(true)
     }

@@ -188,7 +188,7 @@ mod tests {
         index.create_collection("default", 8, 4, 2).unwrap();
         for i in 0..5 {
             let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.insert("default", i, &v).unwrap();
+            index.insert("default", i, 0, &v).unwrap();
         }
         index.flush_buffer("default").unwrap();
         let server = server.with_index(index).await;

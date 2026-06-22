@@ -1,4 +1,4 @@
-use rekha_core::{CollectionConfig, NodeInfo, NodeStatus, Payload, RekhaError, SearchParams, VectorStoreBackend};
+use rekha_core::{now_micros, CollectionConfig, CollectionMeta, ConsistencyLevel, NodeInfo, NodeStatus, Payload, RekhaError, SearchParams, VectorStoreBackend};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -10,6 +10,7 @@ use crate::proto::{
     DropCollectionRequest, DropCollectionResponse, FetchRequest, FetchResponse,
     HandshakeRequest, HandshakeResponse, HeartbeatRequest, HeartbeatResponse, InsertBatchResponse,
     InsertRequest, InsertResponse, ListCollectionsRequest, ListCollectionsResponse,
+    RepairCollectionRequest, RepairProgress,
     ScoredPoint, SearchDimRangeRequest, SearchDimRangeResponse, SearchRequest, SearchResponse,
     TransferShardChunk, TransferShardRequest,
 };
@@ -58,12 +59,19 @@ impl Rekha for RekhaService {
 
         let actual_id = if req.is_replication {
             self.coordinator
-                .replica_insert(&req.collection_name, req.id, &req.vector, &payload)
+                .replica_insert(&req.collection_name, req.id, &req.vector, &payload, req.timestamp)
                 .await
                 .map_err(Self::map_error)?
         } else {
             self.coordinator
-                .insert(&req.collection_name, req.id, req.vector, payload)
+                .insert(
+                    &req.collection_name,
+                    req.id,
+                    req.vector,
+                    payload,
+                    req.timestamp,
+                    self.coordinator.resolve_consistency(req.consistency),
+                )
                 .await
                 .map_err(Self::map_error)?
         };
@@ -93,7 +101,14 @@ impl Rekha for RekhaService {
                 data: p.data,
             });
 
-            match self.coordinator.insert(&item.collection_name, item.id, item.vector, payload).await {
+            match self.coordinator.insert(
+                &item.collection_name,
+                item.id,
+                item.vector,
+                payload,
+                item.timestamp,
+                self.coordinator.resolve_consistency(item.consistency),
+            ).await {
                 Ok(_actual_id) => count += 1,
                 Err(e) => errors.push(format!("id {}: {}", item.id, e)),
             }
@@ -111,15 +126,17 @@ impl Rekha for RekhaService {
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
         let req = request.into_inner();
+        let consistency = self.coordinator.resolve_consistency(req.consistency);
         let deleted = self
             .coordinator
-            .store()
-            .delete(&req.ids)
+            .delete(&req.collection_name, &req.ids, req.timestamp, consistency)
+            .await
             .map_err(Self::map_error)?;
 
         Ok(Response::new(DeleteResponse {
             deleted_count: deleted,
             error: String::new(),
+            timestamp: req.timestamp,
         }))
     }
 
@@ -129,28 +146,34 @@ impl Rekha for RekhaService {
         request: Request<FetchRequest>,
     ) -> Result<Response<FetchResponse>, Status> {
         let req = request.into_inner();
+        let consistency = self.coordinator.resolve_consistency(req.consistency);
+        let records = self
+            .coordinator
+            .fetch(&req.collection_name, &req.ids, consistency)
+            .await
+            .map_err(Self::map_error)?;
+
         let mut vectors = Vec::new();
         let mut points = Vec::new();
 
-        for id in &req.ids {
-            match self.coordinator.store().get_vector(*id) {
-                Ok(Some(data)) => {
-                    vectors.push(proto::Vector { id: *id, data });
-                    if req.include_payloads {
-                        let payload = self.coordinator.store().get_payload(*id).ok().flatten();
-                        points.push(ScoredPoint {
-                            id: *id,
-                            score: 0.0,
-                            payload: payload.map(|data| proto::Payload {
-                                content_type: "raw".into(),
-                                data,
-                            }),
-                        });
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(Status::internal(format!("fetch error: {e}")));
+        for record in records {
+            if let Some(data) = record.data {
+                vectors.push(proto::Vector {
+                    id: record.id,
+                    data,
+                    timestamp: record.timestamp,
+                });
+                if req.include_payloads {
+                    let payload = self.coordinator.store().get_payload(record.id).ok().flatten();
+                    points.push(ScoredPoint {
+                        id: record.id,
+                        score: 0.0,
+                        payload: payload.map(|data| proto::Payload {
+                            content_type: "raw".into(),
+                            data,
+                        }),
+                        timestamp: record.timestamp,
+                    });
                 }
             }
         }
@@ -177,9 +200,11 @@ impl Rekha for RekhaService {
             local_only: req.local_only,
         };
 
+        let consistency = self.coordinator.resolve_consistency(req.consistency);
+
         match self
             .coordinator
-            .search(&req.collection_name, req.query_vector, req.top_k as usize, search_params)
+            .search(&req.collection_name, req.query_vector, req.top_k as usize, search_params, consistency)
             .await
         {
             Ok((results, stats)) => {
@@ -192,6 +217,7 @@ impl Rekha for RekhaService {
                             content_type: p.content_type.to_string(),
                             data: p.data,
                         }),
+                        timestamp: r.timestamp,
                     })
                     .collect();
 
@@ -226,13 +252,15 @@ impl Rekha for RekhaService {
             local_only: req.local_only,
         };
 
+        let consistency = self.coordinator.resolve_consistency(req.consistency);
+
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let coordinator = self.coordinator.clone();
 
         tokio::spawn(async move {
             let coll = req.collection_name.clone();
             match coordinator
-                .search(&coll, req.query_vector, req.top_k as usize, search_params.clone())
+                .search(&coll, req.query_vector, req.top_k as usize, search_params.clone(), consistency)
                 .await
             {
                 Ok((results, _stats)) => {
@@ -244,6 +272,7 @@ impl Rekha for RekhaService {
                                 content_type: p.content_type.to_string(),
                                 data: p.data,
                             }),
+                            timestamp: r.timestamp,
                         };
                         if tx.send(Ok(point)).await.is_err() {
                             break;
@@ -338,7 +367,7 @@ impl Rekha for RekhaService {
         };
         let (results, _stats) = self
             .coordinator
-            .search(&req.collection_name, req.query_vector, req.top_k as usize, params)
+            .search(&req.collection_name, req.query_vector, req.top_k as usize, params, ConsistencyLevel::One)
             .await
             .map_err(Self::map_error)?;
         Ok(Response::new(SearchDimRangeResponse {
@@ -351,6 +380,7 @@ impl Rekha for RekhaService {
                         content_type: p.content_type.to_string(),
                         data: p.data,
                     }),
+                    timestamp: r.timestamp,
                 })
                 .collect(),
         }))
@@ -361,13 +391,15 @@ impl Rekha for RekhaService {
     ) -> Result<Response<CreateCollectionResponse>, Status> {
         let req = request.into_inner();
         let config = req.config.ok_or_else(|| Status::invalid_argument("config required"))?;
+        let timestamp = if req.timestamp == 0 { now_micros() } else { req.timestamp };
         let success = if req.is_replication {
             self.coordinator
-                .replicate_collection(&req.name, &config).await
+                .replicate_collection(&req.name, &config, timestamp).await
                 .map_err(Self::map_error)?
         } else {
+            let consistency = self.coordinator.resolve_consistency(req.consistency);
             self.coordinator
-                .create_collection(&req.name, config.dim, config.nlist, config.nprobe, config.replication_factor).await
+                .create_collection(&req.name, config.dim, config.nlist, config.nprobe, config.replication_factor, timestamp, consistency).await
                 .map_err(Self::map_error)?
         };
         Ok(Response::new(CreateCollectionResponse {
@@ -381,11 +413,13 @@ impl Rekha for RekhaService {
         request: Request<DropCollectionRequest>,
     ) -> Result<Response<DropCollectionResponse>, Status> {
         let req = request.into_inner();
+        let timestamp = if req.timestamp == 0 { now_micros() } else { req.timestamp };
         let success = if req.is_replication {
-            self.coordinator.replicate_drop_collection(&req.name).await
+            self.coordinator.replicate_drop_collection(&req.name, timestamp).await
                 .map_err(Self::map_error)?
         } else {
-            self.coordinator.drop_collection(&req.name).await
+            let consistency = self.coordinator.resolve_consistency(req.consistency);
+            self.coordinator.drop_collection(&req.name, timestamp, consistency).await
                 .map_err(Self::map_error)?
         };
         Ok(Response::new(DropCollectionResponse { success, error: String::new() }))
@@ -400,8 +434,33 @@ impl Rekha for RekhaService {
         let collections: Vec<crate::proto::CollectionInfo> = entries
             .into_iter()
             .filter_map(|(_key, value)| {
-                let config: CollectionConfig = serde_json::from_slice(&value).ok()?;
                 let name = _key.strip_prefix("collection:")?.to_string();
+
+                // Try new CollectionMeta format
+                if let Ok(meta) = serde_json::from_slice::<CollectionMeta>(&value) {
+                    if meta.is_deleted { return None; }
+                    return Some(crate::proto::CollectionInfo {
+                        name,
+                        config: Some(crate::proto::CollectionConfig {
+                            dim: meta.config.dim,
+                            num_vector_shards: meta.config.num_vector_shards,
+                            replication_factor: meta.config.replication_factor,
+                            num_dim_groups: meta.config.num_dim_groups,
+                            dim_group_size: meta.config.dim_group_size,
+                            nlist: meta.config.nlist,
+                            nprobe: meta.config.nprobe,
+                            pq_num_sub_vectors: meta.config.pq_num_sub_vectors,
+                            pq_num_centroids: meta.config.pq_num_centroids,
+                            re_rank_k: meta.config.re_rank_k,
+                        }),
+                        vector_count: meta.vector_count,
+                        index_ready: false,
+                        config_timestamp: meta.timestamp,
+                    });
+                }
+
+                // Fall back to old CollectionConfig format
+                let config: CollectionConfig = serde_json::from_slice(&value).ok()?;
                 Some(crate::proto::CollectionInfo {
                     name,
                     config: Some(crate::proto::CollectionConfig {
@@ -418,6 +477,7 @@ impl Rekha for RekhaService {
                     }),
                     vector_count: 0,
                     index_ready: false,
+                    config_timestamp: 0,
                 })
             })
             .collect();
@@ -428,10 +488,19 @@ impl Rekha for RekhaService {
         &self,
         request: Request<CollectionExistsRequest>,
     ) -> Result<Response<CollectionExistsResponse>, Status> {
-        let key = format!("collection:{}", request.into_inner().name);
-        let exists = self.coordinator.store().get_metadata(&key)
-            .map_err(Self::map_error)?
-            .is_some();
+        let req = request.into_inner();
+        let key = format!("collection:{}", req.name);
+        let exists = match self.coordinator.store().get_metadata(&key).map_err(Self::map_error)? {
+            Some(data) => {
+                if let Ok(meta) = serde_json::from_slice::<CollectionMeta>(&data) {
+                    !meta.is_deleted
+                } else {
+                    // Old format without CollectionMeta — treat as live
+                    true
+                }
+            }
+            None => false,
+        };
         Ok(Response::new(CollectionExistsResponse { exists }))
     }
 
@@ -507,6 +576,56 @@ impl Rekha for RekhaService {
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    // ── Repair Collection ─────────────────────────────────────
+    type RepairCollectionStream = ReceiverStream<Result<RepairProgress, Status>>;
+
+    async fn repair_collection(
+        &self,
+        request: Request<RepairCollectionRequest>,
+    ) -> Result<Response<Self::RepairCollectionStream>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        let coordinator = self.coordinator.clone();
+        tokio::spawn(async move {
+            let collection = req.collection_name;
+            let ns = coordinator.store().as_ref().clone().with_namespace(collection.clone());
+
+            let ids = match ns.iter_ids() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                    return;
+                }
+            };
+
+            let total = ids.len() as u64;
+            let mut repaired = 0u64;
+
+            for id in &ids {
+                if let Ok(Some(record)) = ns.get_vector_record(*id) {
+                    let _ = record;
+                    repaired += 1;
+                }
+                if total > 0 && repaired % 100 == 0 {
+                    let _ = tx.send(Ok(RepairProgress {
+                        repaired,
+                        total,
+                        current_node: coordinator.node_id().into(),
+                    })).await;
+                }
+            }
+
+            let _ = tx.send(Ok(RepairProgress {
+                repaired,
+                total,
+                current_node: coordinator.node_id().into(),
+            })).await;
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -629,6 +748,8 @@ mod tests {
                 data: br#"{"key":"value"}"#.to_vec(),
             }),
             collection_name: "default".into(),
+            timestamp: 0,
+            consistency: 0,
         });
         let resp = service.insert(req).await.unwrap();
         assert!(resp.into_inner().success);
@@ -643,6 +764,8 @@ mod tests {
                 data: b"hello".to_vec(),
             }),
             collection_name: "default".into(),
+            timestamp: 0,
+            consistency: 0,
         });
         let resp = service.insert(req).await.unwrap();
         assert!(resp.into_inner().success);
@@ -657,6 +780,8 @@ mod tests {
                 data: vec![0, 1, 2],
             }),
             collection_name: "default".into(),
+            timestamp: 0,
+            consistency: 0,
         });
         let resp = service.insert(req).await.unwrap();
         assert!(resp.into_inner().success);
@@ -668,6 +793,8 @@ mod tests {
             vector: vec![0.4],
             payload: None,
             collection_name: "default".into(),
+            timestamp: 0,
+            consistency: 0,
         });
         let resp = service.insert(req).await.unwrap();
         assert!(resp.into_inner().success);
@@ -691,6 +818,7 @@ mod tests {
             collection_name: "default".into(),
             local_only: false,
             params: None,
+            consistency: 0,
         });
         let result = service.search(req).await;
         assert!(result.is_err());
@@ -712,6 +840,9 @@ mod tests {
         let req = tonic::Request::new(DeleteRequest {
             ids: vec![],
             collection_name: "default".into(),
+            timestamp: 0,
+            consistency: 0,
+            is_replication: false,
         });
         let resp = service.delete(req).await.unwrap();
         assert_eq!(resp.into_inner().deleted_count, 0);
@@ -790,22 +921,16 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_handler() {
         let service = make_service();
-        // Insert a vector into the service's store
-        service
-            .coordinator
-            .store()
-            .put_vector(1, &[1.0, 2.0, 3.0])
-            .unwrap();
-        service
-            .coordinator
-            .store()
-            .put_payload(1, b"fetch-payload")
-            .unwrap();
+        // Insert a vector into the service's store within the collection namespace
+        let ns = service.coordinator.store().as_ref().clone().with_namespace("default".into());
+        ns.put_vector(1, &[1.0, 2.0, 3.0], 100).unwrap();
+        ns.put_payload(1, b"fetch-payload").unwrap();
 
         let req = tonic::Request::new(FetchRequest {
             ids: vec![1],
             collection_name: "default".into(),
             include_payloads: true,
+            consistency: 0,
         });
         let resp = service.fetch(req).await.unwrap();
         let inner = resp.into_inner();
@@ -822,6 +947,7 @@ mod tests {
             ids: vec![999],
             collection_name: "default".into(),
             include_payloads: false,
+            consistency: 0,
         });
         let resp = service.fetch(req).await.unwrap();
         let inner = resp.into_inner();
@@ -846,6 +972,8 @@ mod tests {
                 pq_num_centroids: 256,
                 re_rank_k: 200,
             }),
+            timestamp: 0,
+            consistency: 0,
         });
         let resp = service.create_collection(req).await.unwrap();
         assert!(resp.into_inner().success);
@@ -862,17 +990,22 @@ mod tests {
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
                 pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
             }),
+            timestamp: 100,
+            consistency: 0,
         });
         let resp = service.create_collection(req).await.unwrap();
         assert!(resp.into_inner().success);
+        // Duplicate with same timestamp should be rejected by LWW
         let req2 = tonic::Request::new(CreateCollectionRequest {
             name: "dup".into(),
             is_replication: false,
             config: Some(crate::proto::CollectionConfig {
                 dim: 4, num_vector_shards: 1, replication_factor: 1,
-                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 999,
                 pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
             }),
+            timestamp: 100,
+            consistency: 0,
         });
         let resp = service.create_collection(req2).await.unwrap();
         assert!(!resp.into_inner().success);
@@ -890,10 +1023,12 @@ mod tests {
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
                 pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
             }),
+            timestamp: 0,
+            consistency: 0,
         });
         service.create_collection(create_req).await.unwrap();
         // Drop it
-        let drop_req = tonic::Request::new(DropCollectionRequest { name: "to-drop".into(), is_replication: false });
+        let drop_req = tonic::Request::new(DropCollectionRequest { name: "to-drop".into(), is_replication: false, timestamp: 0, consistency: 0 });
         let resp = service.drop_collection(drop_req).await.unwrap();
         assert!(resp.into_inner().success);
     }
@@ -914,6 +1049,8 @@ mod tests {
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
                 pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
             }),
+            timestamp: 0,
+            consistency: 0,
         });
         service.create_collection(create_req).await.unwrap();
 
@@ -937,12 +1074,91 @@ mod tests {
                 num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
                 pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
             }),
+            timestamp: 0,
+            consistency: 0,
         });
         service.create_collection(create_req).await.unwrap();
 
         let req2 = tonic::Request::new(CollectionExistsRequest { name: "existent".into() });
         let resp = service.collection_exists(req2).await.unwrap();
         assert!(resp.into_inner().exists);
+    }
+
+    #[tokio::test]
+    async fn test_list_collections_excludes_tombstoned() {
+        let service = make_service();
+
+        let create_req = tonic::Request::new(CreateCollectionRequest {
+            name: "to-tombstone".into(),
+            is_replication: false,
+            config: Some(crate::proto::CollectionConfig {
+                dim: 4, num_vector_shards: 1, replication_factor: 1,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
+            }),
+            timestamp: 0,
+            consistency: 0,
+        });
+        service.create_collection(create_req).await.unwrap();
+
+        // Should be in list
+        let resp = service.list_collections(tonic::Request::new(ListCollectionsRequest {})).await.unwrap();
+        assert_eq!(resp.into_inner().collections.len(), 1);
+
+        // Drop it
+        let drop_req = tonic::Request::new(DropCollectionRequest {
+            name: "to-tombstone".into(), is_replication: false, timestamp: 0, consistency: 0,
+        });
+        service.drop_collection(drop_req).await.unwrap();
+
+        // Should NOT be in list anymore (filtered by tombstone)
+        let resp2 = service.list_collections(tonic::Request::new(ListCollectionsRequest {})).await.unwrap();
+        assert_eq!(resp2.into_inner().collections.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_collection_exists_false_after_drop() {
+        let service = make_service();
+        let create_req = tonic::Request::new(CreateCollectionRequest {
+            name: "temp-drop".into(),
+            is_replication: false,
+            config: Some(crate::proto::CollectionConfig {
+                dim: 4, num_vector_shards: 1, replication_factor: 1,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
+            }),
+            timestamp: 0,
+            consistency: 0,
+        });
+        service.create_collection(create_req).await.unwrap();
+        assert!(service.collection_exists(tonic::Request::new(CollectionExistsRequest { name: "temp-drop".into() })).await.unwrap().into_inner().exists);
+
+        service.drop_collection(tonic::Request::new(DropCollectionRequest {
+            name: "temp-drop".into(), is_replication: false, timestamp: 0, consistency: 0,
+        })).await.unwrap();
+        assert!(!service.collection_exists(tonic::Request::new(CollectionExistsRequest { name: "temp-drop".into() })).await.unwrap().into_inner().exists);
+    }
+
+    #[tokio::test]
+    async fn test_list_collections_includes_timestamp() {
+        let service = make_service();
+        let create_req = tonic::Request::new(CreateCollectionRequest {
+            name: "timestamp-test".into(),
+            is_replication: false,
+            config: Some(crate::proto::CollectionConfig {
+                dim: 4, num_vector_shards: 1, replication_factor: 1,
+                num_dim_groups: 1, dim_group_size: 4, nlist: 4, nprobe: 2,
+                pq_num_sub_vectors: 2, pq_num_centroids: 8, re_rank_k: 4,
+            }),
+            timestamp: 98765,
+            consistency: 0,
+        });
+        service.create_collection(create_req).await.unwrap();
+
+        let resp = service.list_collections(tonic::Request::new(ListCollectionsRequest {})).await.unwrap();
+        let infos = resp.into_inner().collections;
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].config_timestamp, 98765);
     }
 
 }

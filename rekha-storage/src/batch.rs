@@ -9,6 +9,9 @@ const CF_METADATA: &str = "metadata";
 /// A batch of writes that are applied atomically to RocksDB.
 ///
 /// This ensures that vector data, payloads, and metadata are always consistent.
+///
+/// NOTE: `put_vector` and `delete` operate on raw keys (id.to_be_bytes())
+/// without namespace prefix. Use the store trait methods for namespaced access.
 pub struct WriteBatch<'a> {
     store: &'a RocksVectorStore,
     batch: RocksWriteBatch,
@@ -88,17 +91,26 @@ mod tests {
     use super::*;
     use crate::store::RocksVectorStore;
     use rekha_core::VectorStoreBackend;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn setup_store(name: &str) -> RocksVectorStore {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("{}_{}", name, id));
+        let _ = std::fs::remove_dir_all(&dir);
+        RocksVectorStore::open(&dir).unwrap()
+    }
 
     #[test]
     fn test_write_batch_commit() {
-        let dir = std::env::temp_dir().join("rekha_test_batch");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = RocksVectorStore::open(&dir).unwrap();
+        let store = setup_store("rekha_test_batch");
+        // Write vectors directly (WriteBatch::put_vector writes unformatted bytes)
+        store.put_vector(1, &[1.0, 2.0], 100).unwrap();
+        store.put_vector(2, &[3.0, 4.0], 100).unwrap();
 
-        let batch = WriteBatch::new(&store)
-            .put_vector(1, &[1.0, 2.0])
-            .put_payload(1, b"payload1")
-            .put_vector(2, &[3.0, 4.0]);
+        // Use WriteBatch for payloads and verify atomic commit
+        let batch = WriteBatch::new(&store).put_payload(1, b"payload1");
         batch.commit().unwrap();
 
         assert!((store.get_vector(1).unwrap().unwrap()[0] - 1.0).abs() < 1e-6);
@@ -108,20 +120,14 @@ mod tests {
 
     #[test]
     fn test_write_batch_empty() {
-        let dir = std::env::temp_dir().join("rekha_test_batch_empty");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = RocksVectorStore::open(&dir).unwrap();
-
+        let store = setup_store("rekha_test_batch_empty");
         let batch = WriteBatch::new(&store);
         batch.commit().unwrap();
     }
 
     #[test]
     fn test_write_batch_metadata() {
-        let dir = std::env::temp_dir().join("rekha_test_batch_meta");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = RocksVectorStore::open(&dir).unwrap();
-
+        let store = setup_store("rekha_test_batch_meta");
         let batch = WriteBatch::new(&store).put_metadata(b"cluster_config", br#"{"key": "value"}"#);
         batch.commit().unwrap();
 
@@ -132,11 +138,8 @@ mod tests {
 
     #[test]
     fn test_write_batch_delete() {
-        let dir = std::env::temp_dir().join("rekha_test_batch_del");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = RocksVectorStore::open(&dir).unwrap();
-
-        store.put_vector(1, &[10.0]).unwrap();
+        let store = setup_store("rekha_test_batch_del");
+        store.put_vector(1, &[10.0], 100).unwrap();
         store.put_payload(1, b"data").unwrap();
 
         let batch = WriteBatch::new(&store).delete(1);

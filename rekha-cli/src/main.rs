@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use rekha_client::RekhaClient;
+use rekha_core::ConsistencyLevel;
 
 /// Rekha CLI — admin tool for the distributed vector database.
 #[derive(Parser)]
@@ -116,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     let actual_id = client
-                        .insert(0, vector, &collection, payload.map(|p| p.into_bytes()))
+                        .insert(0, vector, &collection, payload.map(|p| p.into_bytes()), ConsistencyLevel::Quorum)
                         .await?;
                     println!("Inserted vector {actual_id}");
                 }
@@ -133,19 +134,22 @@ async fn main() -> anyhow::Result<()> {
                         anyhow::bail!("No valid floats provided on stdin");
                     }
 
-                    let results = client.search(query, &collection, top_k).await?;
+                    let results = client.search(query, &collection, top_k, ConsistencyLevel::Quorum).await?;
                     println!("Search results (top {top_k}):");
                     for (i, r) in results.iter().enumerate() {
                         println!("  {}. id={}, score={:.6}", i + 1, r.id, r.score);
                     }
                 }
                 Commands::Delete { ids, collection } => {
-                    let count = client.delete(&collection, &ids).await?;
+                    let count = client.delete(&ids, &collection, ConsistencyLevel::Quorum).await?;
                     println!("Deleted {count} vectors");
                 }
                 Commands::Info => {
+                    let info = client.cluster_info().await?;
                     println!("Rekha cluster info:");
-                    client.cluster_info().await?;
+                    println!("  Node ID: {}", info.node_id);
+                    println!("  Address: {}", info.address);
+                    println!("  Status: {:?}", info.status);
                 }
                 Commands::Health => {
                     let _ = client;
@@ -162,11 +166,11 @@ async fn main() -> anyhow::Result<()> {
                             Err(_) => { eprintln!("Warning: invalid config JSON, using defaults"); (8u32, 128u32, 16u32) }
                         }
                     } else { (8u32, 128u32, 16u32) };
-                    client.create_collection(&collection, dim, nlist, nprobe, rf).await?;
+                    client.create_collection(&collection, dim, nlist, nprobe, rf, ConsistencyLevel::Quorum).await?;
                     println!("Collection '{collection}' created (dim={dim} rf={rf})");
                 }
                 Commands::DropCollection { collection } => {
-                    client.drop_collection(&collection).await?;
+                    client.drop_collection(&collection, ConsistencyLevel::Quorum).await?;
                     println!("Collection '{collection}' dropped");
                 }
                 Commands::ListCollections => {

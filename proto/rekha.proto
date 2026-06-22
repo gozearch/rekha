@@ -2,6 +2,13 @@ syntax = "proto3";
 
 package rekha;
 
+enum ConsistencyLevel {
+    CONSISTENCY_UNSPECIFIED = 0;
+    ONE = 1;
+    QUORUM = 2;
+    ALL = 3;
+}
+
 service Rekha {
     rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
     rpc DropCollection(DropCollectionRequest) returns (DropCollectionResponse);
@@ -20,11 +27,14 @@ service Rekha {
     rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
     rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
     rpc TransferShard(TransferShardRequest) returns (stream TransferShardChunk);
+
+    rpc RepairCollection(RepairCollectionRequest) returns (stream RepairProgress);
 }
 
 message Vector {
     uint64 id = 1;
     repeated float data = 2;
+    uint64 timestamp = 3;
 }
 
 message Payload {
@@ -36,6 +46,7 @@ message ScoredPoint {
     uint64 id = 1;
     float score = 2;
     optional Payload payload = 3;
+    uint64 timestamp = 4;
 }
 
 message InsertRequest {
@@ -44,6 +55,8 @@ message InsertRequest {
     optional Payload payload = 3;
     string collection_name = 4;
     bool is_replication = 5;
+    uint64 timestamp = 6;
+    ConsistencyLevel consistency = 7;
 }
 
 message InsertResponse {
@@ -60,17 +73,22 @@ message InsertBatchResponse {
 message DeleteRequest {
     repeated uint64 ids = 1;
     string collection_name = 2;
+    uint64 timestamp = 3;
+    ConsistencyLevel consistency = 4;
+    bool is_replication = 5;
 }
 
 message DeleteResponse {
     uint64 deleted_count = 1;
     string error = 2;
+    uint64 timestamp = 3;
 }
 
 message FetchRequest {
     repeated uint64 ids = 1;
     bool include_payloads = 2;
     string collection_name = 3;
+    ConsistencyLevel consistency = 4;
 }
 
 message FetchResponse {
@@ -91,6 +109,7 @@ message SearchRequest {
     SearchParams params = 3;
     bool local_only = 4;
     string collection_name = 5;
+    ConsistencyLevel consistency = 6;
 }
 
 message SearchStats {
@@ -192,12 +211,15 @@ message CollectionInfo {
     CollectionConfig config = 2;
     uint64 vector_count = 3;
     bool index_ready = 4;
+    uint64 config_timestamp = 5;
 }
 
 message CreateCollectionRequest {
     string name = 1;
     CollectionConfig config = 2;
     bool is_replication = 3;
+    uint64 timestamp = 4;
+    ConsistencyLevel consistency = 5;
 }
 
 message CreateCollectionResponse {
@@ -208,6 +230,8 @@ message CreateCollectionResponse {
 message DropCollectionRequest {
     string name = 1;
     bool is_replication = 2;
+    uint64 timestamp = 3;
+    ConsistencyLevel consistency = 4;
 }
 
 message DropCollectionResponse {
@@ -227,4 +251,14 @@ message CollectionExistsRequest {
 
 message CollectionExistsResponse {
     bool exists = 1;
+}
+
+message RepairCollectionRequest {
+    string collection_name = 1;
+}
+
+message RepairProgress {
+    uint64 repaired = 1;
+    uint64 total = 2;
+    string current_node = 3;
 }

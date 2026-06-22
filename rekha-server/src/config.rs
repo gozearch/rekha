@@ -24,6 +24,9 @@ impl ServerConfig {
                 seed_nodes: vec![format!("127.0.0.1:50051")],
                 bind_addr: "0.0.0.0:50051".into(),
                 data_dir: data_dir.into(),
+                default_write_consistency: "QUORUM".into(),
+                hinted_handoff_enabled: true,
+                max_hint_window_secs: 10800,
             },
             tls: TlsConfig::default(),
             observability: ObservabilityConfig {
@@ -34,6 +37,7 @@ impl ServerConfig {
             storage: StorageConfig {
                 max_payload_size: 1_048_576,
                 max_inline_size: 1_048_576,
+                gc_grace_seconds: 864000,
             },
         }
     }
@@ -54,6 +58,15 @@ pub struct ClusterConfig {
     pub seed_nodes: Vec<String>,
     pub bind_addr: String,
     pub data_dir: String,
+
+    #[serde(default = "default_consistency")]
+    pub default_write_consistency: String,
+
+    #[serde(default = "default_true")]
+    pub hinted_handoff_enabled: bool,
+
+    #[serde(default = "default_hint_window")]
+    pub max_hint_window_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +80,34 @@ pub struct ObservabilityConfig {
 pub struct StorageConfig {
     pub max_payload_size: usize,
     pub max_inline_size: usize,
+
+    #[serde(default = "default_gc_grace")]
+    pub gc_grace_seconds: u64,
+}
+
+fn default_consistency() -> String {
+    "QUORUM".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_hint_window() -> u64 {
+    10800
+}
+
+fn default_gc_grace() -> u64 {
+    864000
+}
+
+pub fn parse_consistency(s: &str) -> Option<rekha_core::ConsistencyLevel> {
+    match s.to_uppercase().as_str() {
+        "ONE" => Some(rekha_core::ConsistencyLevel::One),
+        "QUORUM" => Some(rekha_core::ConsistencyLevel::Quorum),
+        "ALL" => Some(rekha_core::ConsistencyLevel::All),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -78,6 +119,10 @@ mod tests {
         let config = ServerConfig::dev_default("node-1", "/tmp/rekha");
         assert_eq!(config.cluster.node_id, "node-1");
         assert_eq!(config.cluster.bind_addr, "0.0.0.0:50051");
+        assert_eq!(config.cluster.default_write_consistency, "QUORUM");
+        assert!(config.cluster.hinted_handoff_enabled);
+        assert_eq!(config.cluster.max_hint_window_secs, 10800);
+        assert_eq!(config.storage.gc_grace_seconds, 864000);
     }
 
     #[test]
@@ -108,5 +153,14 @@ mod tests {
     fn test_dev_default_tls_disabled() {
         let config = ServerConfig::dev_default("n1", "/tmp");
         assert!(!config.tls.enabled);
+    }
+
+    #[test]
+    fn test_parse_consistency() {
+        assert_eq!(parse_consistency("ONE"), Some(rekha_core::ConsistencyLevel::One));
+        assert_eq!(parse_consistency("one"), Some(rekha_core::ConsistencyLevel::One));
+        assert_eq!(parse_consistency("QUORUM"), Some(rekha_core::ConsistencyLevel::Quorum));
+        assert_eq!(parse_consistency("ALL"), Some(rekha_core::ConsistencyLevel::All));
+        assert_eq!(parse_consistency("INVALID"), None);
     }
 }

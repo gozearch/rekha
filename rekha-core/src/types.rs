@@ -1,10 +1,38 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum ConsistencyLevel {
+    One,
+    Quorum,
+    All,
+}
+
+impl ConsistencyLevel {
+    pub fn to_i32(self) -> i32 {
+        match self {
+            Self::One => 1,
+            Self::Quorum => 2,
+            Self::All => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorRecord {
+    pub id: u64,
+    pub timestamp: u64,
+    pub data: Option<Vec<f32>>,
+    pub is_tombstone: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vector {
     pub id: u64,
     pub data: Vec<f32>,
+    #[serde(default)]
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +46,8 @@ pub struct ScoredPoint {
     pub id: u64,
     pub score: f32,
     pub payload: Option<Payload>,
+    #[serde(default)]
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +201,16 @@ pub struct CollectionInfo {
     pub config: CollectionConfig,
     pub vector_count: u64,
     pub index_ready: bool,
+    pub config_timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionMeta {
+    pub config: CollectionConfig,
+    pub timestamp: u64,
+    pub is_deleted: bool,
+    #[serde(default)]
+    pub vector_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -223,6 +263,17 @@ impl OwnedRange {
     pub fn dim_count(&self) -> usize {
         self.dim_end.saturating_sub(self.dim_start)
     }
+}
+
+pub fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+pub fn quorum(rf: usize) -> usize {
+    rf / 2 + 1
 }
 
 #[cfg(test)]
@@ -310,5 +361,46 @@ mod tests {
         assert_eq!(PayloadType::Text.to_string(), "text");
         assert_eq!(PayloadType::Json.to_string(), "json");
         assert_eq!(PayloadType::Raw.to_string(), "raw");
+    }
+
+    #[test]
+    fn test_vector_timestamp_default() {
+        let v = Vector { id: 1, data: vec![1.0, 2.0], timestamp: 0 };
+        assert_eq!(v.timestamp, 0);
+    }
+
+    #[test]
+    fn test_scored_point_timestamp_default() {
+        let sp = ScoredPoint { id: 1, score: 0.5, payload: None, timestamp: 0 };
+        assert_eq!(sp.timestamp, 0);
+    }
+
+    #[test]
+    fn test_consistency_level_debug_clone_copy() {
+        let c = ConsistencyLevel::Quorum;
+        let _d = format!("{:?}", c);
+        let _c = c;
+        let _e = c;
+    }
+
+    #[test]
+    fn test_vector_record_tombstone() {
+        let r = VectorRecord { id: 42, timestamp: 100, data: None, is_tombstone: true };
+        assert!(r.is_tombstone);
+        assert!(r.data.is_none());
+    }
+
+    #[test]
+    fn test_now_micros_nonzero() {
+        let t = now_micros();
+        assert!(t > 1_700_000_000_000_000); // must be past 2023
+    }
+
+    #[test]
+    fn test_quorum() {
+        assert_eq!(quorum(1), 1);
+        assert_eq!(quorum(2), 2);
+        assert_eq!(quorum(3), 2);
+        assert_eq!(quorum(5), 3);
     }
 }

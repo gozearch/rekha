@@ -1,5 +1,5 @@
 use crate::error::RekhaError;
-use crate::types::SearchParams;
+use crate::types::{SearchParams, VectorRecord};
 
 pub trait VectorIndex: Send + Sync {
     fn insert(&self, id: u64, vector: &[f32]) -> Result<(), RekhaError>;
@@ -19,8 +19,10 @@ pub trait VectorIndex: Send + Sync {
 }
 
 pub trait VectorStoreBackend: Send + Sync {
-    fn put_vector(&self, id: u64, data: &[f32]) -> Result<(), RekhaError>;
+    fn put_vector(&self, id: u64, data: &[f32], timestamp: u64) -> Result<(), RekhaError>;
     fn get_vector(&self, id: u64) -> Result<Option<Vec<f32>>, RekhaError>;
+    fn get_vector_record(&self, id: u64) -> Result<Option<VectorRecord>, RekhaError>;
+    fn put_tombstone(&self, id: u64, timestamp: u64) -> Result<(), RekhaError>;
     fn put_payload(&self, id: u64, payload: &[u8]) -> Result<(), RekhaError>;
     fn get_payload(&self, id: u64) -> Result<Option<Vec<u8>>, RekhaError>;
     fn delete(&self, ids: &[u64]) -> Result<u64, RekhaError>;

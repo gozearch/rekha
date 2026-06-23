@@ -2,7 +2,7 @@ use crate::config::parse_consistency;
 use crate::config::CoordinatorConfig;
 use crate::peer_pool::PeerPool;
 use rekha_cluster::Membership;
-use rekha_core::{ClusterTopology, CollectionConfig, CollectionMeta, ConsistencyLevel, NodeInfo, NodeStatus, VectorStoreBackend, now_micros};
+use rekha_core::{ClusterTopology, CollectionConfig, CollectionMeta, ConsistencyLevel, NodeInfo, NodeStatus, RekhaError, VectorStoreBackend, now_micros};
 use rekha_index::RekhaIndex;
 use rekha_replication::HintedHandoff;
 use rekha_storage::RocksVectorStore;
@@ -143,6 +143,18 @@ impl Coordinator {
         });
     }
 
+    pub(super) fn ns(&self, collection: &str) -> RocksVectorStore {
+        self.store.as_ref().clone().with_namespace(collection.into())
+    }
+
+    pub(super) fn default_config(dim: u32, nlist: u32, nprobe: u32, rf: u64) -> CollectionConfig {
+        CollectionConfig {
+            dim, nlist, nprobe, num_vector_shards: 6, replication_factor: rf,
+            num_dim_groups: 4, dim_group_size: dim / 4,
+            pq_num_sub_vectors: 4, pq_num_centroids: 256, re_rank_k: 256,
+        }
+    }
+
     pub fn resolve_consistency(&self, proto_cl: i32) -> ConsistencyLevel {
         match proto_cl {
             1 => ConsistencyLevel::One,
@@ -153,6 +165,14 @@ impl Coordinator {
     }
 
     pub fn store(&self) -> &Arc<RocksVectorStore> { &self.store }
+
+    pub async fn topology(&self) -> Result<ClusterTopology, RekhaError> {
+        Ok(self.topology.read().await.clone())
+    }
+
+    pub async fn peers_for_handshake(&self, exclude: &str) -> Vec<NodeInfo> {
+        self.membership.read().await.peers_for_handshake(exclude)
+    }
 
     pub fn cluster_id(&self) -> &str { "rekha-dev" }
 

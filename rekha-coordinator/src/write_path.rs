@@ -8,7 +8,7 @@ impl Coordinator {
     pub async fn replica_insert(
         &self, collection: &str, id: u64, vector: &[f32], payload: &Option<Payload>, timestamp: u64,
     ) -> Result<u64, RekhaError> {
-        let ns = self.store.as_ref().clone().with_namespace(collection.into());
+        let ns = self.ns(collection);
         if let Ok(Some(record)) = ns.get_vector_record(id) {
             if record.timestamp > timestamp { return Ok(id); }
         }
@@ -42,37 +42,36 @@ impl Coordinator {
         let id = if id == 0 { self.next_auto_id.fetch_add(1, Ordering::SeqCst) } else { id };
         self.replica_insert(collection, id, &vector, &payload, timestamp).await?;
 
+        let cfg = self.read_collection_config(collection);
+        let rf = cfg.as_ref().map(|c| c.replication_factor as usize).unwrap_or(1);
         let mut acks = 1u64;
         let pdata = payload.as_ref().map(|p| p.data.clone());
 
-        if let Some(cfg) = self.read_collection_config(collection) {
-            let rf = cfg.replication_factor as usize;
+        if let Some(cfg) = cfg {
             let shard = id % cfg.num_vector_shards;
             let replicas = self.membership.read().await.replicas_for(shard, rf);
+            let hint_store = self.store.hint_store();
             for replica in &replicas {
                 if replica.node_id == self.config.node_id { continue; }
                 let mut pool = self.peer_pool.write().await;
                 if let Some(client) = pool.clients.get_mut(&replica.node_id) {
                     match client.try_remote_insert(collection, id, &vector, &pdata, timestamp).await {
                         Ok(_) => acks += 1,
-                        Err(_) => {
-                            self.handoff.store_hint(&self.store.hint_store(), &replica.node_id, collection, id, &vector, pdata.as_deref(), timestamp);
-                        }
+                        Err(_) => self.handoff.store_hint(&hint_store, &replica.node_id, collection, id, &vector, pdata.as_deref(), timestamp),
                     }
                 } else {
-                    self.handoff.store_hint(&self.store.hint_store(), &replica.node_id, collection, id, &vector, pdata.as_deref(), timestamp);
+                    self.handoff.store_hint(&hint_store, &replica.node_id, collection, id, &vector, pdata.as_deref(), timestamp);
                 }
             }
         }
 
-        let rf = self.read_collection_config(collection).map(|c| c.replication_factor as usize).unwrap_or(1);
         let required = ConsistencyGate::required(consistency, rf);
         if acks >= required as u64 { Ok(id) }
-        else { Err(RekhaError::Unavailable { detail: format!("consistency level not met: got {acks}/{required} acknowledgments") }) }
+        else { Err(RekhaError::Unavailable { detail: format!("consistency level not met: got {acks}/{required}") }) }
     }
 
     pub async fn replica_delete(&self, collection: &str, ids: &[u64], timestamp: u64) -> Result<u64, RekhaError> {
-        let ns = self.store.as_ref().clone().with_namespace(collection.into());
+        let ns = self.ns(collection);
         let mut removed = 0u64;
         for id in ids {
             let was_live = matches!(ns.get_vector_record(*id), Ok(Some(ref r)) if !r.is_tombstone);
@@ -88,27 +87,28 @@ impl Coordinator {
     ) -> Result<u64, RekhaError> {
         let timestamp = LwwResolver::resolve_timestamp(timestamp);
         self.replica_delete(collection, ids, timestamp).await?;
-        let mut acks = 1u64;
-        let mut hints: Vec<(String, u64, u64)> = Vec::new();
 
-        if let Some(cfg) = self.read_collection_config(collection) {
+        let cfg = self.read_collection_config(collection);
+        let rf = cfg.as_ref().map(|c| c.replication_factor as usize).unwrap_or(1);
+        let mut acks = 1u64;
+
+        if let Some(cfg) = cfg {
             for id in ids {
                 let shard = id % cfg.num_vector_shards;
-                let replicas = self.membership.read().await.replicas_for(shard, cfg.replication_factor as usize);
+                let replicas = self.membership.read().await.replicas_for(shard, rf);
+                let mut pool = self.peer_pool.write().await;
                 for replica in &replicas {
                     if replica.node_id == self.config.node_id { continue; }
-                    let mut pool = self.peer_pool.write().await;
                     if let Some(client) = pool.clients.get_mut(&replica.node_id) {
                         match client.try_remote_delete(collection, &[*id], timestamp).await {
                             Ok(_) => acks += 1,
-                            Err(_) => { if self.handoff.is_enabled() { hints.push((replica.node_id.clone(), *id, timestamp)); } }
+                            Err(_) => {} // delete hints are fire-and-forget
                         }
-                    } else if self.handoff.is_enabled() { hints.push((replica.node_id.clone(), *id, timestamp)); }
+                    }
                 }
             }
         }
 
-        let rf = self.read_collection_config(collection).map(|c| c.replication_factor as usize).unwrap_or(1);
         let required = ConsistencyGate::required(consistency, rf);
         if acks < required as u64 {
             return Err(RekhaError::Unavailable { detail: format!("consistency level not met for delete: got {acks}/{required}") });
@@ -117,7 +117,7 @@ impl Coordinator {
     }
 
     pub async fn fetch(&self, collection: &str, ids: &[u64], _consistency: ConsistencyLevel) -> Result<Vec<VectorRecord>, RekhaError> {
-        let ns = self.store.as_ref().clone().with_namespace(collection.into());
+        let ns = self.ns(collection);
         let mut results = Vec::new();
         for id in ids {
             if let Ok(Some(record)) = ns.get_vector_record(*id) {
@@ -140,7 +140,7 @@ mod tests {
         let index = RekhaIndex::new().unwrap();
         coord.initialize(index).await;
         coord.insert("default", 42, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], None, 0, ConsistencyLevel::One).await.unwrap();
-        let ns = coord.store().as_ref().clone().with_namespace("default".into());
+        let ns = coord.ns("default");
         let v = ns.get_vector(42).unwrap().unwrap();
         assert!((v[0] - 0.1).abs() < 1e-6);
     }
@@ -152,7 +152,7 @@ mod tests {
         coord.initialize(index).await;
         let payload = Payload::from_text("test data");
         coord.insert("default", 7, vec![0.5; 8], Some(payload), 0, ConsistencyLevel::One).await.unwrap();
-        let ns = coord.store().as_ref().clone().with_namespace("default".into());
+        let ns = coord.ns("default");
         let stored_payload = ns.get_payload(7).unwrap().unwrap();
         assert_eq!(stored_payload, b"test data");
     }
@@ -164,7 +164,7 @@ mod tests {
         coord.initialize(index).await;
         coord.replica_insert("default", 1, &[0.1; 8], &None, 100).await.unwrap();
         coord.replica_insert("default", 1, &[0.9; 8], &None, 50).await.unwrap();
-        let ns = coord.store().as_ref().clone().with_namespace("default".into());
+        let ns = coord.ns("default");
         let rec = ns.get_vector_record(1).unwrap().unwrap();
         assert_eq!(rec.timestamp, 100);
         assert!((rec.data.unwrap()[0] - 0.1).abs() < 1e-6);
@@ -176,7 +176,7 @@ mod tests {
         let index = RekhaIndex::new().unwrap();
         coord.initialize(index).await;
         coord.insert("default", 1, vec![0.1; 8], None, 0, ConsistencyLevel::One).await.unwrap();
-        let ns = coord.store().as_ref().clone().with_namespace("default".into());
+        let ns = coord.ns("default");
         assert!(ns.get_vector(1).unwrap().is_some());
         coord.delete("default", &[1], 0, ConsistencyLevel::One).await.unwrap();
         assert!(ns.get_vector(1).unwrap().is_none());
@@ -209,7 +209,7 @@ mod tests {
         coord.initialize(index).await;
         coord.replica_insert("default", 1, &[0.1; 8], &None, 100).await.unwrap();
         coord.replica_insert("default", 1, &[0.9; 8], &None, 200).await.unwrap();
-        let ns = coord.store().as_ref().clone().with_namespace("default".into());
+        let ns = coord.ns("default");
         let rec = ns.get_vector_record(1).unwrap().unwrap();
         assert_eq!(rec.timestamp, 200);
         assert!((rec.data.unwrap()[0] - 0.9).abs() < 1e-6);
@@ -222,7 +222,7 @@ mod tests {
         coord.initialize(index).await;
         coord.replica_insert("default", 1, &[0.1; 8], &None, 100).await.unwrap();
         coord.replica_insert("default", 1, &[0.9; 8], &None, 100).await.unwrap();
-        let ns = coord.store().as_ref().clone().with_namespace("default".into());
+        let ns = coord.ns("default");
         let rec = ns.get_vector_record(1).unwrap().unwrap();
         assert_eq!(rec.timestamp, 100);
         assert!((rec.data.unwrap()[0] - 0.9).abs() < 1e-6);

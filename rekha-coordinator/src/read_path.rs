@@ -5,16 +5,97 @@ use std::collections::HashMap;
 use crate::Coordinator;
 
 impl Coordinator {
-    fn maybe_load_payload(&self, collection: &str, include: bool, id: u64) -> Option<Payload> {
-        if include {
-            let ns = self.store.as_ref().clone().with_namespace(collection.into());
-            ns.get_payload(id).ok().flatten().map(Payload::from_bytes)
-        } else { None }
+    fn load_payload(&self, collection: &str, include: bool, id: u64) -> Option<Payload> {
+        if include { self.ns(collection).get_payload(id).ok().flatten().map(Payload::from_bytes) } else { None }
     }
 
-    fn maybe_load_timestamp(&self, collection: &str, id: u64) -> u64 {
-        let ns = self.store.as_ref().clone().with_namespace(collection.into());
-        ns.get_vector_record(id).ok().flatten().map(|r| r.timestamp).unwrap_or(0)
+    fn load_timestamp(&self, collection: &str, id: u64) -> u64 {
+        self.ns(collection).get_vector_record(id).ok().flatten().map(|r| r.timestamp).unwrap_or(0)
+    }
+
+    /// Local index search — returns candidates with payloads and timestamps.
+    async fn local_search(&self, collection: &str, query: &[f32], k: usize, params: &SearchParams) -> Result<(Vec<ScoredPoint>, SearchStats), RekhaError> {
+        let mut stats = SearchStats::default();
+        let index_guard = self.index.read().await;
+        let index = index_guard.as_ref().ok_or_else(|| RekhaError::Internal { detail: "index not initialized".into() })?;
+        if !index.has_collection(collection) {
+            return Err(RekhaError::NotFound(collection.into()));
+        }
+        let (ids, dists) = index.search(collection, query, k * 2, params).map_err(|e| { stats.warnings.push(format!("search failed: {e}")); e })?;
+        let points = ids.iter().enumerate().map(|(i, id)| ScoredPoint {
+            id: *id,
+            score: dists.get(i).copied().unwrap_or(f32::MAX),
+            payload: self.load_payload(collection, params.include_payloads, *id),
+            timestamp: self.load_timestamp(collection, *id),
+        }).collect();
+        Ok((points, stats))
+    }
+
+    /// Peer fan-out search — queries remote replicas.
+    async fn fanout_search(&self, collection: &str, query: &[f32], k: usize, params: &SearchParams, consistency: ConsistencyLevel) -> (Vec<ScoredPoint>, SearchStats) {
+        let mut stats = SearchStats::default();
+        let peer_count = { self.peer_pool.read().await.clients.len() };
+        if peer_count == 0 { stats.nodes_contacted = 1; return (vec![], stats); }
+
+        let cfg = self.read_collection_config(collection);
+        let rf = cfg.as_ref().map(|c| c.replication_factor as usize).unwrap_or(1);
+        let needed = ConsistencyGate::required(consistency, rf);
+
+        let mut node_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(cfg) = cfg {
+            let memb = self.membership.read().await;
+            for shard in 0..cfg.num_vector_shards {
+                for replica in memb.replicas_for(shard, rf).iter().take(needed) {
+                    if replica.node_id != self.config.node_id { node_set.insert(replica.node_id.clone()); }
+                }
+            }
+        }
+
+        let node_ids: Vec<String> = node_set.into_iter().collect();
+        let mut pool = self.peer_pool.write().await;
+        let mut all_peer_candidates = Vec::new();
+        let mut peer_params = params.clone();
+        peer_params.local_only = true;
+
+        for node_id in &node_ids {
+            if let Some(client) = pool.clients.get_mut(node_id) {
+                match client.try_search(query, k, &peer_params, collection).await {
+                    Ok((candidates, _)) => { all_peer_candidates.extend(candidates); client.error_count = 0; }
+                    Err(_) => {
+                        if let Some(c) = pool.clients.get_mut(node_id) { c.error_count += 1; if c.error_count >= 3 { pool.clients.remove(node_id); } }
+                        stats.warnings.push(format!("peer {node_id} search failed"));
+                    }
+                }
+            }
+        }
+        all_peer_candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
+        all_peer_candidates.truncate(k * 2);
+        stats.nodes_contacted = 1 + node_ids.len() as u32;
+        (all_peer_candidates, stats)
+    }
+
+    /// LWW dedup + re-rank with full vectors.
+    fn merge_and_rerank(&self, candidates: Vec<ScoredPoint>, query: &[f32], k: usize, collection: &str) -> Vec<ScoredPoint> {
+        let mut seen: HashMap<u64, ScoredPoint> = HashMap::new();
+        for c in candidates {
+            match seen.entry(c.id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => { if c.timestamp > entry.get().timestamp { entry.insert(c); } }
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(c); }
+            }
+        }
+        let mut candidates: Vec<_> = seen.into_values().collect();
+        candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
+        candidates.truncate(k * 2);
+
+        for c in candidates.iter_mut() {
+            let ns = self.ns(collection);
+            if let Ok(Some(v)) = ns.get_vector(c.id) {
+                c.score = DistanceMetric::L2.distance(&v, query);
+            }
+        }
+        candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
+        candidates.truncate(k);
+        candidates
     }
 
     pub async fn search(
@@ -22,100 +103,19 @@ impl Coordinator {
         params: SearchParams, consistency: ConsistencyLevel,
     ) -> Result<(Vec<ScoredPoint>, SearchStats), RekhaError> {
         let start = std::time::Instant::now();
-        let mut stats = SearchStats::default();
 
-        let index_guard = self.index.read().await;
-        let index = index_guard.as_ref().ok_or_else(|| RekhaError::Internal {
-            detail: "index not initialized".into(),
-        })?;
-
-        if !index.has_collection(collection) {
-            return Err(RekhaError::NotFound(collection.into()));
-        }
-
-        let mut candidates: Vec<ScoredPoint> = Vec::new();
-        let (ids, dists) = index.search(collection, &query, k * 2, &params).map_err(|e| {
-            stats.warnings.push(format!("search failed: {e}")); e
-        })?;
-        for (i, id) in ids.iter().enumerate() {
-            let score = dists.get(i).copied().unwrap_or(f32::MAX);
-            let payload = self.maybe_load_payload(collection, params.include_payloads, *id);
-            let timestamp = self.maybe_load_timestamp(collection, *id);
-            candidates.push(ScoredPoint { id: *id, score, payload, timestamp });
-        }
+        let (mut candidates, mut stats) = self.local_search(collection, &query, k, &params).await?;
 
         if !params.local_only {
-            let peer_count = { self.peer_pool.read().await.clients.len() };
-            if peer_count > 0 {
-                let rf = self.read_collection_config(collection)
-                    .map(|c| c.replication_factor as usize).unwrap_or(1);
-                let needed_per_shard = ConsistencyGate::required(consistency, rf);
-
-                let mut node_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-                if let Some(cfg) = self.read_collection_config(collection) {
-                    let memb = self.membership.read().await;
-                    for shard in 0..cfg.num_vector_shards {
-                        let replicas = memb.replicas_for(shard, rf);
-                        for replica in replicas.iter().take(needed_per_shard) {
-                            if replica.node_id != self.config.node_id {
-                                node_set.insert(replica.node_id.clone());
-                            }
-                        }
-                    }
-                }
-                let node_ids: Vec<String> = node_set.into_iter().collect();
-                let mut pool = self.peer_pool.write().await;
-
-                if !node_ids.is_empty() {
-                    let mut peer_params = params.clone();
-                    peer_params.local_only = true;
-                    let mut all_peer_candidates: Vec<ScoredPoint> = Vec::new();
-                    let mut peer_stats = SearchStats::default();
-                    for node_id in &node_ids {
-                        if let Some(client) = pool.clients.get_mut(node_id) {
-                            match client.try_search(&query, k, &peer_params, collection).await {
-                                Ok((candidates, _)) => { all_peer_candidates.extend(candidates); client.error_count = 0; }
-                                Err(_) => {
-                                    if let Some(c) = pool.clients.get_mut(node_id) {
-                                        c.error_count += 1;
-                                        if c.error_count >= 3 { pool.clients.remove(node_id); }
-                                    }
-                                    peer_stats.warnings.push(format!("peer {node_id} search failed"));
-                                }
-                            }
-                        }
-                    }
-                    all_peer_candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
-                    all_peer_candidates.truncate(k * 2);
-                    peer_stats.nodes_contacted = node_ids.len() as u32;
-                    stats.nodes_contacted = 1 + peer_stats.nodes_contacted;
-                    stats.warnings.extend(peer_stats.warnings);
-                    candidates.extend(all_peer_candidates);
-                }
-            }
+            let (peer_candidates, peer_stats) = self.fanout_search(collection, &query, k, &params, consistency).await;
+            candidates.extend(peer_candidates);
+            stats.warnings.extend(peer_stats.warnings);
+            stats.nodes_contacted = peer_stats.nodes_contacted;
+        } else {
+            stats.nodes_contacted = 1;
         }
 
-        let mut seen: HashMap<u64, ScoredPoint> = HashMap::new();
-        for c in candidates {
-            let id = c.id;
-            match seen.entry(id) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => { if c.timestamp > entry.get().timestamp { entry.insert(c); } }
-                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(c); }
-            }
-        }
-        let mut candidates: Vec<ScoredPoint> = seen.into_values().collect();
-        candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
-        candidates.truncate(k * 2);
-
-        let ns = self.store.as_ref().clone().with_namespace(collection.into());
-        for candidate in candidates.iter_mut().take(k * 2) {
-            if let Ok(Some(full_vec)) = ns.get_vector(candidate.id) {
-                candidate.score = DistanceMetric::L2.distance(&full_vec, &query);
-            }
-        }
-        candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
-        candidates.truncate(k);
-
+        candidates = self.merge_and_rerank(candidates, &query, k, collection);
         stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
         stats.vectors_scanned = candidates.len() as u64;
         Ok((candidates, stats))

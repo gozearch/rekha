@@ -1,5 +1,4 @@
-use rekha_core::{ClusterTopology, NodeInfo, RekhaError, now_epoch_secs};
-use std::collections::HashMap;
+use rekha_core::{NodeInfo, now_epoch_secs};
 
 use crate::Coordinator;
 
@@ -11,28 +10,8 @@ impl Coordinator {
         self.refresh_peer_pool().await;
     }
 
-    pub async fn healthy_peers(&self) -> Vec<NodeInfo> {
-        self.membership.read().await.healthy_peers()
-    }
-
-    pub async fn peer_address(&self, node_id: &str) -> Option<String> {
-        self.membership.read().await.get(node_id).map(|p| p.info.address.clone())
-    }
-
-    pub async fn peers_for_handshake(&self, exclude: &str) -> Vec<NodeInfo> {
-        self.membership.read().await.peers_for_handshake(exclude)
-    }
-
-    pub async fn topology(&self) -> Result<ClusterTopology, RekhaError> {
-        Ok(self.topology.read().await.clone())
-    }
-
-    pub async fn node_info(&self, _node_id: &str) -> Result<NodeInfo, RekhaError> {
-        Ok(self.local_node_info())
-    }
-
     async fn refresh_peer_pool(&self) {
-        let healthy = self.healthy_peers().await;
+        let healthy = self.membership.read().await.healthy_peers();
         let mut pool = self.peer_pool.write().await;
         let external: Vec<NodeInfo> = healthy.into_iter()
             .filter(|p| p.node_id != self.config.node_id).collect();
@@ -68,7 +47,7 @@ impl Coordinator {
 
     async fn sync_topology(&self) {
         let members = self.membership.read().await;
-        let mut nodes = HashMap::new();
+        let mut nodes = std::collections::HashMap::new();
         nodes.insert(self.config.node_id.clone(), self.local_node_info());
         for peer in members.all_peers() {
             nodes.insert(peer.node_id.clone(), peer);

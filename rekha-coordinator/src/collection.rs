@@ -37,11 +37,7 @@ impl Coordinator {
                 if !existing.is_deleted && existing.timestamp >= timestamp { return Ok(false); }
             } else { return Ok(false); }
         }
-        let cfg = CollectionConfig {
-            dim, nlist, nprobe, num_vector_shards: 6, replication_factor: rf,
-            num_dim_groups: 4, dim_group_size: dim / 4,
-            pq_num_sub_vectors: 4, pq_num_centroids: 256, re_rank_k: 256,
-        };
+        let cfg = Self::default_config(dim, nlist, nprobe, rf);
         let meta = CollectionMeta { config: cfg.clone(), timestamp, is_deleted: false, vector_count: 0 };
         let json = serde_json::to_vec(&meta).map_err(|e| RekhaError::InvalidArgument(format!("serialize config: {e}")))?;
         self.store.put_metadata(&key, &json)?;
@@ -51,11 +47,7 @@ impl Coordinator {
         }
         drop(idx);
 
-        let proto_cfg = rekha_proto::proto::CollectionConfig {
-            dim, nlist, nprobe, num_vector_shards: 6, replication_factor: rf,
-            num_dim_groups: 4, dim_group_size: dim / 4,
-            pq_num_sub_vectors: 4, pq_num_centroids: 256, re_rank_k: 256,
-        };
+        let proto_cfg: rekha_proto::proto::CollectionConfig = cfg.into();
         let peer_ids: Vec<String> = { let pool = self.peer_pool.read().await; pool.clients.keys().cloned().collect() };
         let required = ConsistencyGate::required(consistency, rf as usize);
         let mut acks = 1u64;
@@ -65,9 +57,7 @@ impl Coordinator {
                 match client.try_remote_create_collection(name, &proto_cfg, timestamp).await {
                     Ok(true) => acks += 1,
                     Ok(false) => {}
-                    Err(_) => {
-                        self.handoff.store_collection_hint(&self.store.hint_store(), node_id, name, &[], timestamp, 0);
-                    }
+                    Err(_) => { self.handoff.store_collection_hint(&self.store.hint_store(), node_id, name, &[], timestamp, 0); }
                 }
             }
         }
@@ -81,12 +71,9 @@ impl Coordinator {
         let timestamp = LwwResolver::resolve_timestamp(timestamp);
         let key = format!("collection:{name}");
         let existing = match self.store.get_metadata(&key)? {
-            Some(data) => {
-                if let Ok(meta) = serde_json::from_slice::<CollectionMeta>(&data) { meta }
-                else {
-                    CollectionMeta { config: serde_json::from_slice(&data).unwrap_or_default(), timestamp: 0, is_deleted: false, vector_count: 0 }
-                }
-            }
+            Some(data) => serde_json::from_slice::<CollectionMeta>(&data).unwrap_or_else(|_| {
+                CollectionMeta { config: serde_json::from_slice(&data).unwrap_or_default(), timestamp: 0, is_deleted: false, vector_count: 0 }
+            }),
             None => return Ok(false),
         };
         if existing.timestamp >= timestamp { return Ok(false); }
@@ -107,14 +94,12 @@ impl Coordinator {
                 match client.try_remote_drop_collection(name, timestamp).await {
                     Ok(true) => acks += 1,
                     Ok(false) => {}
-                    Err(_) => {
-                        self.handoff.store_collection_hint(&self.store.hint_store(), node_id, name, &[], timestamp, 1);
-                    }
+                    Err(_) => { self.handoff.store_collection_hint(&self.store.hint_store(), node_id, name, &[], timestamp, 1); }
                 }
             }
         }
         if (acks as usize) >= required { Ok(true) }
-        else { Err(RekhaError::Unavailable { detail: format!("consistency level not met for collection drop: got {acks}/{required} acknowledgments") }) }
+        else { Err(RekhaError::Unavailable { detail: format!("consistency level not met for collection drop: got {acks}/{required}") }) }
     }
 
     pub async fn replicate_collection(
@@ -140,12 +125,9 @@ impl Coordinator {
     pub async fn replicate_drop_collection(&self, name: &str, timestamp: u64) -> Result<bool, RekhaError> {
         let key = format!("collection:{name}");
         let existing = match self.store.get_metadata(&key)? {
-            Some(data) => {
-                if let Ok(meta) = serde_json::from_slice::<CollectionMeta>(&data) { meta }
-                else {
-                    CollectionMeta { config: serde_json::from_slice(&data).unwrap_or_default(), timestamp: 0, is_deleted: false, vector_count: 0 }
-                }
-            }
+            Some(data) => serde_json::from_slice::<CollectionMeta>(&data).unwrap_or_else(|_| {
+                CollectionMeta { config: serde_json::from_slice(&data).unwrap_or_default(), timestamp: 0, is_deleted: false, vector_count: 0 }
+            }),
             None => return Ok(false),
         };
         if existing.timestamp > timestamp && !existing.is_deleted { return Ok(false); }

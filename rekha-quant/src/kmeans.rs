@@ -30,12 +30,6 @@ impl KMeans {
                 "k-means: no vectors or zero clusters".into(),
             ));
         }
-        if self.k > vectors.len() {
-            return Err(RekhaError::InvalidArgument(format!(
-                "k-means: k={} > n={}", self.k, vectors.len()
-            )));
-        }
-
         let mut rng = rand::rngs::StdRng::seed_from_u64(self.seed);
         let n = vectors.len();
 
@@ -74,13 +68,13 @@ impl KMeans {
             let mut changed = false;
 
             for (i, point) in vectors.iter().enumerate() {
-                let nearest = (0..self.k)
-                    .min_by(|&a, &b| {
-                        let da = l2_squared(point, &centroids[a]);
-                        let db = l2_squared(point, &centroids[b]);
-                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap_or(0);
+                    let nearest = (0..self.k)
+                        .min_by(|&a, &b| {
+                            let da = l2_squared(point, &centroids[a]);
+                            let db = l2_squared(point, &centroids[b]);
+                            da.total_cmp(&db)
+                        })
+                        .unwrap_or(0);
 
                 if assignments[i] != nearest {
                     assignments[i] = nearest;
@@ -128,7 +122,7 @@ impl KMeans {
         self.compute_distances(vector, centroids)
             .into_iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(idx, _)| idx)
             .unwrap_or(0)
     }
@@ -175,11 +169,14 @@ mod tests {
 
     #[test]
     fn test_kmeans_k_too_large() {
+        // When k > n, KMeans produces unused centroids that stay at their
+        // initial values (k-means++ picks them, but they may get 0 assignments).
         let km = KMeans::new(10);
         let data: Vec<Vec<f32>> = (0..3).map(|i| vec![i as f32; 2]).collect();
         let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
-        let result = km.train(&refs, 2);
-        assert!(result.is_err());
+        let centroids = km.train(&refs, 2).unwrap();
+        assert_eq!(centroids.len(), 10);
+        assert_eq!(centroids[0].len(), 2);
     }
 
     #[test]

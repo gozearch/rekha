@@ -1,0 +1,17 @@
+[package]
+name = "rekha-replication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Replication policy: LWW timestamps, quorum consistency, hinted handoff"
+keywords = ["vector-database", "replication", "lww", "dynamo"]
+categories = ["database"]
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-storage = { path = "../rekha-storage" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,20 +1,17 @@
 use rekha_index::RekhaIndex;
-use rekha_partition::PartitionManager;
 use rekha_storage::RocksVectorStore;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Identity, Server};
 use tracing::{info, warn};
 
 use crate::config::ServerConfig;
-use crate::coordinator::Coordinator;
 use crate::proto::rekha_server::RekhaServer as RekhaGrpcServer;
 use crate::proto::HeartbeatRequest;
 use crate::service::RekhaService;
+use rekha_coordinator::Coordinator;
 
 pub struct ServerInstance {
     config: ServerConfig,
@@ -41,14 +38,19 @@ impl ServerInstance {
         );
         info!("Storage opened at {}", config.cluster.data_dir);
 
-        let partition_manager = Arc::new(RwLock::new(PartitionManager::new(
-            HashMap::new(), 4, 8,
-        )));
-
+        let coord_config = rekha_coordinator::CoordinatorConfig {
+            node_id: config.cluster.node_id.clone(),
+            bind_addr: config.cluster.bind_addr.clone(),
+            seed_nodes: config.cluster.seed_nodes.clone(),
+            default_write_consistency: config.cluster.default_write_consistency.clone(),
+            hinted_handoff_enabled: config.cluster.hinted_handoff_enabled,
+            max_hint_window_secs: config.cluster.max_hint_window_secs,
+            gc_grace_seconds: config.storage.gc_grace_seconds,
+            peer_timeout_ms: 10000,
+        };
         let coordinator = Arc::new(Coordinator::new(
-            config.clone(),
+            coord_config,
             store.clone(),
-            partition_manager,
         ));
 
         let index = RekhaIndex::new()?;
@@ -161,14 +163,10 @@ impl ServerInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rekha_core::VectorIndex;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
+    #[allow(deprecated)]
     fn temp_dir() -> String {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("/tmp/rekha_server_test_{}", n)
+        tempfile::TempDir::new().unwrap().into_path().to_string_lossy().to_string()
     }
 
     #[tokio::test]
@@ -182,7 +180,6 @@ mod tests {
     async fn test_with_index() {
         let config = ServerConfig::dev_default("test-node", &temp_dir());
         let server = ServerInstance::from_config(config).await.unwrap();
-        let store = rekha_storage::RocksVectorStore::open(temp_dir()).unwrap();
         let index =
             rekha_index::RekhaIndex::new().unwrap();
         index.create_collection("default", 8, 4, 2).unwrap();
@@ -207,12 +204,5 @@ mod tests {
         let config = ServerConfig::dev_default("test-node", "/nonexistent_dir_xyz/data");
         let result = ServerInstance::from_config(config).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_spawn_heartbeat_loop() {
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        assert!(server.coordinator.is_initialized().await);
     }
 }

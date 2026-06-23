@@ -147,7 +147,23 @@ class RekhaClient:
     ) -> Collection:
         if get_or_create:
             try:
-                return self.get_collection(name)
+                exists = self._with_retry(
+                    "collection_exists",
+                    lambda: self._stub.CollectionExists(
+                        pb.CollectionExistsRequest(name=name),
+                        timeout=self._config["request_timeout"],
+                    ),
+                )
+                if exists.exists:
+                    info_pb = self._with_retry(
+                        "list_collections",
+                        lambda: self._stub.ListCollections(
+                            pb.ListCollectionsRequest(), timeout=self._config["request_timeout"]
+                        ),
+                    )
+                    for ci in info_pb.collections:
+                        if ci.name == name:
+                            return Collection(self, name, info=self._collection_info_from_pb(ci))
             except RekhaError:
                 pass
 
@@ -173,43 +189,10 @@ class RekhaClient:
                 break
         return Collection(self, name, info=coll_info)
 
-    def get_collection(self, name: str) -> Collection:
-        response = self._with_retry(
-            "collection_exists",
-            lambda: self._stub.CollectionExists(
-                pb.CollectionExistsRequest(name=name),
-                timeout=self._config["request_timeout"],
-            ),
-        )
-        if not response.exists:
-            raise RekhaError(f"collection '{name}' not found")
-
-        info_pb = self._with_retry(
-            "list_collections",
-            lambda: self._stub.ListCollections(
-                pb.ListCollectionsRequest(), timeout=self._config["request_timeout"]
-            ),
-        )
-        coll_info = None
-        for ci in info_pb.collections:
-            if ci.name == name:
-                coll_info = self._collection_info_from_pb(ci)
-                break
-        return Collection(self, name, info=coll_info)
-
-    def get_or_create_collection(
-        self,
-        name: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        consistency: ConsistencyLevel | None = None,
-        **config: Any,
-    ) -> Collection:
-        return self.create_collection(name, metadata=metadata, get_or_create=True, consistency=consistency, **config)
-
-    def delete_collection(self, name: str, consistency: ConsistencyLevel | None = None) -> None:
+    def drop_collection(self, name: str, consistency: ConsistencyLevel | None = None) -> None:
         cl_val = consistency.value if consistency else 0
         self._with_retry(
-            "delete_collection",
+            "drop_collection",
             lambda: self._stub.DropCollection(
                 pb.DropCollectionRequest(name=name, timestamp=0, consistency=cl_val),
                 timeout=self._config["request_timeout"],
@@ -234,19 +217,6 @@ class RekhaClient:
         if limit is not None:
             collections = collections[:limit]
         return collections
-
-    def count_collections(self) -> int:
-        return len(self.list_collections())
-
-    def heartbeat(self) -> bool:
-        response = self._with_retry(
-            "heartbeat",
-            lambda: self._stub.Heartbeat(
-                pb.HeartbeatRequest(node_id="", address="", storage_bytes=0),
-                timeout=self._config["request_timeout"],
-            ),
-        )
-        return response.success
 
     def close(self) -> None:
         try:

@@ -1,8 +1,8 @@
 use rekha_core::distance::{l2_squared, l2_squared_partial};
 use rekha_core::{IndexError, RekhaError};
 
-use crate::kmeans::KMeans;
-use crate::pq::ProductQuantizer;
+use rekha_quant::KMeans;
+use rekha_quant::ProductQuantizer;
 
 pub struct IvfIndex {
     pub centroids: Vec<Vec<f32>>,
@@ -27,7 +27,6 @@ impl IvfIndex {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         vectors: &[(u64, Vec<f32>)],
         nlist: usize,
@@ -116,8 +115,8 @@ impl IvfIndex {
                 candidates.push((dist, *id));
             }
         }
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let mut seen = std::collections::HashSet::new();
         let mut result_ids = Vec::with_capacity(k);
         let mut result_dists = Vec::with_capacity(k);
@@ -168,7 +167,7 @@ impl IvfIndex {
             }
         }
 
-        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut seen = std::collections::HashSet::new();
         let mut result_ids = Vec::with_capacity(k);
         let mut result_dists = Vec::with_capacity(k);
@@ -205,7 +204,7 @@ impl IvfIndex {
             }
         }
 
-        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut seen = std::collections::HashSet::new();
         let mut result_ids = Vec::with_capacity(k);
         let mut result_dists = Vec::with_capacity(k);
@@ -226,7 +225,7 @@ impl IvfIndex {
             .enumerate()
             .map(|(i, c)| (i, l2_squared(query, c)))
             .collect();
-        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        dists.sort_by(|a, b| a.1.total_cmp(&b.1));
         dists.truncate(nprobe);
         dists
     }
@@ -278,7 +277,7 @@ mod tests {
     fn small_dataset() -> Vec<(u64, Vec<f32>)> {
         (0..50)
             .map(|i| {
-                let v: Vec<f32> = (0..8).map(|d| ((i * 8 + d) as f32)).collect();
+                let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
                 (i as u64, v)
             })
             .collect()

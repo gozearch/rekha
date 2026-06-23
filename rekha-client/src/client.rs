@@ -1,4 +1,4 @@
-use rekha_core::{ConsistencyLevel, NodeInfo, RekhaError};
+use rekha_core::{ConsistencyLevel, RekhaError};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -90,21 +90,6 @@ impl RekhaClient {
         })
     }
 
-    async fn resolve_connect(&self, addr: &str) -> Result<tonic::transport::Channel, RekhaError> {
-        let endpoint_string = format!("http://{addr}");
-        tonic::transport::Channel::from_shared(endpoint_string.clone())
-            .map_err(|e| RekhaError::Unavailable {
-                detail: format!("invalid endpoint {endpoint_string}: {e}"),
-            })?
-            .connect_timeout(self.config.connect_timeout)
-            .timeout(self.config.request_timeout)
-            .connect()
-            .await
-            .map_err(|e| RekhaError::Unavailable {
-                detail: format!("failed to connect to {addr}: {e}"),
-            })
-    }
-
     /// Insert a vector with optional payload.
     /// Automatically follows leader redirects.
     pub async fn replica_insert(
@@ -151,7 +136,6 @@ impl RekhaClient {
     ) -> Result<u64, RekhaError> {
         let max_attempts = self.config.max_retries + 1;
         let mut last_err = None;
-        let cl_val = consistency.to_i32();
 
         for _ in 0..max_attempts {
             let ch = self.channel.read().await.clone();
@@ -203,7 +187,7 @@ impl RekhaClient {
         self.with_retry("replica_create_collection", move || {
             let request = tonic::Request::new(CreateCollectionRequest {
                 name: cn.clone(),
-                config: Some(config.clone()),
+                config: Some(config),
                 is_replication: true,
                 timestamp,
                 consistency: 0,
@@ -257,8 +241,8 @@ impl RekhaClient {
                 top_k: k as u32,
                 collection_name: cn.clone(),
                 local_only: params.local_only,
-                params: Some(proto_params.clone()),
-                consistency: 0,
+                params: Some(proto_params),
+                consistency: consistency.to_i32(),
             });
             let mut client = GrpcClient::new(ch.clone());
             async move {
@@ -352,35 +336,37 @@ impl RekhaClient {
         Ok(results)
     }
 
-    pub async fn get_node_info(&self) -> Result<NodeInfo, RekhaError> {
+    pub async fn handshake_with(&self, node_id: &str, address: &str) -> Result<(String, Vec<rekha_core::NodeInfo>), RekhaError> {
         let ch = self.channel.read().await.clone();
-        self.with_retry("get_node_info", move || {
-            use crate::proto::rekha_client::RekhaClient as GrpcClientInner;
+        let node_id = node_id.to_string();
+        let address = address.to_string();
+        self.with_retry("handshake_with", move || {
             let request = tonic::Request::new(crate::proto::HandshakeRequest {
-                node_id: String::new(),
-                address: String::new(),
+                node_id: node_id.clone(),
+                address: address.clone(),
             });
-            let mut client = GrpcClientInner::new(ch.clone());
+            let mut client = GrpcClient::new(ch.clone());
             async move {
                 let resp = client.handshake(request).await?.into_inner();
-                Ok(NodeInfo {
-                    node_id: resp.cluster_id,
-                    address: String::new(),
-                    partition_id: 0,
-                    dim_groups: Vec::new(),
+                let peers: Vec<rekha_core::NodeInfo> = resp.peers.into_iter().map(|p| rekha_core::NodeInfo {
+                    node_id: p.node_id,
+                    address: p.address,
+                    partition_id: p.partition_id,
+                    dim_groups: p.dim_groups,
                     is_leader: false,
                     raft_term: 0,
                     commit_index: 0,
-                    storage_bytes: 0,
+                    storage_bytes: p.storage_bytes,
                     status: rekha_core::NodeStatus::Healthy,
                     last_heartbeat: 0,
-                })
+                }).collect();
+                Ok((resp.cluster_id, peers))
             }
         }).await
     }
 
-    pub async fn cluster_info(&self) -> Result<NodeInfo, RekhaError> {
-        self.get_node_info().await
+    pub async fn cluster_info(&self) -> Result<(String, Vec<rekha_core::NodeInfo>), RekhaError> {
+        self.handshake_with("", "").await
     }
 
     pub async fn create_collection(

@@ -2,6 +2,12 @@
 name = "rekha-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core types, traits, and utilities for the Rekha vector database"
+keywords = ["vector-database", "ann", "core", "types", "nearest-neighbor"]
+categories = ["database", "data-structures"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

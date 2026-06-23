@@ -185,11 +185,9 @@ mod tests {
         ring.add_node("node-a");
         ring.add_node("node-b");
         let healthy_a: HashSet<&str> = ["node-a", "node-b"].into();
-        let before = ring.replicas_for(5, 1, &healthy_a);
 
         ring.add_node("node-c");
         let healthy_all: HashSet<&str> = ["node-a", "node-b", "node-c"].into();
-        let after = ring.replicas_for(5, 1, &healthy_all);
 
         let shards_changed = (0..100)
             .filter(|s| {
@@ -263,5 +261,21 @@ mod tests {
         let replicas = ring.replicas_for(0, 3, &healthy);
         assert_eq!(replicas.len(), 1);
         assert_eq!(replicas[0], "solo");
+    }
+
+    #[test]
+    fn test_replicas_never_duplicate() {
+        let mut ring = ConsistentHashRing::new(128);
+        ring.add_node("a");
+        ring.add_node("b");
+        ring.add_node("c");
+        let healthy: std::collections::HashSet<&str> = ["a", "b", "c"].into();
+        for rf in 1..5usize {
+            let replicas = ring.replicas_for(42, rf, &healthy);
+            let mut unique = replicas.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(replicas.len(), unique.len());
+        }
     }
 }

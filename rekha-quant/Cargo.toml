@@ -1,0 +1,17 @@
+[package]
+name = "rekha-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Product quantization and K-Means clustering for vector compression"
+keywords = ["vector-quantization", "kmeans", "ann"]
+categories = ["algorithms", "data-structures"]
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rand = "0.8"
+
+[dev-dependencies]
+approx = "0.5"

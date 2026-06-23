@@ -4,20 +4,28 @@ default-members = [
     "rekha-core",
     "rekha-storage",
     "rekha-index",
-    "rekha-partition",
+    "rekha-quant",
+    "rekha-replication",
+    "rekha-cluster",
+    "rekha-coordinator",
     "rekha-server",
     "rekha-client",
     "rekha-cli",
+    "rekha-proto",
     "rekha-bench",
 ]
 members = [
     "rekha-core",
     "rekha-storage",
     "rekha-index",
-    "rekha-partition",
+    "rekha-quant",
+    "rekha-replication",
+    "rekha-cluster",
+    "rekha-coordinator",
     "rekha-server",
     "rekha-client",
     "rekha-cli",
+    "rekha-proto",
     "rekha-bench",
 ]
 
@@ -25,3 +33,9 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+rust-version = "1.80"
+authors = ["Rekha Contributors"]
+readme = "README.md"
+repository = "https://github.com/anomalyco/rekha"
+homepage = "https://github.com/anomalyco/rekha"
+description = "Rekha — distributed vector database with IVF+PQ indexing and Dynamo-style replication"

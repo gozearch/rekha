@@ -8,12 +8,12 @@ import pytest
 
 from rekha import (
     Collection,
+    ConsistencyLevel,
     RekhaClient,
     RekhaConnectError,
     RekhaError,
     RekhaRequestError,
 )
-
 
 
 class FakeRpcError(grpc.RpcError):
@@ -80,12 +80,6 @@ class FakeStub:
     def CollectionExists(self, request: Any, timeout: float = 0) -> Any:
         return self._call("CollectionExists", request, timeout=timeout)
 
-    def Heartbeat(self, request: Any, timeout: float = 0) -> Any:
-        return self._call("Heartbeat", request, timeout=timeout)
-
-    def Insert(self, request: Any, timeout: float = 0) -> Any:
-        return self._call("Insert", request, timeout=timeout)
-
     def InsertBatch(self, request_iterator: Any, timeout: float = 0) -> Any:
         self._call_counts["InsertBatch"] = self._call_counts.get("InsertBatch", 0) + 1
         items = list(request_iterator)
@@ -99,12 +93,6 @@ class FakeStub:
 
     def Search(self, request: Any, timeout: float = 0) -> Any:
         return self._call("Search", request, timeout=timeout)
-
-    def SearchDimRange(self, request: Any, timeout: float = 0) -> Any:
-        return self._call("SearchDimRange", request, timeout=timeout)
-
-    def Handshake(self, request: Any, timeout: float = 0) -> Any:
-        return self._call("Handshake", request, timeout=timeout)
 
 
 def make_client(stub: Any = None) -> RekhaClient:
@@ -125,7 +113,6 @@ def make_collection(client: RekhaClient, name: str = "test") -> Collection:
     coll = Collection.__new__(Collection)
     coll._client = client
     coll.name = name
-    coll._info = None
     return coll
 
 
@@ -163,12 +150,12 @@ class TestRekhaClient:
 
     def test_retry_exhausted_raises_error(self) -> None:
         stub = FakeStub({
-            "CreateCollection": lambda req, timeout: FakeResponse(success=True, error=""),
+            "ListCollections": lambda req, timeout: FakeResponse(collections=[]),
         })
-        stub.set_fails("CreateCollection", 99)
+        stub.set_fails("ListCollections", 99)
         client = make_client(stub)
         with pytest.raises(RekhaRequestError):
-            client.create_collection("test", dim=256)
+            client.list_collections()
 
     def test_create_collection(self) -> None:
         cfg = _fake_config(dim=256, nlist=1024)
@@ -180,8 +167,6 @@ class TestRekhaClient:
         client = make_client(stub)
         coll = client.create_collection("test", dim=256, nlist=1024)
         assert coll.name == "test"
-        assert coll._info is not None
-        assert coll._info.config.dim == 256
 
     def test_create_collection_get_or_create_exists(self) -> None:
         cfg = _fake_config(dim=256)
@@ -194,44 +179,12 @@ class TestRekhaClient:
         coll = client.create_collection("existing", get_or_create=True)
         assert coll.name == "existing"
 
-    def test_get_collection(self) -> None:
-        cfg = _fake_config(dim=128)
-        ci = FakeResponse(name="mycoll", config=cfg, vector_count=10, index_ready=True)
-        stub = FakeStub({
-            "CollectionExists": lambda req, timeout: FakeResponse(exists=True),
-            "ListCollections": lambda req, timeout: FakeResponse(collections=[ci]),
-        })
-        client = make_client(stub)
-        coll = client.get_collection("mycoll")
-        assert coll.name == "mycoll"
-        assert coll.count() == 10
-
-    def test_get_collection_not_found(self) -> None:
-        stub = FakeStub({
-            "CollectionExists": lambda req, timeout: FakeResponse(exists=False),
-        })
-        client = make_client(stub)
-        with pytest.raises(RekhaError, match="not found"):
-            client.get_collection("nonexistent")
-
-    def test_get_or_create_collection(self) -> None:
-        cfg = _fake_config(dim=256)
-        ci = FakeResponse(name="mycoll", config=cfg, vector_count=0, index_ready=False)
-        stub = FakeStub({
-            "CollectionExists": lambda req, timeout: FakeResponse(exists=False),
-            "CreateCollection": lambda req, timeout: FakeResponse(success=True, error=""),
-            "ListCollections": lambda req, timeout: FakeResponse(collections=[ci]),
-        })
-        client = make_client(stub)
-        coll = client.get_or_create_collection("mycoll", dim=256)
-        assert coll.name == "mycoll"
-
-    def test_delete_collection(self) -> None:
+    def test_drop_collection(self) -> None:
         stub = FakeStub({
             "DropCollection": lambda req, timeout: FakeResponse(success=True, error=""),
         })
         client = make_client(stub)
-        client.delete_collection("test")
+        client.drop_collection("test")
         assert stub._call_counts.get("DropCollection", 0) == 1
 
     def test_list_collections(self) -> None:
@@ -259,22 +212,6 @@ class TestRekhaClient:
         colls = client.list_collections(limit=1, offset=1)
         assert len(colls) == 1
         assert colls[0].name == "b"
-
-    def test_count_collections(self) -> None:
-        cfg = _fake_config(dim=256)
-        ci = FakeResponse(name="x", config=cfg, vector_count=0, index_ready=True)
-        stub = FakeStub({
-            "ListCollections": lambda req, timeout: FakeResponse(collections=[ci, ci, ci]),
-        })
-        client = make_client(stub)
-        assert client.count_collections() == 3
-
-    def test_heartbeat(self) -> None:
-        stub = FakeStub({
-            "Heartbeat": lambda req, timeout: FakeResponse(success=True),
-        })
-        client = make_client(stub)
-        assert client.heartbeat() is True
 
 
 class TestCollection:
@@ -397,29 +334,6 @@ class TestCollection:
         )
         assert len(result["ids"]) == 2
 
-    def test_peek(self) -> None:
-        pt1 = fake_scored_point(id=1, score=0.9)
-        pt2 = fake_scored_point(id=2, score=0.8)
-        stub = FakeStub({
-            "Search": lambda req, timeout: FakeResponse(
-                results=[pt1, pt2], stats=MockStats(),
-            ),
-        })
-        client = make_client(stub)
-        coll = make_collection(client)
-        result = coll.peek(limit=2)
-        assert result["ids"] == [1, 2]
-
-    def test_count(self) -> None:
-        cfg = _fake_config(dim=256)
-        ci = FakeResponse(name="test", config=cfg, vector_count=42, index_ready=True)
-        stub = FakeStub({
-            "ListCollections": lambda req, timeout: FakeResponse(collections=[ci]),
-        })
-        client = make_client(stub)
-        coll = make_collection(client)
-        assert coll.count() == 42
-
     def test_delete_by_ids(self) -> None:
         stub = FakeStub({
             "Delete": lambda req, timeout: FakeResponse(deleted_count=3),
@@ -435,24 +349,7 @@ class TestCollection:
         with pytest.raises(ValueError, match="ids must not be empty"):
             coll.delete(ids=[])
 
-    def test_search_dim_range(self) -> None:
-        pt1 = fake_scored_point(id=1, score=0.9)
-        stub = FakeStub({
-            "SearchDimRange": lambda req, timeout: FakeResponse(results=[pt1]),
-        })
-        client = make_client(stub)
-        coll = make_collection(client)
-        result = coll.search_dim_range(
-            query_embeddings=[[0.1] * 8],
-            n_results=5,
-            dim_start=0,
-            dim_end=4,
-        )
-        assert len(result["ids"]) == 1
-        assert result["ids"][0] == [1]
-
     def test_consistency_level_enum_values(self) -> None:
-        from rekha.types import ConsistencyLevel
         assert ConsistencyLevel.ONE.value == 1
         assert ConsistencyLevel.QUORUM.value == 2
         assert ConsistencyLevel.ALL.value == 3

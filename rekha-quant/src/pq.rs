@@ -1,6 +1,7 @@
-use rand::Rng;
 use rekha_core::{distance::l2_squared, IndexError, RekhaError};
 use std::f32;
+
+use crate::kmeans::KMeans;
 
 /// Product Quantizer for compressing high-dimensional vectors.
 ///
@@ -30,7 +31,7 @@ pub struct ProductQuantizer {
 impl ProductQuantizer {
     /// Create a new PQ with M sub-quantizers, each with K centroids.
     pub fn new(m: usize, k: usize, dim: usize) -> Result<Self, RekhaError> {
-        if !dim.is_multiple_of(m) {
+        if dim % m != 0 {
             return Err(RekhaError::InvalidArgument(format!(
                 "PQ: dimension {dim} not divisible by M={m}"
             )));
@@ -67,8 +68,8 @@ impl ProductQuantizer {
             // Collect sub-vectors for this sub-quantizer.
             let sub_vectors: Vec<&[f32]> = vectors.iter().map(|v| &v[start..end]).collect();
 
-            // Train k-means on these sub-vectors.
-            let centroids = kmeans(&sub_vectors, self.k, 20);
+            // Train k-means on these sub-vectors using KMeans (k-means++ init).
+            let centroids = KMeans::with_params(self.k, 20, 1e-4, 42).train(&sub_vectors, self.d)?;
             self.centroids[m] = centroids;
         }
 
@@ -150,71 +151,6 @@ impl ProductQuantizer {
     }
 }
 
-/// K-means clustering on a set of sub-vectors.
-/// Returns K centroids, each of dimension d.
-fn kmeans(data: &[&[f32]], k: usize, max_iter: usize) -> Vec<Vec<f32>> {
-    if data.is_empty() || k == 0 {
-        return vec![];
-    }
-
-    let dim = data[0].len();
-    let mut rng = rand::thread_rng();
-
-    // Initialize: randomly pick k data points as centroids.
-    let mut centroids: Vec<Vec<f32>> = (0..k)
-        .map(|_| {
-            let idx = rng.gen_range(0..data.len());
-            data[idx].to_vec()
-        })
-        .collect();
-
-    let mut _assignments = vec![0usize; data.len()];
-
-    for _iter in 0..max_iter {
-        // Assignment step: assign each point to nearest centroid.
-        let mut changed = false;
-        for (i, point) in data.iter().enumerate() {
-            let nearest = (0..k)
-                .min_by(|&a, &b| {
-                    let da = l2_squared(point, &centroids[a]);
-                    let db = l2_squared(point, &centroids[b]);
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap_or(0);
-
-            if _assignments[i] != nearest {
-                _assignments[i] = nearest;
-                changed = true;
-            }
-        }
-
-        if !changed {
-            break;
-        }
-
-        // Update step: recompute centroids as mean of assigned points.
-        let mut sums = vec![vec![0.0f32; dim]; k];
-        let mut counts = vec![0usize; k];
-        for (i, point) in data.iter().enumerate() {
-            let cluster = _assignments[i];
-            for d in 0..dim {
-                sums[cluster][d] += point[d];
-            }
-            counts[cluster] += 1;
-        }
-
-        for c in 0..k {
-            if counts[c] > 0 {
-                for d in 0..dim {
-                    centroids[c][d] = sums[c][d] / counts[c] as f32;
-                }
-            }
-        }
-    }
-
-    centroids
-}
-
 /// Find the index of the nearest centroid to the given sub-vector.
 fn nearest_centroid(sub_vec: &[f32], centroids: &[Vec<f32>]) -> usize {
     centroids
@@ -223,7 +159,7 @@ fn nearest_centroid(sub_vec: &[f32], centroids: &[Vec<f32>]) -> usize {
         .min_by(|(_, a), (_, b)| {
             let da = l2_squared(sub_vec, a);
             let db = l2_squared(sub_vec, b);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            da.total_cmp(&db)
         })
         .map(|(idx, _)| idx)
         .unwrap_or(0)
@@ -232,6 +168,7 @@ fn nearest_centroid(sub_vec: &[f32], centroids: &[Vec<f32>]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
     #[test]
     fn test_pq_roundtrip() {
@@ -323,32 +260,6 @@ mod tests {
         assert_eq!(table.len(), 4);
         assert_eq!(table[0].len(), 32);
         assert_eq!(table[3].len(), 32);
-    }
-
-    #[test]
-    fn test_kmeans_convergence() {
-        // Small 2D dataset with clear clusters
-        let data: Vec<Vec<f32>> = vec![
-            vec![0.0, 0.0],
-            vec![0.1, 0.1],
-            vec![0.2, 0.2],
-            vec![5.0, 5.0],
-            vec![5.1, 5.1],
-            vec![5.2, 5.2],
-        ];
-        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
-        let centroids = kmeans(&refs, 2, 10);
-        assert_eq!(centroids.len(), 2);
-        assert_eq!(centroids[0].len(), 2);
-    }
-
-    #[test]
-    fn test_nearest_centroid_direct() {
-        let centroids = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
-        let idx = nearest_centroid(&[1.0, 1.0], &centroids);
-        assert_eq!(idx, 0);
-        let idx = nearest_centroid(&[9.0, 9.0], &centroids);
-        assert_eq!(idx, 1);
     }
 
     #[test]

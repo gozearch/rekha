@@ -1,0 +1,27 @@
+[package]
+name = "rekha-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Coordinator logic for Rekha — write/read path orchestration"
+keywords = ["vector-database", "coordinator", "orchestration"]
+categories = ["database"]
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-storage = { path = "../rekha-storage" }
+rekha-index = { path = "../rekha-index" }
+rekha-replication = { path = "../rekha-replication" }
+rekha-cluster = { path = "../rekha-cluster" }
+rekha-proto = { path = "../rekha-proto" }
+rekha-client = { path = "../rekha-client" }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

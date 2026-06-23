@@ -9,9 +9,6 @@ const CF_METADATA: &str = "metadata";
 /// A batch of writes that are applied atomically to RocksDB.
 ///
 /// This ensures that vector data, payloads, and metadata are always consistent.
-///
-/// NOTE: `put_vector` and `delete` operate on raw keys (id.to_be_bytes())
-/// without namespace prefix. Use the store trait methods for namespaced access.
 pub struct WriteBatch<'a> {
     store: &'a RocksVectorStore,
     batch: RocksWriteBatch,
@@ -27,9 +24,9 @@ impl<'a> WriteBatch<'a> {
         }
     }
 
-    pub fn put_vector(mut self, id: u64, data: &[f32]) -> Self {
-        let key = id.to_be_bytes();
-        let value = vector_to_bytes(data);
+    pub fn put_vector(mut self, id: u64, timestamp: u64, data: &[f32]) -> Self {
+        let key = self.store.encode_key(id);
+        let value = RocksVectorStore::encode_vector_value(timestamp, 0x00, data);
         let cf = self.store.db().cf_handle(CF_VECTORS).unwrap();
         self.batch.put_cf(&cf, key, value);
         self.pending += 1;
@@ -37,19 +34,19 @@ impl<'a> WriteBatch<'a> {
     }
 
     pub fn put_payload(mut self, id: u64, payload: &[u8]) -> Self {
-        let key = id.to_be_bytes();
+        let key = self.store.encode_key(id);
         let cf = self.store.db().cf_handle(CF_PAYLOADS).unwrap();
         self.batch.put_cf(&cf, key, payload);
         self.pending += 1;
         self
     }
 
-    #[allow(dead_code)]
-    pub fn delete(mut self, id: u64) -> Self {
-        let key = id.to_be_bytes();
+    pub fn put_tombstone(mut self, id: u64, timestamp: u64) -> Self {
+        let key = self.store.encode_key(id);
+        let value = RocksVectorStore::encode_vector_value(timestamp, 0x01, &[]);
         let cf_v = self.store.db().cf_handle(CF_VECTORS).unwrap();
         let cf_p = self.store.db().cf_handle(CF_PAYLOADS).unwrap();
-        self.batch.delete_cf(&cf_v, key);
+        self.batch.put_cf(&cf_v, key.clone(), value);
         self.batch.delete_cf(&cf_p, key);
         self.pending += 2;
         self
@@ -71,19 +68,11 @@ impl<'a> WriteBatch<'a> {
             StorageError::BatchWrite {
                 committed: 0,
                 failed: self.pending,
-                source: e.to_string(),
+                msg: e.to_string(),
             }
             .into()
         })
     }
-}
-
-fn vector_to_bytes(data: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for &val in data {
-        bytes.extend_from_slice(&val.to_le_bytes());
-    }
-    bytes
 }
 
 #[cfg(test)]
@@ -103,19 +92,38 @@ mod tests {
     }
 
     #[test]
+    fn test_write_batch_vector_roundtrip() {
+        let store = setup_store("rekha_test_batch_vec");
+        let batch = WriteBatch::new(&store).put_vector(42, 100, &[1.0, 2.0, 3.0, 4.0]);
+        batch.commit().unwrap();
+
+        let rec = store.get_vector_record(42).unwrap().unwrap();
+        assert!(!rec.is_tombstone);
+        assert_eq!(rec.timestamp, 100);
+        assert_eq!(rec.data, Some(vec![1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn test_write_batch_tombstone_roundtrip() {
+        let store = setup_store("rekha_test_batch_ts");
+        let batch = WriteBatch::new(&store)
+            .put_vector(1, 100, &[10.0])
+            .put_tombstone(1, 200);
+        batch.commit().unwrap();
+
+        let rec = store.get_vector_record(1).unwrap().unwrap();
+        assert!(rec.is_tombstone);
+        assert_eq!(rec.timestamp, 200);
+        assert!(store.get_vector(1).unwrap().is_none());
+    }
+
+    #[test]
     fn test_write_batch_commit() {
         let store = setup_store("rekha_test_batch");
-        // Write vectors directly (WriteBatch::put_vector writes unformatted bytes)
-        store.put_vector(1, &[1.0, 2.0], 100).unwrap();
-        store.put_vector(2, &[3.0, 4.0], 100).unwrap();
-
-        // Use WriteBatch for payloads and verify atomic commit
         let batch = WriteBatch::new(&store).put_payload(1, b"payload1");
         batch.commit().unwrap();
 
-        assert!((store.get_vector(1).unwrap().unwrap()[0] - 1.0).abs() < 1e-6);
         assert_eq!(store.get_payload(1).unwrap().unwrap(), b"payload1");
-        assert!((store.get_vector(2).unwrap().unwrap()[0] - 3.0).abs() < 1e-6);
     }
 
     #[test]
@@ -134,18 +142,5 @@ mod tests {
         let cf = store.db().cf_handle("metadata").unwrap();
         let val = store.db().get_cf(&cf, b"cluster_config").unwrap().unwrap();
         assert_eq!(val, br#"{"key": "value"}"#);
-    }
-
-    #[test]
-    fn test_write_batch_delete() {
-        let store = setup_store("rekha_test_batch_del");
-        store.put_vector(1, &[10.0], 100).unwrap();
-        store.put_payload(1, b"data").unwrap();
-
-        let batch = WriteBatch::new(&store).delete(1);
-        batch.commit().unwrap();
-
-        assert!(store.get_vector(1).unwrap().is_none());
-        assert!(store.get_payload(1).unwrap().is_none());
     }
 }

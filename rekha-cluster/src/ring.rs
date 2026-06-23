@@ -253,22 +253,6 @@ mod tests {
         );
     }
 
-    proptest::proptest! {
-        #[test]
-        fn replicas_never_duplicate(rf in 1..5usize) {
-            let mut ring = crate::ring::ConsistentHashRing::new(128);
-            ring.add_node("a");
-            ring.add_node("b");
-            ring.add_node("c");
-            let healthy: std::collections::HashSet<&str> = ["a", "b", "c"].into();
-            let replicas = ring.replicas_for(42, rf, &healthy);
-            let mut unique = replicas.clone();
-            unique.sort();
-            unique.dedup();
-            assert_eq!(replicas.len(), unique.len());
-        }
-    }
-
     #[test]
     fn test_single_node_rf() {
         let mut ring = empty_ring();
@@ -277,5 +261,21 @@ mod tests {
         let replicas = ring.replicas_for(0, 3, &healthy);
         assert_eq!(replicas.len(), 1);
         assert_eq!(replicas[0], "solo");
+    }
+
+    #[test]
+    fn test_replicas_never_duplicate() {
+        let mut ring = ConsistentHashRing::new(128);
+        ring.add_node("a");
+        ring.add_node("b");
+        ring.add_node("c");
+        let healthy: std::collections::HashSet<&str> = ["a", "b", "c"].into();
+        for rf in 1..5usize {
+            let replicas = ring.replicas_for(42, rf, &healthy);
+            let mut unique = replicas.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(replicas.len(), unique.len());
+        }
     }
 }

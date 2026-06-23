@@ -13,7 +13,6 @@ categories = ["database", "data-structures"]
 rekha-core = { path = "../rekha-core" }
 rekha-index = { path = "../rekha-index" }
 rekha-quant = { path = "../rekha-quant" }
-rekha-partition = { path = "../rekha-partition" }
 criterion = { version = "0.5", features = ["async_tokio"] }
 tokio = { version = "1", features = ["full"] }
 rand = "0.8"

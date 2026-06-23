@@ -1,6 +1,7 @@
 use rekha_core::{RekhaError, now_epoch_secs};
 use rekha_storage::{HintEntry, HintStore};
 
+#[derive(Debug)]
 pub struct HintedHandoff {
     enabled: bool,
     max_window_secs: u64,

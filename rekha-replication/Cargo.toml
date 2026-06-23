@@ -12,7 +12,6 @@ categories = ["database"]
 [dependencies]
 rekha-core = { path = "../rekha-core" }
 rekha-storage = { path = "../rekha-storage" }
-rekha-partition = { path = "../rekha-partition" }
 
 [dev-dependencies]
 tempfile = "3"

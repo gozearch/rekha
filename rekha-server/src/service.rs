@@ -642,10 +642,7 @@ mod tests {
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open(dir.path().join("db")).unwrap(),
         );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds, peer_timeout_ms: 10000 }, store));
         let service = RekhaService::new(coord);
         // service is initialized; verify by checking it doesn't panic
         let _ = service;
@@ -658,10 +655,7 @@ mod tests {
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open(dir.path().join("db")).unwrap(),
         );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds, peer_timeout_ms: 10000 }, store));
         let service = RekhaService::new(coord);
 
         // Test "json" content type
@@ -733,10 +727,7 @@ mod tests {
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open(dir.path().join("db")).unwrap(),
         );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds, peer_timeout_ms: 10000 }, store));
         let service = RekhaService::new(coord);
 
         let req = tonic::Request::new(SearchRequest {
@@ -758,10 +749,7 @@ mod tests {
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open("/tmp/svc_del_test_db").unwrap(),
         );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds, peer_timeout_ms: 10000 }, store));
         let service = RekhaService::new(coord);
 
         let req = tonic::Request::new(DeleteRequest {
@@ -790,10 +778,7 @@ mod tests {
         let store = std::sync::Arc::new(
             rekha_storage::RocksVectorStore::open(format!("{dir}/db")).unwrap(),
         );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds }, store, pm));
+        let coord = std::sync::Arc::new(rekha_coordinator::Coordinator::new(rekha_coordinator::CoordinatorConfig { node_id: config.cluster.node_id.clone(), bind_addr: config.cluster.bind_addr.clone(), seed_nodes: config.cluster.seed_nodes.clone(), default_write_consistency: config.cluster.default_write_consistency.clone(), hinted_handoff_enabled: config.cluster.hinted_handoff_enabled, max_hint_window_secs: config.cluster.max_hint_window_secs, gc_grace_seconds: config.storage.gc_grace_seconds, peer_timeout_ms: 10000 }, store));
         RekhaService::new(coord)
     }
 

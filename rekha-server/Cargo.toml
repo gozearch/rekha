@@ -13,7 +13,6 @@ categories = ["database", "data-structures"]
 rekha-core = { path = "../rekha-core" }
 rekha-storage = { path = "../rekha-storage" }
 rekha-index = { path = "../rekha-index" }
-rekha-partition = { path = "../rekha-partition" }
 rekha-proto = { path = "../rekha-proto" }
 rekha-replication = { path = "../rekha-replication" }
 rekha-cluster = { path = "../rekha-cluster" }
@@ -34,10 +33,10 @@ futures = "0.3"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
+tempfile = "3"
 
 [dev-dependencies]
 approx = "0.5"
-tempfile = "3"
 proptest = "1"
 tokio-test = "0.4"
 rand = "0.8"

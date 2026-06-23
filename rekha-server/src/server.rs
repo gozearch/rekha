@@ -1,11 +1,8 @@
 use rekha_index::RekhaIndex;
-use rekha_partition::PartitionManager;
 use rekha_storage::RocksVectorStore;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Identity, Server};
 use tracing::{info, warn};
@@ -41,12 +38,6 @@ impl ServerInstance {
         );
         info!("Storage opened at {}", config.cluster.data_dir);
 
-        let partition_manager = Arc::new(RwLock::new(PartitionManager::new(
-            HashMap::new(),
-            config.partition.num_dim_groups,
-            config.partition.total_dim,
-        )));
-
         let coord_config = rekha_coordinator::CoordinatorConfig {
             node_id: config.cluster.node_id.clone(),
             bind_addr: config.cluster.bind_addr.clone(),
@@ -55,11 +46,11 @@ impl ServerInstance {
             hinted_handoff_enabled: config.cluster.hinted_handoff_enabled,
             max_hint_window_secs: config.cluster.max_hint_window_secs,
             gc_grace_seconds: config.storage.gc_grace_seconds,
+            peer_timeout_ms: 10000,
         };
         let coordinator = Arc::new(Coordinator::new(
             coord_config,
             store.clone(),
-            partition_manager,
         ));
 
         let index = RekhaIndex::new()?;

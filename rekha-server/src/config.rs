@@ -7,7 +7,6 @@ pub struct ServerConfig {
     pub tls: TlsConfig,
     pub observability: ObservabilityConfig,
     pub storage: StorageConfig,
-    pub partition: PartitionConfig,
 }
 
 impl ServerConfig {
@@ -40,7 +39,6 @@ impl ServerConfig {
                 max_inline_size: 1_048_576,
                 gc_grace_seconds: 864000,
             },
-            partition: PartitionConfig::default(),
         }
     }
 }
@@ -86,28 +84,6 @@ pub struct StorageConfig {
     #[serde(default = "default_gc_grace")]
     pub gc_grace_seconds: u64,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionConfig {
-    /// Number of dimension groups for partitioning
-    #[serde(default = "default_num_dim_groups")]
-    pub num_dim_groups: u32,
-    /// Total dimension for partition layout
-    #[serde(default = "default_total_dim")]
-    pub total_dim: usize,
-}
-
-impl Default for PartitionConfig {
-    fn default() -> Self {
-        Self {
-            num_dim_groups: default_num_dim_groups(),
-            total_dim: default_total_dim(),
-        }
-    }
-}
-
-fn default_num_dim_groups() -> u32 { 4 }
-fn default_total_dim() -> usize { 768 }
 
 fn default_consistency() -> String {
     "QUORUM".into()

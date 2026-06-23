@@ -1465,7 +1465,6 @@ dependencies = [
  "rand 0.8.6",
  "rekha-core",
  "rekha-index",
- "rekha-partition",
  "rekha-quant",
  "serde",
  "serde_json",
@@ -1526,7 +1525,6 @@ dependencies = [
  "rekha-cluster",
  "rekha-core",
  "rekha-index",
- "rekha-partition",
  "rekha-proto",
  "rekha-replication",
  "rekha-storage",
@@ -1568,19 +1566,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rekha-partition"
-version = "0.1.0"
-dependencies = [
- "approx",
- "fnv",
- "log",
- "proptest",
- "rand 0.8.6",
- "rekha-core",
- "serde",
-]
-
-[[package]]
 name = "rekha-proto"
 version = "0.1.0"
 dependencies = [
@@ -1605,7 +1590,6 @@ name = "rekha-replication"
 version = "0.1.0"
 dependencies = [
  "rekha-core",
- "rekha-partition",
  "rekha-storage",
  "tempfile",
 ]
@@ -1627,7 +1611,6 @@ dependencies = [
  "rekha-coordinator",
  "rekha-core",
  "rekha-index",
- "rekha-partition",
  "rekha-proto",
  "rekha-replication",
  "rekha-storage",

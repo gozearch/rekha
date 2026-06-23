@@ -13,7 +13,6 @@ categories = ["database"]
 rekha-core = { path = "../rekha-core" }
 rekha-storage = { path = "../rekha-storage" }
 rekha-index = { path = "../rekha-index" }
-rekha-partition = { path = "../rekha-partition" }
 rekha-replication = { path = "../rekha-replication" }
 rekha-cluster = { path = "../rekha-cluster" }
 rekha-proto = { path = "../rekha-proto" }

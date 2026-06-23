@@ -29,54 +29,6 @@ class QueryResult(TypedDict, total=False):
 
 
 @dataclass
-class Payload:
-    content_type: str
-    data: bytes
-
-    @classmethod
-    def from_bytes(cls, data: bytes, content_type: str = "raw") -> Payload:
-        return cls(content_type=content_type, data=data)
-
-
-@dataclass
-class ScoredPoint:
-    id: int
-    score: float
-    payload: Optional[Payload] = None
-
-
-@dataclass
-class SearchParams:
-    ef_search: int = 100
-    nprobe: int = 32
-    include_payloads: bool = False
-
-
-@dataclass
-class SearchStats:
-    total_ms: float = 0.0
-    nodes_contacted: int = 0
-    vectors_scanned: int = 0
-    warnings: List[str] = field(default_factory=list)
-
-
-@dataclass
-class NodeInfo:
-    node_id: str
-    address: str
-    partition_id: int
-    dim_groups: List[int]
-    storage_bytes: int
-    status: str
-
-
-@dataclass
-class ClusterTopology:
-    cluster_id: str
-    peers: List[NodeInfo]
-
-
-@dataclass
 class CollectionConfig:
     dim: int = 0
     num_vector_shards: int = 1

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import rekha.proto.rekha_pb2 as pb
-from .types import CollectionInfo, ConsistencyLevel, GetResult, QueryResult
+from .types import ConsistencyLevel, GetResult, QueryResult
 
 if TYPE_CHECKING:
     from .client import RekhaClient
@@ -32,21 +32,9 @@ def _parse_payload(payload_pb: Any) -> tuple[dict | None, str | None]:
 
 
 class Collection:
-    def __init__(self, client: RekhaClient, name: str, info: CollectionInfo | None = None):
+    def __init__(self, client: RekhaClient, name: str, info: Any | None = None):
         self._client = client
         self.name = name
-        self._info = info
-
-    def count(self) -> int:
-        self._refresh_info()
-        return self._info.vector_count if self._info else 0
-
-    def _refresh_info(self) -> None:
-        collections = self._client.list_collections()
-        for c in collections:
-            if c.name == self.name:
-                self._info = c._info
-                return
 
     def add(
         self,
@@ -230,9 +218,6 @@ class Collection:
             result[_INCLUDE_EMBEDDINGS] = batch_embeddings
         return result
 
-    def peek(self, limit: int = 10) -> GetResult:
-        return self.get(limit=limit)
-
     def delete(self, ids: List[int], consistency: ConsistencyLevel | None = None) -> None:
         if not ids:
             raise ValueError("ids must not be empty")
@@ -244,56 +229,3 @@ class Collection:
                 timeout=self._client._config["request_timeout"],
             ),
         )
-
-    def search_dim_range(
-        self,
-        query_embeddings: List[List[float]],
-        n_results: int = 10,
-        dim_start: int = 0,
-        dim_end: int = 0,
-    ) -> QueryResult:
-        batch_ids: List[List[int]] = []
-        batch_distances: List[List[float]] = []
-        batch_metadatas: List[List[dict | None]] = []
-        batch_documents: List[List[str | None]] = []
-
-        for qvec in query_embeddings:
-            request = pb.SearchDimRangeRequest(
-                query_vector=qvec,
-                top_k=n_results,
-                dim_start=dim_start,
-                dim_end=dim_end,
-                nprobe=32,
-                collection_name=self.name,
-            )
-            response = self._client._with_retry(
-                "search_dim_range",
-                lambda req=request: self._client._stub.SearchDimRange(
-                    req, timeout=self._client._config["request_timeout"]
-                ),
-            )
-            point_ids: List[int] = []
-            point_dists: List[float] = []
-            point_mds: List[dict | None] = []
-            point_docs: List[str | None] = []
-
-            for pt in response.results:
-                point_ids.append(pt.id)
-                point_dists.append(pt.score)
-                md, doc = _parse_payload(getattr(pt, "payload", None))
-                point_mds.append(md)
-                point_docs.append(doc)
-
-            batch_ids.append(point_ids)
-            batch_distances.append(point_dists)
-            batch_metadatas.append(point_mds)
-            batch_documents.append(point_docs)
-
-        result: QueryResult = {
-            "ids": batch_ids,
-            "included": [_INCLUDE_DISTANCES, _INCLUDE_METADATAS, _INCLUDE_DOCUMENTS],
-        }
-        result[_INCLUDE_DISTANCES] = batch_distances
-        result[_INCLUDE_METADATAS] = batch_metadatas
-        result[_INCLUDE_DOCUMENTS] = batch_documents
-        return result

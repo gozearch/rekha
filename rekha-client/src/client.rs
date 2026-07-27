@@ -1,445 +1,421 @@
-use rekha_core::{ConsistencyLevel, RekhaError};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
+use rekha_core::{ConsistencyLevel, IvfConfig, RekhaError, ScoredPoint, SearchParams};
+use rekha_proto::proto::{self, rekha_client::RekhaClient as ProtoRekhaClient};
+use tonic::transport::Channel;
 
-use crate::proto::{
-    rekha_client::RekhaClient as GrpcClient, CollectionExistsRequest, CreateCollectionRequest,
-    DeleteRequest, DropCollectionRequest, InsertRequest, ListCollectionsRequest, SearchRequest,
-    SearchParams as ProtoSearchParams,
-};
-
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone)]
-pub struct ClientConfig {
-    pub seeds: Vec<String>,
-    pub max_retries: u32,
-    pub request_timeout: Duration,
-    pub connect_timeout: Duration,
+pub struct Client {
+    inner: ProtoRekhaClient<Channel>,
 }
 
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            seeds: vec!["127.0.0.1:50051".into()],
-            max_retries: 3,
-            request_timeout: DEFAULT_TIMEOUT,
-            connect_timeout: CONNECT_TIMEOUT,
-        }
-    }
-}
-
-pub struct RekhaClient {
-    config: ClientConfig,
-    channel: Arc<RwLock<tonic::transport::Channel>>,
-}
-
-impl RekhaClient {
-    pub async fn connect(seeds: &[String]) -> Result<Self, RekhaError> {
-        let config = ClientConfig {
-            seeds: seeds.to_vec(),
-            ..Default::default()
-        };
-        Self::connect_with_config(config).await
-    }
-
-    pub async fn connect_with_config(config: ClientConfig) -> Result<Self, RekhaError> {
-        let endpoint_string = format!("http://{}", config.seeds[0]);
-        let channel = tonic::transport::Channel::from_shared(endpoint_string.clone())
-            .map_err(|e| RekhaError::Unavailable {
-                detail: format!("invalid endpoint {endpoint_string}: {e}"),
-            })?
-            .connect_timeout(config.connect_timeout)
-            .timeout(config.request_timeout)
-            .connect()
+impl Client {
+    pub async fn connect(address: &str) -> Result<Self, RekhaError> {
+        let inner = ProtoRekhaClient::connect(address.to_string())
             .await
-            .map_err(|e| RekhaError::Unavailable {
-                detail: format!("failed to connect to {}: {e}", config.seeds[0]),
-            })?;
-
-        Ok(Self {
-            config,
-            channel: Arc::new(RwLock::new(channel)),
-        })
-    }
-
-    async fn with_retry<F, Fut, T>(&self, _op_name: &str, f: F) -> Result<T, RekhaError>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T, tonic::Status>>,
-    {
-        let max_attempts = self.config.max_retries + 1;
-        let mut last_err = None;
-
-        for attempt in 0..max_attempts {
-            match f().await {
-                Ok(val) => return Ok(val),
-                Err(e) => {
-                    last_err = Some(e);
-                    if attempt + 1 < max_attempts {
-                        tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
-                    }
-                }
-            }
-        }
-
-        Err(RekhaError::Unavailable {
-            detail: format!("operation failed after {max_attempts} attempts: {:?}", last_err),
-        })
-    }
-
-    /// Insert a vector with optional payload.
-    /// Automatically follows leader redirects.
-    pub async fn replica_insert(
-        &self,
-        id: u64,
-        vector: Vec<f32>,
-        collection_name: &str,
-        payload: Option<Vec<u8>>,
-        timestamp: u64,
-    ) -> Result<u64, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let v = vector.clone();
-        let p = payload.clone();
-        let cn = collection_name.to_string();
-        self.with_retry("replica_insert", move || {
-            let request = tonic::Request::new(InsertRequest {
-                id,
-                vector: v.clone(),
-                collection_name: cn.clone(),
-                payload: p.clone().map(|data| crate::proto::Payload {
-                    content_type: "raw".into(),
-                    data,
-                }),
-                is_replication: true,
-                timestamp,
-                consistency: 0,
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.insert(request).await?.into_inner();
-                if resp.success { Ok(resp.id) }
-                else { Err(tonic::Status::internal(resp.error)) }
-            }
-        }).await
-    }
-
-    pub async fn insert(
-        &self,
-        id: u64,
-        vector: Vec<f32>,
-        collection_name: &str,
-        payload: Option<Vec<u8>>,
-        consistency: ConsistencyLevel,
-    ) -> Result<u64, RekhaError> {
-        let max_attempts = self.config.max_retries + 1;
-        let mut last_err = None;
-
-        for _ in 0..max_attempts {
-            let ch = self.channel.read().await.clone();
-            let v = vector.clone();
-            let p = payload.clone();
-            let cn = collection_name.to_string();
-
-            let request = tonic::Request::new(InsertRequest {
-                id,
-                vector: v,
-                collection_name: cn,
-                payload: p.map(|data| crate::proto::Payload {
-                    content_type: "raw".into(),
-                    data,
-                }),
-                is_replication: false,
-                timestamp: 0,
-                consistency: consistency.to_i32(),
-            });
-            let mut client = GrpcClient::new(ch);
-
-            match client.insert(request).await {
-                Ok(resp) => {
-                    let inner = resp.into_inner();
-                    if inner.success {
-                        return Ok(inner.id);
-                    }
-                    return Err(RekhaError::Internal {
-                        detail: inner.error,
-                    });
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-
-        Err(RekhaError::Unavailable {
-            detail: format!("insert failed after {max_attempts} attempts: {:?}", last_err),
-        })
-    }
-
-    pub async fn replica_create_collection(
-        &self, name: &str, config: crate::proto::CollectionConfig, timestamp: u64,
-    ) -> Result<bool, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let cn = name.to_string();
-        self.with_retry("replica_create_collection", move || {
-            let request = tonic::Request::new(CreateCollectionRequest {
-                name: cn.clone(),
-                config: Some(config),
-                is_replication: true,
-                timestamp,
-                consistency: 0,
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.create_collection(request).await?.into_inner();
-                Ok(resp.success)
-            }
-        }).await
-    }
-
-    pub async fn replica_drop_collection(&self, name: &str, timestamp: u64) -> Result<bool, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let cn = name.to_string();
-        self.with_retry("replica_drop_collection", move || {
-            let request = tonic::Request::new(DropCollectionRequest {
-                name: cn.clone(),
-                is_replication: true,
-                timestamp,
-                consistency: 0,
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.drop_collection(request).await?.into_inner();
-                Ok(resp.success)
-            }
-        }).await
-    }
-
-    pub async fn search_with_params(
-        &self,
-        query: Vec<f32>,
-        collection_name: &str,
-        k: usize,
-        params: rekha_core::SearchParams,
-        consistency: ConsistencyLevel,
-    ) -> Result<(Vec<rekha_core::ScoredPoint>, rekha_core::SearchStats), RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let q = query.clone();
-        let cn = collection_name.to_string();
-        let proto_params = ProtoSearchParams {
-            ef_search: params.ef_search as u32,
-            nprobe: params.nprobe as u32,
-            include_payloads: params.include_payloads,
-        };
-
-        self.with_retry("search", move || {
-            let request = tonic::Request::new(SearchRequest {
-                query_vector: q.clone(),
-                top_k: k as u32,
-                collection_name: cn.clone(),
-                local_only: params.local_only,
-                params: Some(proto_params),
-                consistency: consistency.to_i32(),
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.search(request).await?.into_inner();
-                let results: Vec<rekha_core::ScoredPoint> = resp
-                    .results
-                    .into_iter()
-                    .map(|r| rekha_core::ScoredPoint {
-                        id: r.id,
-                        score: r.score,
-                        payload: r.payload.map(|p| rekha_core::Payload {
-                            content_type: match p.content_type.as_str() {
-                                "json" => rekha_core::PayloadType::Json,
-                                "text" => rekha_core::PayloadType::Text,
-                                _ => rekha_core::PayloadType::Raw,
-                            },
-                            data: p.data,
-                        }),
-                        timestamp: r.timestamp,
-                    })
-                    .collect();
-                let stats = resp.stats.unwrap_or_default();
-                Ok((
-                    results,
-                    rekha_core::SearchStats {
-                        total_ms: stats.total_ms,
-                        nodes_contacted: stats.nodes_contacted,
-                        vectors_scanned: stats.vectors_scanned,
-                        warnings: stats.warnings,
-                    },
-                ))
-            }
-        }).await
-    }
-
-    pub async fn delete(&self, ids: &[u64], collection_name: &str, consistency: ConsistencyLevel) -> Result<u64, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let ids_vec = ids.to_vec();
-        let cn = collection_name.to_string();
-        self.with_retry("delete", move || {
-            let request = tonic::Request::new(DeleteRequest {
-                ids: ids_vec.clone(),
-                collection_name: cn.clone(),
-                timestamp: 0,
-                consistency: consistency.to_i32(),
-                is_replication: false,
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.delete(request).await?.into_inner();
-                Ok(resp.deleted_count)
-            }
-        }).await
-    }
-
-    pub async fn replica_delete(
-        &self,
-        ids: &[u64],
-        collection_name: &str,
-        timestamp: u64,
-    ) -> Result<u64, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let ids_vec = ids.to_vec();
-        let cn = collection_name.to_string();
-        self.with_retry("replica_delete", move || {
-            let request = tonic::Request::new(DeleteRequest {
-                ids: ids_vec.clone(),
-                collection_name: cn.clone(),
-                timestamp,
-                consistency: 0,
-                is_replication: true,
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.delete(request).await?.into_inner();
-                Ok(resp.deleted_count)
-            }
-        }).await
-    }
-
-    pub async fn search(
-        &self,
-        query: Vec<f32>,
-        collection_name: &str,
-        k: usize,
-        consistency: ConsistencyLevel,
-    ) -> Result<Vec<rekha_core::ScoredPoint>, RekhaError> {
-        let (results, _) = self
-            .search_with_params(query, collection_name, k, rekha_core::SearchParams::default(), consistency)
-            .await?;
-        Ok(results)
-    }
-
-    pub async fn handshake_with(&self, node_id: &str, address: &str) -> Result<(String, Vec<rekha_core::NodeInfo>), RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let node_id = node_id.to_string();
-        let address = address.to_string();
-        self.with_retry("handshake_with", move || {
-            let request = tonic::Request::new(crate::proto::HandshakeRequest {
-                node_id: node_id.clone(),
-                address: address.clone(),
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.handshake(request).await?.into_inner();
-                let peers: Vec<rekha_core::NodeInfo> = resp.peers.into_iter().map(|p| rekha_core::NodeInfo {
-                    node_id: p.node_id,
-                    address: p.address,
-                    partition_id: p.partition_id,
-                    dim_groups: p.dim_groups,
-                    is_leader: false,
-                    raft_term: 0,
-                    commit_index: 0,
-                    storage_bytes: p.storage_bytes,
-                    status: rekha_core::NodeStatus::Healthy,
-                    last_heartbeat: 0,
-                }).collect();
-                Ok((resp.cluster_id, peers))
-            }
-        }).await
-    }
-
-    pub async fn cluster_info(&self) -> Result<(String, Vec<rekha_core::NodeInfo>), RekhaError> {
-        self.handshake_with("", "").await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?;
+        Ok(Client { inner })
     }
 
     pub async fn create_collection(
-        &self, name: &str, dim: u32, nlist: u32, nprobe: u32, rf: u64,
+        &mut self,
+        name: &str,
+        config: IvfConfig,
+    ) -> Result<bool, RekhaError> {
+        let req = tonic::Request::new(proto::CreateCollectionRequest {
+            name: name.to_string(),
+            config: Some(config.into()),
+            is_replication: false,
+            timestamp: 0,
+            consistency: proto::ConsistencyLevel::Quorum as i32,
+            origin_node_id: "client".to_string(),
+        });
+        let resp = self
+            .inner
+            .create_collection(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        if !resp.success {
+            return Err(RekhaError::InvalidArgument(resp.error));
+        }
+        Ok(true)
+    }
+
+    pub async fn drop_collection(&mut self, name: &str) -> Result<bool, RekhaError> {
+        let req = tonic::Request::new(proto::DropCollectionRequest {
+            name: name.to_string(),
+            is_replication: false,
+            timestamp: 0,
+            consistency: proto::ConsistencyLevel::Quorum as i32,
+            origin_node_id: "client".to_string(),
+        });
+        let resp = self
+            .inner
+            .drop_collection(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        if !resp.success {
+            return Err(RekhaError::InvalidArgument(resp.error));
+        }
+        Ok(true)
+    }
+
+    pub async fn list_collections(&mut self) -> Result<Vec<String>, RekhaError> {
+        let req = tonic::Request::new(proto::ListCollectionsRequest {});
+        let resp = self
+            .inner
+            .list_collections(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp.collections.into_iter().map(|c| c.name).collect())
+    }
+
+    pub async fn collection_exists(&mut self, name: &str) -> Result<bool, RekhaError> {
+        let req = tonic::Request::new(proto::CollectionExistsRequest {
+            name: name.to_string(),
+        });
+        let resp = self
+            .inner
+            .collection_exists(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp.exists)
+    }
+
+    pub async fn insert(
+        &mut self,
+        collection: &str,
+        id: u64,
+        vector: Vec<f32>,
+        payload: Option<Vec<u8>>,
+        timestamp: u64,
         consistency: ConsistencyLevel,
     ) -> Result<bool, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let name_str = name.to_string();
-        self.with_retry("create_collection", move || {
-            let request = tonic::Request::new(CreateCollectionRequest {
-                name: name_str.clone(),
-                config: Some(crate::proto::CollectionConfig {
-                    dim, nlist, nprobe,
-                    num_vector_shards: 6,
-                    replication_factor: rf,
-                    num_dim_groups: 4,
-                    dim_group_size: dim / 4,
-                    pq_num_sub_vectors: 4,
-                    pq_num_centroids: 256,
-                    re_rank_k: 256,
-                }),
-                is_replication: false,
-                timestamp: 0,
-                consistency: consistency.to_i32(),
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                client.create_collection(request).await.map(|r| r.into_inner().success)
-            }
-        }).await
+        let req = tonic::Request::new(proto::InsertRequest {
+            id,
+            vector,
+            payload: payload.map(|data| proto::Payload {
+                content_type: "application/octet-stream".into(),
+                data,
+            }),
+            collection_name: collection.to_string(),
+            is_replication: false,
+            timestamp,
+            consistency: proto::ConsistencyLevel::from(consistency) as i32,
+            origin_node_id: "client".to_string(),
+        });
+        let resp = self
+            .inner
+            .insert(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        if !resp.success {
+            return Err(RekhaError::Internal(resp.error));
+        }
+        Ok(true)
     }
 
-    pub async fn drop_collection(&self, name: &str, consistency: ConsistencyLevel) -> Result<bool, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let name_str = name.to_string();
-        self.with_retry("drop_collection", move || {
-            let request = tonic::Request::new(DropCollectionRequest {
-                name: name_str.clone(),
-                is_replication: false,
-                timestamp: 0,
-                consistency: consistency.to_i32(),
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                client.drop_collection(request).await.map(|r| r.into_inner().success)
-            }
-        }).await
+    pub async fn delete(
+        &mut self,
+        collection: &str,
+        ids: &[u64],
+        timestamp: u64,
+        consistency: ConsistencyLevel,
+    ) -> Result<u64, RekhaError> {
+        let req = tonic::Request::new(proto::DeleteRequest {
+            ids: ids.to_vec(),
+            collection_name: collection.to_string(),
+            timestamp,
+            consistency: proto::ConsistencyLevel::from(consistency) as i32,
+            is_replication: false,
+            origin_node_id: "client".to_string(),
+        });
+        let resp = self
+            .inner
+            .delete(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp.deleted_count)
     }
 
-    pub async fn list_collections(&self) -> Result<Vec<String>, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        self.with_retry("list_collections", move || {
-            let request = tonic::Request::new(ListCollectionsRequest {});
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.list_collections(request).await?.into_inner();
-                Ok(resp.collections.into_iter().map(|c| c.name).collect())
-            }
-        }).await
+    pub async fn fetch(
+        &mut self,
+        collection: &str,
+        ids: &[u64],
+        include_payloads: bool,
+    ) -> Result<Vec<ScoredPoint>, RekhaError> {
+        let req = tonic::Request::new(proto::FetchRequest {
+            ids: ids.to_vec(),
+            include_payloads,
+            collection_name: collection.to_string(),
+            consistency: proto::ConsistencyLevel::One as i32,
+        });
+        let resp = self
+            .inner
+            .fetch(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp
+            .points
+            .into_iter()
+            .map(|sp| ScoredPoint {
+                id: sp.id,
+                score: sp.score,
+                payload: sp.payload.map(|p| p.data),
+                timestamp: sp.timestamp as i64,
+            })
+            .collect())
     }
 
-    pub async fn collection_exists(&self, name: &str) -> Result<bool, RekhaError> {
-        let ch = self.channel.read().await.clone();
-        let cn = name.to_string();
-        self.with_retry("collection_exists", move || {
-            let request = tonic::Request::new(CollectionExistsRequest {
-                name: cn.clone(),
-            });
-            let mut client = GrpcClient::new(ch.clone());
-            async move {
-                let resp = client.collection_exists(request).await?.into_inner();
-                Ok(resp.exists)
+    pub async fn search(
+        &mut self,
+        collection: &str,
+        query: Vec<f32>,
+        top_k: u32,
+        params: SearchParams,
+    ) -> Result<Vec<ScoredPoint>, RekhaError> {
+        let req = tonic::Request::new(proto::SearchRequest {
+            query_vector: query,
+            top_k,
+            params: Some(proto::SearchParams {
+                ef_search: 0,
+                nprobe: params.nprobe,
+                include_payloads: params.include_payloads,
+            }),
+            local_only: false,
+            collection_name: collection.to_string(),
+            consistency: proto::ConsistencyLevel::Quorum as i32,
+        });
+        let resp = self
+            .inner
+            .search(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp
+            .results
+            .into_iter()
+            .map(|sp| ScoredPoint {
+                id: sp.id,
+                score: sp.score,
+                payload: sp.payload.map(|p| p.data),
+                timestamp: sp.timestamp as i64,
+            })
+            .collect())
+    }
+
+    pub async fn health(&mut self) -> Result<bool, RekhaError> {
+        let req = tonic::Request::new(proto::HeartbeatRequest {
+            node_id: "client".to_string(),
+            address: String::new(),
+            storage_bytes: 0,
+        });
+        let resp = self
+            .inner
+            .heartbeat(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp.success)
+    }
+
+    pub async fn import(
+        &mut self,
+        requests: Vec<proto::InsertRequest>,
+    ) -> Result<proto::ImportResponse, RekhaError> {
+        let chunk = proto::ImportChunk { requests };
+        use tokio_stream::wrappers::ReceiverStream;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(chunk).await.map_err(|_| RekhaError::Internal("channel closed".into()))?;
+        drop(tx);
+        let resp = self.inner
+            .import(tonic::Request::new(ReceiverStream::new(rx)))
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp)
+    }
+
+    pub async fn export(
+        &mut self,
+        collection: &str,
+        offset: u64,
+        limit: u64,
+        include_vectors: bool,
+        include_payloads: bool,
+    ) -> Result<Vec<rekha_core::ExportedVector>, RekhaError> {
+        let req = tonic::Request::new(proto::ExportRequest {
+            collection_name: collection.to_string(),
+            offset,
+            limit,
+            include_vectors,
+            include_payloads,
+        });
+        let mut resp = self.inner.export(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        let mut all = Vec::new();
+        while let Some(chunk) = resp.message().await.unwrap_or(None) {
+            for v in chunk.vectors {
+                all.push(rekha_core::ExportedVector {
+                    id: v.id,
+                    vector: v.vector,
+                    payload: v.payload.map(|p| p.data),
+                    timestamp: v.timestamp,
+                });
             }
-        }).await
+        }
+        Ok(all)
+    }
+
+    pub async fn import_stream(
+        &mut self,
+        mut chunks: impl tokio_stream::Stream<Item = Vec<proto::InsertRequest>> + Send + Unpin + 'static,
+    ) -> Result<proto::ImportResponse, RekhaError> {
+        use tokio_stream::StreamExt;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(requests) = chunks.next().await {
+                let chunk = proto::ImportChunk { requests };
+                if tx.send(chunk).await.is_err() { break; }
+            }
+        });
+
+        let resp = self.inner
+            .import(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp)
+    }
+
+    pub async fn export_stream(
+        &mut self,
+        collection: &str,
+        offset: u64,
+        limit: u64,
+        include_vectors: bool,
+        include_payloads: bool,
+    ) -> Result<impl tokio_stream::Stream<Item = Result<rekha_core::ExportedVector, RekhaError>>, RekhaError> {
+        let req = tonic::Request::new(proto::ExportRequest {
+            collection_name: collection.to_string(),
+            offset, limit, include_vectors, include_payloads,
+        });
+        let resp = self.inner.export(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<rekha_core::ExportedVector, RekhaError>>(64);
+        tokio::spawn(async move {
+            use tokio_stream::StreamExt;
+            let mut stream = resp;
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        for v in chunk.vectors {
+                            let ev = rekha_core::ExportedVector {
+                                id: v.id,
+                                vector: v.vector,
+                                payload: v.payload.map(|p| p.data),
+                                timestamp: v.timestamp,
+                            };
+                            if tx.send(Ok(ev)).await.is_err() { return; }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(RekhaError::Unavailable(e.to_string()))).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+
+    pub async fn transfer_shard(
+        &mut self,
+        collection: &str,
+        target_node_id: &str,
+    ) -> Result<Vec<proto::TransferShardChunk>, RekhaError> {
+        let req = tonic::Request::new(proto::TransferShardRequest {
+            shard_id: 0,
+            collection_name: collection.to_string(),
+            target_node_id: target_node_id.to_string(),
+        });
+        let mut stream = self.inner.transfer_shard(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        let mut chunks = Vec::new();
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| RekhaError::Unavailable(e.to_string()))?;
+            chunks.push(chunk);
+        }
+        Ok(chunks)
+    }
+
+    pub async fn repair_collection(
+        &mut self,
+        collection: &str,
+    ) -> Result<Vec<proto::RepairProgress>, RekhaError> {
+        let req = tonic::Request::new(proto::RepairCollectionRequest {
+            collection_name: collection.to_string(),
+        });
+        let mut stream = self.inner.repair_collection(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        let mut results = Vec::new();
+        use futures::StreamExt;
+        while let Some(item) = stream.next().await {
+            let item = item.map_err(|e| RekhaError::Unavailable(e.to_string()))?;
+            results.push(item);
+        }
+        Ok(results)
+    }
+
+    pub async fn send_heartbeat(
+        &mut self,
+        node_id: &str,
+        address: &str,
+    ) -> Result<bool, RekhaError> {
+        let req = tonic::Request::new(rekha_proto::proto::HeartbeatRequest {
+            node_id: node_id.to_string(),
+            address: address.to_string(),
+            storage_bytes: 0,
+        });
+        let resp = self
+            .inner
+            .heartbeat(req)
+            .await
+            .map_err(|e| RekhaError::Unavailable(e.to_string()))?
+            .into_inner();
+        Ok(resp.success)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_connect_fails() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            let client = Client::connect("http://127.0.0.1:1").await;
+            // Should fail to connect
+            assert!(client.is_err());
+            Ok::<_, RekhaError>(())
+        });
+        assert!(result.is_ok());
     }
 }

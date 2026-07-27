@@ -1,208 +1,287 @@
-use rekha_index::RekhaIndex;
-use rekha_storage::RocksVectorStore;
-
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::transport::server::ServerTlsConfig;
-use tonic::transport::{Identity, Server};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use rekha_cluster::chord::{ChordNode, hash_to_chord_id};
+use rekha_cluster::Membership;
+use rekha_coordinator::{Coordinator, PeerPool};
+use rekha_core::ConsistencyLevel;
+use rekha_proto::proto::rekha_server::RekhaServer;
+use rekha_storage::RekhaStore;
+use tokio::sync::RwLock;
+use tonic::transport::{Certificate, Identity};
 use tracing::{info, warn};
 
 use crate::config::ServerConfig;
-use crate::proto::rekha_server::RekhaServer as RekhaGrpcServer;
-use crate::proto::HeartbeatRequest;
 use crate::service::RekhaService;
-use rekha_coordinator::Coordinator;
 
 pub struct ServerInstance {
-    config: ServerConfig,
-    coordinator: Arc<Coordinator>,
+    pub config: ServerConfig,
+    pub store: Arc<RekhaStore>,
+    pub coordinator: Arc<Coordinator>,
+    pub chord: Arc<ChordNode>,
+    pub shutdown_flag: Arc<AtomicBool>,
 }
 
 impl ServerInstance {
-    pub async fn from_config_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = ServerConfig::from_file(path)?;
-        Self::from_config(config).await
-    }
+    pub async fn new(config: ServerConfig) -> anyhow::Result<Self> {
+        let store = Arc::new(RekhaStore::open(&config.data_dir)?);
 
-    pub async fn from_config(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let _ = tracing_subscriber::fmt().with_target(false).try_init();
+        let node_id = config.node_id.clone();
+        let membership = Arc::new(RwLock::new(Membership::new(
+            &node_id,
+            config.cluster.heartbeat_timeout_ms,
+        )));
 
-        info!(
-            "Starting Rekha server: node={}, bind={}",
-            config.cluster.node_id, config.cluster.bind_addr
-        );
+        let node_id_num: u64 = farmhash(&node_id);
 
-        let store = Arc::new(
-            RocksVectorStore::open(&config.cluster.data_dir)
-                .map_err(|e| format!("failed to open storage: {e}"))?,
-        );
-        info!("Storage opened at {}", config.cluster.data_dir);
-
-        let coord_config = rekha_coordinator::CoordinatorConfig {
-            node_id: config.cluster.node_id.clone(),
-            bind_addr: config.cluster.bind_addr.clone(),
-            seed_nodes: config.cluster.seed_nodes.clone(),
-            default_write_consistency: config.cluster.default_write_consistency.clone(),
-            hinted_handoff_enabled: config.cluster.hinted_handoff_enabled,
-            max_hint_window_secs: config.cluster.max_hint_window_secs,
-            gc_grace_seconds: config.storage.gc_grace_seconds,
-            peer_timeout_ms: 10000,
+        let consistency = match config.cluster.default_write_consistency.to_lowercase().as_str() {
+            "one" => ConsistencyLevel::One,
+            "all" => ConsistencyLevel::All,
+            _ => ConsistencyLevel::Quorum,
         };
+
+        let chord_id = hash_to_chord_id(format!("{}:{}", node_id, config.listen).as_bytes());
+        let chord = Arc::new(ChordNode::new(chord_id, &config.listen));
+        chord.set_successor(&node_id, &config.listen);
+
+        let peer_pool = Arc::new(PeerPool::new());
+
         let coordinator = Arc::new(Coordinator::new(
-            coord_config,
             store.clone(),
+            membership,
+            node_id_num,
+            node_id.clone(),
+            config.cluster.hinted_handoff_enabled,
+            config.cluster.max_hint_window_secs,
+            consistency,
+            config.cluster.default_rf,
+            chord.clone(),
+            peer_pool.clone(),
+            config.storage.gc_grace_seconds,
         ));
 
-        let index = RekhaIndex::new()?;
-        coordinator.initialize(index).await;
+        coordinator.initialize().await?;
 
-        let server = Self { config, coordinator };
-        info!("Server initialized {}/{}", server.config.cluster.node_id, server.config.cluster.bind_addr);
-        Ok(server)
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+        Ok(ServerInstance {
+            config,
+            store,
+            coordinator,
+            chord,
+            shutdown_flag,
+        })
     }
 
-    pub async fn with_index(self, index: RekhaIndex) -> Self {
-        self.coordinator.initialize(index).await;
-        self
-    }
+    pub async fn run(self) -> anyhow::Result<()> {
+        if self.config.observability.enable_tracing {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::builder()
+                        .with_default_directive("rekha=info".parse().unwrap())
+                        .from_env_lossy(),
+                )
+                .init();
+            info!("tracing initialized");
+        }
 
-    fn spawn_heartbeat_loop(&self) {
-        let coordinator = self.coordinator.clone();
-        let heartbeat_ms = 100;
-        let node_id = self.config.cluster.node_id.clone();
-        let seed_nodes = self.config.cluster.seed_nodes.clone();
-        let bind_addr = self.config.cluster.bind_addr.clone();
+        let addr = self.config.listen.parse()?;
+        let service = RekhaService::new(self.coordinator.clone());
 
-        let my_addr = seed_nodes
-            .iter()
-            .find(|s| s.starts_with(&node_id))
-            .cloned()
-            .unwrap_or_else(|| bind_addr.clone());
-
+        let hb_coordinator = self.coordinator.clone();
+        let hb_seeds = self.config.cluster.seed_nodes.clone();
+        let hb_interval = self.config.cluster.heartbeat_interval_ms;
+        let hb_self_id = self.config.node_id.clone();
+        let hb_listen = self.config.listen.clone();
         tokio::spawn(async move {
-            let mut health_tick = 0u64;
+            heartbeat_loop(hb_coordinator, &hb_seeds, hb_interval, &hb_self_id, &hb_listen).await;
+        });
+
+        let gc_coordinator = self.coordinator.clone();
+        let gc_interval = self.config.storage.gc_interval_secs;
+        tokio::spawn(async move {
+            gc_loop(gc_coordinator, gc_interval).await;
+        });
+
+        let hr_coordinator = self.coordinator.clone();
+        tokio::spawn(async move {
+            hint_replay_loop(hr_coordinator).await;
+        });
+
+        let chord_stab = self.chord.clone();
+        let shutdown_stab = self.shutdown_flag.clone();
+        tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
-
-                for seed in &seed_nodes {
-                    if seed.starts_with(&node_id) {
-                        continue;
-                    }
-                    let endpoint = format!("http://{}", seed);
-                    match tonic::transport::Channel::from_shared(endpoint) {
-                        Ok(ch) => match ch.connect().await {
-                            Ok(ch) => {
-                                let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
-                                let storage_bytes =
-                                    coordinator.store().get_storage_estimate().unwrap_or(0);
-                                let req = tonic::Request::new(HeartbeatRequest {
-                                    node_id: node_id.clone(),
-                                    address: my_addr.clone(),
-                                    storage_bytes,
-                                });
-                                match client.heartbeat(req).await {
-                                    Ok(resp) => { let _ = resp.into_inner(); }
-                                    Err(e) => { warn!("Heartbeat to {} failed: {}", seed, e); }
-                                }
-                            }
-                            Err(e) => { warn!("Cannot connect to seed node {}: {}", seed, e); }
-                        },
-                        Err(e) => { warn!("Invalid seed URI {}: {}", seed, e); }
-                    }
-                }
-
-                health_tick += 1;
-                if health_tick >= 10 {
-                    health_tick = 0;
-                    coordinator.check_peer_health().await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if shutdown_stab.load(Ordering::Relaxed) { break; }
+                // stabilize: ask successor for predecessor, update if needed
+                if let Some((succ_id, succ_addr)) = chord_stab.successor() {
+                    chord_stab.stabilize_with(&succ_id, &succ_addr);
                 }
             }
         });
-    }
 
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let addr: std::net::SocketAddr = self.config.cluster.bind_addr.parse()?;
-        info!("Starting gRPC server on {}", addr);
+        let chord_fix = self.chord.clone();
+        let shutdown_fix = self.shutdown_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if shutdown_fix.load(Ordering::Relaxed) { break; }
+                chord_fix.fix_next_finger(|_start| {
+                    None
+                });
+            }
+        });
 
-        let service = RekhaService::new(self.coordinator.clone());
+        let chord_check = self.chord.clone();
+        let shutdown_check = self.shutdown_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if shutdown_check.load(Ordering::Relaxed) { break; }
+                chord_check.check_predecessor(false);
+            }
+        });
 
-        self.spawn_heartbeat_loop();
+        let reaper_membership = self.coordinator.membership.clone();
+        let reaper_timeout = self.config.cluster.heartbeat_timeout_ms;
+        let shutdown_rap = self.shutdown_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if shutdown_rap.load(Ordering::Relaxed) { break; }
+                let memb = reaper_membership.read().await;
+                memb.check_timeouts(reaper_timeout);
+            }
+        });
 
-        let mut builder = Server::builder();
+        let mut builder = tonic::transport::Server::builder();
+
         if self.config.tls.enabled {
-            if let (Some(cert), Some(key)) = (
-                self.config.tls.cert_path.as_ref(),
-                self.config.tls.key_path.as_ref(),
-            ) {
-                let cert = tokio::fs::read(cert).await?;
-                let key = tokio::fs::read(key).await?;
+            if let (Some(cert_path), Some(key_path)) =
+                (&self.config.tls.cert_path, &self.config.tls.key_path)
+            {
+                let cert = tokio::fs::read(cert_path).await?;
+                let key = tokio::fs::read(key_path).await?;
                 let identity = Identity::from_pem(cert, key);
-                let tls = ServerTlsConfig::new().identity(identity);
-                if let Some(ca) = self.config.tls.ca_cert_path.as_ref() {
-                    let ca = tokio::fs::read(ca).await?;
-                    let ca = tonic::transport::Certificate::from_pem(ca);
-                    let tls = tls.client_ca_root(ca);
-                    builder = builder.tls_config(tls)?;
+                let mut tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+
+                if let Some(ca_path) = &self.config.tls.client_ca_cert_path {
+                    let ca_cert = tokio::fs::read(ca_path).await?;
+                    tls = tls.client_ca_root(Certificate::from_pem(ca_cert));
+                    info!("mTLS enabled with client CA verification");
                 } else {
-                    builder = builder.tls_config(tls)?;
+                    info!("TLS enabled (no client cert verification)");
                 }
+
+                builder = builder.tls_config(tls)?;
             } else {
-                warn!("TLS enabled but cert or key path missing — falling back to plaintext");
+                warn!("TLS enabled but cert_path or key_path missing, skipping TLS");
             }
         }
 
+        if self.config.observability.enable_metrics {
+            let addr = format!("0.0.0.0:{}", self.config.observability.metrics_port);
+            if let Ok(_exporter) = metrics_exporter_prometheus::PrometheusBuilder::new()
+                .with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap())
+                .install()
+            {
+                info!("Prometheus metrics endpoint on {}", addr);
+            } else {
+                warn!("metrics already installed");
+            }
+        }
+
+        info!("Rekha server listening on {}", addr);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("shutdown signal received, stopping server...");
+            let _ = tx.send(());
+        });
+
         builder
-            .add_service(RekhaGrpcServer::new(service))
-            .serve(addr)
+            .add_service(RekhaServer::new(service))
+            .serve_with_shutdown(addr, async {
+                rx.await.ok();
+            })
             .await?;
+
+        info!("flushing RocksDB...");
+        self.store.flush()?;
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        info!("shutdown complete");
 
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+async fn heartbeat_loop(
+    coordinator: Arc<Coordinator>,
+    seed_nodes: &[String],
+    interval_ms: u64,
+    self_id: &str,
+    listen_addr: &str,
+) {
+    let interval = Duration::from_millis(interval_ms.max(100));
+    let mut tick = 0u64;
+    loop {
+        tokio::time::sleep(interval).await;
+        tick += 1;
 
-    #[allow(deprecated)]
-    fn temp_dir() -> String {
-        tempfile::TempDir::new().unwrap().into_path().to_string_lossy().to_string()
-    }
-
-    #[tokio::test]
-    async fn test_server_initializes() {
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        assert!(server.coordinator.is_initialized().await);
-    }
-
-    #[tokio::test]
-    async fn test_with_index() {
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        let index =
-            rekha_index::RekhaIndex::new().unwrap();
-        index.create_collection("default", 8, 4, 2).unwrap();
-        for i in 0..5 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.insert("default", i, 0, &v).unwrap();
+        for seed in seed_nodes {
+            match rekha_client::Client::connect(seed).await {
+                Ok(mut client) => {
+                    if let Err(e) = client.send_heartbeat(self_id, listen_addr).await {
+                        warn!("heartbeat to {} failed: {}", seed, e);
+                    }
+                }
+                Err(e) => {
+                    warn!("cannot connect to seed {}: {}", seed, e);
+                }
+            }
         }
-        index.flush_buffer("default").unwrap();
-        let server = server.with_index(index).await;
-        assert!(server.coordinator.is_initialized().await);
-    }
 
-    #[tokio::test]
-    async fn test_server_config_refs() {
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        assert_eq!(server.config.cluster.node_id, "test-node");
+        if tick.is_multiple_of(10) {
+            coordinator.membership.write().await.rebuild_ring().await;
+        }
     }
+}
 
-    #[tokio::test]
-    async fn test_from_config_invalid_path() {
-        let config = ServerConfig::dev_default("test-node", "/nonexistent_dir_xyz/data");
-        let result = ServerInstance::from_config(config).await;
-        assert!(result.is_err());
+async fn gc_loop(coordinator: Arc<Coordinator>, interval_secs: u64) {
+    let interval = Duration::from_secs(interval_secs.max(60));
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Ok(collections) = coordinator.list_collections().await {
+            for name in &collections {
+                if let Ok(count) = coordinator.gc_collection(name).await {
+                    if count > 0 {
+                        info!("GC'd {} tombstones from {}", count, name);
+                    }
+                }
+            }
+        }
     }
+}
+
+async fn hint_replay_loop(coordinator: Arc<Coordinator>) {
+    let interval = Duration::from_secs(300);
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Ok(count) = coordinator.replay_hints() {
+            if count > 0 {
+                info!("replayed {} hints", count);
+            }
+        }
+    }
+}
+
+fn farmhash(data: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
 }

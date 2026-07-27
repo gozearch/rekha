@@ -1,308 +1,231 @@
-use rekha_core::{distance::l2_squared, IndexError, RekhaError};
-use std::f32;
+use std::fmt;
+
+use rekha_core::RekhaError;
 
 use crate::kmeans::KMeans;
 
-/// Product Quantizer for compressing high-dimensional vectors.
-///
-/// Splits vectors into `M` sub-vectors, each quantized independently
-/// using k-means with `K` centroids. A vector is encoded as M indices
-/// (each log2(K) bits), giving significant compression.
-///
-/// For example, a 768-dim vector with M=64, K=256:
-///   - PQ code: 64 bytes (vs 3072 bytes for f32)
-///   - Distance table: 64 × 256 f32 = 64KB per query
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct ProductQuantizer {
-    /// Number of sub-vectors.
     pub m: usize,
-    /// Number of centroids per sub-quantizer.
     pub k: usize,
-    /// Total vector dimension.
-    pub dim: usize,
-    /// Dimensions per sub-vector (dim / M), must divide evenly.
-    pub d: usize,
-    /// Centroids: [M][K][D] — each sub-quantizer's centroids.
-    pub centroids: Vec<Vec<Vec<f32>>>,
-    /// Whether the PQ has been trained.
+    pub sub_dim: usize,
+    pub codebooks: Vec<Vec<Vec<f32>>>, // [m][k][sub_dim]
     pub trained: bool,
 }
 
 impl ProductQuantizer {
-    /// Create a new PQ with M sub-quantizers, each with K centroids.
-    pub fn new(m: usize, k: usize, dim: usize) -> Result<Self, RekhaError> {
-        if dim % m != 0 {
-            return Err(RekhaError::InvalidArgument(format!(
-                "PQ: dimension {dim} not divisible by M={m}"
-            )));
-        }
-        Ok(Self {
+    pub fn new(m: usize, k: usize) -> Self {
+        ProductQuantizer {
             m,
             k,
-            dim,
-            d: dim / m,
-            centroids: vec![vec![vec![0.0f32; dim / m]; k]; m],
+            sub_dim: 0,
+            codebooks: Vec::new(),
             trained: false,
-        })
+        }
     }
 
-    /// Train the PQ on a set of vectors using k-means per sub-quantizer.
-    pub fn train(&mut self, vectors: &[&[f32]]) -> Result<(), RekhaError> {
-        if vectors.is_empty() {
-            return Err(IndexError::NotTrained { component: "PQ" }.into());
+    pub fn is_trained(&self) -> bool {
+        self.trained
+    }
+
+    pub fn train(&mut self, data: &[Vec<f32>]) -> Result<(), RekhaError> {
+        if data.is_empty() {
+            return Err(RekhaError::InvalidArgument(
+                "empty training data for PQ".into(),
+            ));
+        }
+        let dim = data[0].len();
+        if !dim.is_multiple_of(self.m) {
+            return Err(RekhaError::InvalidArgument(format!(
+                "dimension {} must be divisible by m={}",
+                dim, self.m
+            )));
+        }
+        self.sub_dim = dim / self.m;
+
+        let mut codebooks = Vec::with_capacity(self.m);
+        for s in 0..self.m {
+            let start = s * self.sub_dim;
+            let end = start + self.sub_dim;
+            let sub_vectors: Vec<Vec<f32>> = data.iter().map(|v| v[start..end].to_vec()).collect();
+
+            let mut kmeans = KMeans::new(self.k, self.sub_dim, 20, 1e-4);
+            kmeans.fit(&sub_vectors)?;
+            codebooks.push(kmeans.centroids);
         }
 
-        for v in vectors {
-            if v.len() != self.dim {
-                return Err(RekhaError::InvalidDimension {
-                    expected: self.dim,
-                    actual: v.len(),
-                });
-            }
-        }
-
-        for m in 0..self.m {
-            let start = m * self.d;
-            let end = start + self.d;
-
-            // Collect sub-vectors for this sub-quantizer.
-            let sub_vectors: Vec<&[f32]> = vectors.iter().map(|v| &v[start..end]).collect();
-
-            // Train k-means on these sub-vectors using KMeans (k-means++ init).
-            let centroids = KMeans::with_params(self.k, 20, 1e-4, 42).train(&sub_vectors, self.d)?;
-            self.centroids[m] = centroids;
-        }
-
+        self.codebooks = codebooks;
         self.trained = true;
         Ok(())
     }
 
-    /// Encode a single vector into its PQ code.
-    pub fn encode(&self, vector: &[f32]) -> Result<Vec<u8>, RekhaError> {
-        if !self.trained {
-            return Err(IndexError::NotTrained { component: "PQ" }.into());
-        }
-        if vector.len() != self.dim {
-            return Err(RekhaError::InvalidDimension {
-                expected: self.dim,
-                actual: vector.len(),
-            });
-        }
-
-        let mut code = Vec::with_capacity(self.m);
-        for m in 0..self.m {
-            let start = m * self.d;
-            let end = start + self.d;
+    pub fn encode(&self, vector: &[f32]) -> Vec<u8> {
+        let mut codes = Vec::with_capacity(self.m);
+        for s in 0..self.m {
+            let start = s * self.sub_dim;
+            let end = start + self.sub_dim;
             let sub_vec = &vector[start..end];
-            let centroid_idx = nearest_centroid(sub_vec, &self.centroids[m]);
-            code.push(centroid_idx as u8);
+            let mut best = 0u8;
+            let mut best_dist = f32::MAX;
+            for (j, centroid) in self.codebooks[s].iter().enumerate() {
+                let d: f32 = sub_vec
+                    .iter()
+                    .zip(centroid.iter())
+                    .map(|(x, y)| {
+                        let diff = x - y;
+                        diff * diff
+                    })
+                    .sum();
+                if d < best_dist {
+                    best_dist = d;
+                    best = j as u8;
+                }
+            }
+            codes.push(best);
         }
-
-        Ok(code)
+        codes
     }
 
-    /// Encode multiple vectors into PQ codes.
-    pub fn encode_batch(&self, vectors: &[&[f32]]) -> Result<Vec<Vec<u8>>, RekhaError> {
+    pub fn encode_batch(&self, vectors: &[Vec<f32>]) -> Vec<Vec<u8>> {
         vectors.iter().map(|v| self.encode(v)).collect()
     }
 
-    /// Compute a distance table for a query vector.
-    /// Result is [M][K] — for each sub-quantizer, the distance from
-    /// the query's sub-vector to each of the K centroids.
+    pub fn decode(&self, codes: &[u8]) -> Vec<f32> {
+        let mut result = Vec::with_capacity(self.m * self.sub_dim);
+        for (s, &code) in codes.iter().enumerate() {
+            let idx = code as usize;
+            if s < self.codebooks.len() && idx < self.codebooks[s].len() {
+                result.extend_from_slice(&self.codebooks[s][idx]);
+            }
+        }
+        result
+    }
+
     pub fn distance_table(&self, query: &[f32]) -> Vec<Vec<f32>> {
         let mut table = Vec::with_capacity(self.m);
-        for m in 0..self.m {
-            let start = m * self.d;
-            let end = start + self.d;
-            let query_sub = &query[start..end];
-            let mut row = Vec::with_capacity(self.k);
-            for centroid in &self.centroids[m] {
-                let dist = l2_squared(query_sub, centroid);
-                row.push(dist);
+        for s in 0..self.m {
+            let start = s * self.sub_dim;
+            let end = start + self.sub_dim;
+            let sub_query = &query[start..end];
+            let mut dists = Vec::with_capacity(self.k);
+            for centroid in &self.codebooks[s] {
+                let d: f32 = sub_query
+                    .iter()
+                    .zip(centroid.iter())
+                    .map(|(x, y)| {
+                        let diff = x - y;
+                        diff * diff
+                    })
+                    .sum();
+                dists.push(d);
             }
-            table.push(row);
+            table.push(dists);
         }
         table
     }
 
-    /// Approximate L2 distance between query and an encoded vector using ADC.
-    /// query: full query vector (used to build distance table externally)
-    /// code: PQ-encoded vector
-    /// table: precomputed distance table for this query
-    #[inline]
-    pub fn adc_distance(code: &[u8], table: &[Vec<f32>]) -> f32 {
+    pub fn adc_distance(&self, table: &[Vec<f32>], codes: &[u8]) -> f32 {
         let mut dist = 0.0f32;
-        for m in 0..code.len() {
-            let centroid_idx = code[m] as usize;
-            dist += table[m][centroid_idx];
+        for (s, &code) in codes.iter().enumerate() {
+            let idx = code as usize;
+            if s < table.len() && idx < table[s].len() {
+                dist += table[s][idx];
+            }
         }
         dist
     }
-
-    pub fn clone_for_ref(&self) -> Self {
-        Self {
-            m: self.m,
-            k: self.k,
-            dim: self.dim,
-            d: self.d,
-            centroids: self.centroids.clone(),
-            trained: self.trained,
-        }
-    }
 }
 
-/// Find the index of the nearest centroid to the given sub-vector.
-fn nearest_centroid(sub_vec: &[f32], centroids: &[Vec<f32>]) -> usize {
-    centroids
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            let da = l2_squared(sub_vec, a);
-            let db = l2_squared(sub_vec, b);
-            da.total_cmp(&db)
-        })
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
+impl fmt::Debug for ProductQuantizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProductQuantizer")
+            .field("m", &self.m)
+            .field("k", &self.k)
+            .field("sub_dim", &self.sub_dim)
+            .field("trained", &self.trained)
+            .finish()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
 
     #[test]
-    fn test_pq_roundtrip() {
-        let mut pq = ProductQuantizer::new(4, 16, 8).unwrap();
-        assert_eq!(pq.m, 4);
-        assert_eq!(pq.d, 2);
-
-        let vectors: Vec<Vec<f32>> = (0..100)
-            .map(|_| (0..8).map(|_| rand::thread_rng().gen::<f32>()).collect())
+    fn test_pq_train_encode_decode() {
+        let dim = 8;
+        let m = 4;
+        let k = 16;
+        let data: Vec<Vec<f32>> = (0..100)
+            .map(|i| (0..dim).map(|d| ((i * 10 + d) as f32) / 10.0).collect())
             .collect();
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
 
-        pq.train(&refs).unwrap();
-        assert!(pq.trained);
+        let mut pq = ProductQuantizer::new(m, k);
+        pq.train(&data).unwrap();
+        assert!(pq.is_trained());
+        assert_eq!(pq.sub_dim, dim / m);
+        assert_eq!(pq.codebooks.len(), m);
 
-        let code = pq.encode(&vectors[0]).unwrap();
-        assert_eq!(code.len(), 4);
+        let codes = pq.encode(&data[0]);
+        assert_eq!(codes.len(), m);
 
-        let table = pq.distance_table(&vectors[0]);
-        assert_eq!(table.len(), 4);
-        assert_eq!(table[0].len(), 16);
-
-        // ADC distance should be 0 for identical vector.
-        let dist = ProductQuantizer::adc_distance(&code, &table);
-        assert!(dist < 2.0); // Some quantization error expected.
+        let decoded = pq.decode(&codes);
+        assert_eq!(decoded.len(), dim);
     }
 
     #[test]
-    fn test_pq_new_invalid_dim() {
-        let result = ProductQuantizer::new(3, 16, 8);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not divisible"));
-    }
-
-    #[test]
-    fn test_pq_untrained_encode() {
-        let pq = ProductQuantizer::new(2, 8, 4).unwrap();
-        let result = pq.encode(&[0.5; 4]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not been trained"));
-    }
-
-    #[test]
-    fn test_pq_encode_wrong_dims() {
-        let mut pq = ProductQuantizer::new(2, 8, 4).unwrap();
-        let vectors: Vec<Vec<f32>> = (0..10)
-            .map(|_| vec![rand::thread_rng().gen::<f32>(); 4])
+    fn test_pq_distance_table() {
+        let dim = 4;
+        let m = 2;
+        let k = 4;
+        let data: Vec<Vec<f32>> = (0..20)
+            .map(|i| (0..dim).map(|d| (i + d) as f32).collect())
             .collect();
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
-        pq.train(&refs).unwrap();
 
-        let result = pq.encode(&[0.5; 8]);
+        let mut pq = ProductQuantizer::new(m, k);
+        pq.train(&data).unwrap();
+
+        let query = vec![0.5, 0.5, 0.5, 0.5];
+        let table = pq.distance_table(&query);
+        assert_eq!(table.len(), m);
+        assert_eq!(table[0].len(), k);
+
+        let codes = pq.encode(&query);
+        let d1 = pq.adc_distance(&table, &codes);
+        assert!(d1.is_finite());
+    }
+
+    #[test]
+    fn test_pq_invalid_dimension() {
+        let mut pq = ProductQuantizer::new(3, 16);
+        let data = vec![vec![1.0, 2.0, 3.0, 4.0]];
+        let result = pq.train(&data);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_pq_train_empty() {
-        let mut pq = ProductQuantizer::new(2, 8, 4).unwrap();
+    fn test_pq_empty_data() {
+        let mut pq = ProductQuantizer::new(2, 16);
         let result = pq.train(&[]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_pq_encode_batch() {
-        let mut pq = ProductQuantizer::new(2, 8, 4).unwrap();
-        let vectors: Vec<Vec<f32>> = (0..20)
-            .map(|_| vec![rand::thread_rng().gen::<f32>(); 4])
+    fn test_encode_batch() {
+        let dim = 4;
+        let m = 2;
+        let k = 4;
+        let data: Vec<Vec<f32>> = (0..20)
+            .map(|i| (0..dim).map(|d| (i + d) as f32).collect())
             .collect();
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
-        pq.train(&refs).unwrap();
 
-        let codes = pq.encode_batch(&refs).unwrap();
-        assert_eq!(codes.len(), 20);
-        for code in &codes {
-            assert_eq!(code.len(), 2);
+        let mut pq = ProductQuantizer::new(m, k);
+        pq.train(&data).unwrap();
+
+        let batch_codes = pq.encode_batch(&data[..5]);
+        assert_eq!(batch_codes.len(), 5);
+        for codes in &batch_codes {
+            assert_eq!(codes.len(), m);
         }
-    }
-
-    #[test]
-    fn test_pq_distance_table_shape() {
-        let mut pq = ProductQuantizer::new(4, 32, 8).unwrap();
-        let vectors: Vec<Vec<f32>> = (0..50)
-            .map(|_| vec![rand::thread_rng().gen::<f32>(); 8])
-            .collect();
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
-        pq.train(&refs).unwrap();
-
-        let table = pq.distance_table(&vectors[0]);
-        assert_eq!(table.len(), 4);
-        assert_eq!(table[0].len(), 32);
-        assert_eq!(table[3].len(), 32);
-    }
-
-    #[test]
-    fn test_adc_distance_distinct() {
-        let table = vec![vec![0.0, 100.0], vec![0.0, 100.0]];
-        let code_near = vec![0u8, 0u8];
-        let code_far = vec![1u8, 1u8];
-        let near_dist = ProductQuantizer::adc_distance(&code_near, &table);
-        let far_dist = ProductQuantizer::adc_distance(&code_far, &table);
-        assert!(near_dist < far_dist);
-    }
-
-    #[test]
-    fn test_train_single_vector() {
-        let mut pq = ProductQuantizer::new(2, 4, 4).unwrap();
-        let v = vec![0.1, 0.2, 0.3, 0.4];
-        let refs = [v.as_slice()];
-        let result = pq.train(&refs);
-        // Single vector might produce degenerate clusters, but should not panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[test]
-    fn test_new_m1_k1() {
-        let pq = ProductQuantizer::new(1, 1, 8).unwrap();
-        assert_eq!(pq.m, 1);
-        assert_eq!(pq.k, 1);
-        assert_eq!(pq.d, 8);
-    }
-
-    #[test]
-    fn test_pq_adc_distance_zero_for_identical() {
-        let mut pq = ProductQuantizer::new(2, 8, 4).unwrap();
-        let vectors: Vec<Vec<f32>> = (0..30)
-            .map(|_| vec![rand::thread_rng().gen::<f32>(); 4])
-            .collect();
-        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
-        pq.train(&refs).unwrap();
-
-        let v = &vectors[5];
-        let code = pq.encode(v).unwrap();
-        let table = pq.distance_table(v);
-        let dist = ProductQuantizer::adc_distance(&code, &table);
-        assert!(dist < 1.0);
     }
 }

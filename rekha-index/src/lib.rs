@@ -1,6 +1,3 @@
-pub mod index;
-pub mod ivf;
+pub mod disk_ivf;
 
-pub use index::RekhaIndex;
-pub use ivf::IvfIndex;
-pub use rekha_quant::{KMeans, ProductQuantizer};
+pub use disk_ivf::DiskIvfIndex;

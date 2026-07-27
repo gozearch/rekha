@@ -15,10 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 rekha-core = { path = "../rekha-core" }
+rekha-proto = { path = "../rekha-proto" }
 rekha-client = { path = "../rekha-client" }
 rekha-server = { path = "../rekha-server" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 serde_json = "1"
 anyhow = "1"
 tracing = "0.1"

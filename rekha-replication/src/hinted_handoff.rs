@@ -1,91 +1,127 @@
-use rekha_core::{RekhaError, now_epoch_secs};
-use rekha_storage::{HintEntry, HintStore};
+use rekha_core::RekhaError;
+use rekha_storage::HintStore;
 
-#[derive(Debug)]
 pub struct HintedHandoff {
+    store: HintStore,
     enabled: bool,
-    max_window_secs: u64,
+    max_window_secs: i64,
 }
 
 impl HintedHandoff {
-    pub fn new(enabled: bool, max_window_secs: u64) -> Self {
-        Self { enabled, max_window_secs }
+    pub fn new(store: HintStore, enabled: bool, max_window_secs: i64) -> Self {
+        HintedHandoff {
+            store,
+            enabled,
+            max_window_secs,
+        }
     }
-
-    pub fn is_enabled(&self) -> bool { self.enabled }
 
     pub fn store_hint(
-        &self, hint_store: &HintStore, target_node_id: &str, collection: &str,
-        id: u64, vector: &[f32], payload: Option<&[u8]>, timestamp: u64,
-    ) {
-        if !self.enabled { return; }
-        let _ = hint_store.put_hint(target_node_id, collection, id, vector, payload, timestamp);
+        &self,
+        target_node: &str,
+        collection: &str,
+        id: u64,
+        data: &[u8],
+        timestamp: i64,
+    ) -> Result<(), RekhaError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if timestamp < now - self.max_window_secs {
+            return Ok(());
+        }
+        let key = format!("{}:{}:{}", target_node, collection, id);
+        self.store.put_hint(key.as_bytes(), data)
     }
 
-    pub fn store_collection_hint(
-        &self, hint_store: &HintStore, target_node_id: &str, collection: &str,
-        config_bytes: &[u8], timestamp: u64, op: u8,
-    ) {
-        if !self.enabled { return; }
-        let _ = hint_store.put_collection_hint(target_node_id, collection, config_bytes, timestamp, op);
+    pub fn drain_hints(&self, target_node: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RekhaError> {
+        let prefix = format!("{}:", target_node);
+        self.store.iter_hints_for_node(prefix.as_bytes())
     }
 
-    pub fn replay_hints(&self, hint_store: &HintStore, peer_id: &str) -> Result<Vec<HintEntry>, RekhaError> {
-        let hints = hint_store.iter_hints_for_node(peer_id)?;
-        let cutoff = now_epoch_secs().saturating_sub(self.max_window_secs);
-        Ok(hints.into_iter()
-            .filter(|h| h.timestamp / 1_000_000 >= cutoff)
-            .collect())
+    pub fn delete_hint(
+        &self,
+        target_node: &str,
+        collection: &str,
+        id: u64,
+    ) -> Result<(), RekhaError> {
+        let key = format!("{}:{}:{}", target_node, collection, id);
+        self.store.delete_hint(key.as_bytes())
     }
 
-    pub fn delete_hint(&self, hint_store: &HintStore, target: &str, collection: &str, id: u64) {
-        let _ = hint_store.delete_hint(target, collection, id);
-    }
-
-    pub fn delete_collection_hint(&self, hint_store: &HintStore, target: &str, collection: &str) {
-        let _ = hint_store.delete_collection_hint(target, collection);
+    pub fn delete_hint_by_key(&self, key: &[u8]) -> Result<(), RekhaError> {
+        self.store.delete_hint(key)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rekha_storage::RocksVectorStore;
+    use rocksdb::DB;
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
-    fn setup() -> (HintedHandoff, HintStore) {
-        let hh = HintedHandoff::new(true, 10800);
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = RocksVectorStore::open(dir.path()).unwrap();
-        let hint_store = HintStore::new(store.db().clone());
-        (hh, hint_store)
+    fn setup() -> (TempDir, HintedHandoff) {
+        let dir = TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = DB::open_cf_descriptors(
+            &opts,
+            dir.path(),
+            vec![rocksdb::ColumnFamilyDescriptor::new(
+                "hints",
+                rocksdb::Options::default(),
+            )],
+        )
+        .unwrap();
+        let hint_store = HintStore::new(Arc::new(db));
+        let hh = HintedHandoff::new(hint_store, true, 3600);
+        (dir, hh)
     }
 
     #[test]
-    fn test_store_and_replay() {
-        let (hh, hints) = setup();
-        let now = rekha_core::now_micros();
-        hh.store_hint(&hints, "node2", "col1", 1, &[1.0, 2.0], None, now);
-        let replayed = hh.replay_hints(&hints, "node2").unwrap();
-        assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].id, 1);
+    fn test_store_and_drain() {
+        let (_dir, hh) = setup();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        hh.store_hint("node1", "col1", 1, b"data1", now).unwrap();
+        hh.store_hint("node1", "col1", 2, b"data2", now).unwrap();
+        hh.store_hint("node2", "col1", 3, b"data3", now).unwrap();
+
+        let hints = hh.drain_hints("node1").unwrap();
+        assert_eq!(hints.len(), 2);
+
+        hh.delete_hint("node1", "col1", 1).unwrap();
+        let hints = hh.drain_hints("node1").unwrap();
+        assert_eq!(hints.len(), 1);
     }
 
     #[test]
-    fn test_expired_hint_dropped() {
-        let (hh, hints) = setup();
-        // Timestamp of 1 microsecond since epoch = unix epoch, definitely expired
-        hh.store_hint(&hints, "node2", "col1", 1, &[1.0], None, 1);
-        let replayed = hh.replay_hints(&hints, "node2").unwrap();
-        assert!(replayed.is_empty());
-    }
-
-    #[test]
-    fn test_disabled_noop() {
-        let hh = HintedHandoff::new(false, 10800);
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = RocksVectorStore::open(dir.path()).unwrap();
-        let hints = HintStore::new(store.db().clone());
-        hh.store_hint(&hints, "node2", "col1", 1, &[1.0], None, 1_000_000);
-        assert!(hh.replay_hints(&hints, "node2").unwrap().is_empty());
+    fn test_disabled() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = DB::open_cf_descriptors(
+            &opts,
+            dir.path(),
+            vec![rocksdb::ColumnFamilyDescriptor::new(
+                "hints",
+                rocksdb::Options::default(),
+            )],
+        )
+        .unwrap();
+        let hint_store = HintStore::new(Arc::new(db));
+        let hh = HintedHandoff::new(hint_store, false, 3600);
+        hh.store_hint("node1", "col1", 1, b"data", 1000).unwrap();
+        let hints = hh.drain_hints("node1").unwrap();
+        assert_eq!(hints.len(), 0);
     }
 }

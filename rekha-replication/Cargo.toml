@@ -15,3 +15,4 @@ rekha-storage = { path = "../rekha-storage" }
 
 [dev-dependencies]
 tempfile = "3"
+rocksdb = "0.22"

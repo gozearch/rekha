@@ -29,6 +29,41 @@ service Rekha {
     rpc TransferShard(TransferShardRequest) returns (stream TransferShardChunk);
 
     rpc RepairCollection(RepairCollectionRequest) returns (stream RepairProgress);
+
+    rpc FindSuccessor(FindSuccessorRequest) returns (FindSuccessorResponse);
+    rpc GetPredecessor(GetPredecessorRequest) returns (GetPredecessorResponse);
+    rpc NotifyChord(NotifyChordRequest) returns (NotifyChordResponse);
+    rpc GetSuccessorList(GetSuccessorListRequest) returns (GetSuccessorListResponse);
+    rpc Import(stream ImportChunk) returns (ImportResponse);
+    rpc Export(ExportRequest) returns (stream ExportChunk);
+}
+
+message ImportChunk {
+    repeated InsertRequest requests = 1;
+}
+
+message ImportResponse {
+    uint64 inserted_count = 1;
+    repeated string errors = 2;
+}
+
+message ExportRequest {
+    string collection_name = 1;
+    uint64 offset = 2;
+    uint64 limit = 3;
+    bool include_vectors = 4;
+    bool include_payloads = 5;
+}
+
+message ExportChunk {
+    repeated ExportedVector vectors = 1;
+}
+
+message ExportedVector {
+    uint64 id = 1;
+    repeated float vector = 2;
+    optional Payload payload = 3;
+    int64 timestamp = 4;
 }
 
 message Vector {
@@ -57,6 +92,7 @@ message InsertRequest {
     bool is_replication = 5;
     uint64 timestamp = 6;
     ConsistencyLevel consistency = 7;
+    string origin_node_id = 8;
 }
 
 message InsertResponse {
@@ -76,6 +112,7 @@ message DeleteRequest {
     uint64 timestamp = 3;
     ConsistencyLevel consistency = 4;
     bool is_replication = 5;
+    string origin_node_id = 6;
 }
 
 message DeleteResponse {
@@ -220,6 +257,7 @@ message CreateCollectionRequest {
     bool is_replication = 3;
     uint64 timestamp = 4;
     ConsistencyLevel consistency = 5;
+    string origin_node_id = 6;
 }
 
 message CreateCollectionResponse {
@@ -232,6 +270,7 @@ message DropCollectionRequest {
     bool is_replication = 2;
     uint64 timestamp = 3;
     ConsistencyLevel consistency = 4;
+    string origin_node_id = 5;
 }
 
 message DropCollectionResponse {
@@ -261,4 +300,32 @@ message RepairProgress {
     uint64 repaired = 1;
     uint64 total = 2;
     string current_node = 3;
+}
+
+message FindSuccessorRequest {
+    bytes id = 1;
+}
+
+message FindSuccessorResponse {
+    NodeInfo successor = 1;
+}
+
+message GetPredecessorRequest {}
+
+message GetPredecessorResponse {
+    optional NodeInfo predecessor = 1;
+}
+
+message NotifyChordRequest {
+    NodeInfo node = 1;
+}
+
+message NotifyChordResponse {
+    bool success = 1;
+}
+
+message GetSuccessorListRequest {}
+
+message GetSuccessorListResponse {
+    repeated NodeInfo successors = 1;
 }

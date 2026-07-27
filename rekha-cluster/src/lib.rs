@@ -1,7 +1,7 @@
+pub mod chord;
 pub mod membership;
-pub mod peer_state;
-pub mod ring;
 
+mod ring;
+
+pub use chord::{ChordId, ChordNode, FingerEntry, between, hash_to_chord_id};
 pub use membership::Membership;
-pub use peer_state::PeerState;
-pub use ring::ConsistentHashRing;

@@ -3,46 +3,63 @@ use rekha_core::ConsistencyLevel;
 pub struct ConsistencyGate;
 
 impl ConsistencyGate {
-    pub fn required(consistency: ConsistencyLevel, rf: usize) -> usize {
-        match consistency {
+    pub fn required_acks(rf: usize, level: ConsistencyLevel) -> usize {
+        match level {
             ConsistencyLevel::One => 1,
-            ConsistencyLevel::Quorum => rf / 2 + 1,
+            ConsistencyLevel::Quorum => (rf / 2) + 1,
             ConsistencyLevel::All => rf,
         }
     }
 
-    pub fn met(acks: usize, required: usize) -> bool {
-        acks >= required
+    pub fn is_quorum_satisfied(acks: usize, rf: usize, level: ConsistencyLevel) -> bool {
+        acks >= Self::required_acks(rf, level)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rekha_core::ConsistencyLevel;
 
     #[test]
-    fn test_required_one() {
-        assert_eq!(ConsistencyGate::required(ConsistencyLevel::One, 3), 1);
+    fn test_required_acks() {
+        assert_eq!(ConsistencyGate::required_acks(3, ConsistencyLevel::One), 1);
+        assert_eq!(
+            ConsistencyGate::required_acks(3, ConsistencyLevel::Quorum),
+            2
+        );
+        assert_eq!(ConsistencyGate::required_acks(3, ConsistencyLevel::All), 3);
+        assert_eq!(
+            ConsistencyGate::required_acks(5, ConsistencyLevel::Quorum),
+            3
+        );
     }
 
     #[test]
-    fn test_required_quorum() {
-        assert_eq!(ConsistencyGate::required(ConsistencyLevel::Quorum, 1), 1);
-        assert_eq!(ConsistencyGate::required(ConsistencyLevel::Quorum, 2), 2);
-        assert_eq!(ConsistencyGate::required(ConsistencyLevel::Quorum, 3), 2);
-        assert_eq!(ConsistencyGate::required(ConsistencyLevel::Quorum, 5), 3);
-    }
-
-    #[test]
-    fn test_required_all() {
-        assert_eq!(ConsistencyGate::required(ConsistencyLevel::All, 5), 5);
-    }
-
-    #[test]
-    fn test_met() {
-        assert!(ConsistencyGate::met(2, 2));
-        assert!(ConsistencyGate::met(3, 2));
-        assert!(!ConsistencyGate::met(1, 2));
+    fn test_quorum_satisfied() {
+        assert!(ConsistencyGate::is_quorum_satisfied(
+            2,
+            3,
+            ConsistencyLevel::Quorum
+        ));
+        assert!(!ConsistencyGate::is_quorum_satisfied(
+            1,
+            3,
+            ConsistencyLevel::Quorum
+        ));
+        assert!(ConsistencyGate::is_quorum_satisfied(
+            1,
+            3,
+            ConsistencyLevel::One
+        ));
+        assert!(ConsistencyGate::is_quorum_satisfied(
+            3,
+            3,
+            ConsistencyLevel::All
+        ));
+        assert!(!ConsistencyGate::is_quorum_satisfied(
+            2,
+            3,
+            ConsistencyLevel::All
+        ));
     }
 }

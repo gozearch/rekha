@@ -1,738 +1,663 @@
-use crate::hint_store::{HintStore, CF_HINTS};
-use rekha_core::{RekhaError, StorageError, VectorRecord, VectorStoreBackend, now_micros};
-use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded, Options,
-};
-use std::path::Path;
+use std::io::Cursor;
 use std::sync::Arc;
+
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
+use rekha_core::{IvfConfig, RekhaError, VectorRecord};
+use rocksdb::{IteratorMode, DB};
+
+use crate::hint_store::HintStore;
 
 const CF_VECTORS: &str = "vectors";
 const CF_PAYLOADS: &str = "payloads";
 const CF_METADATA: &str = "metadata";
+const CF_INVERTED_LISTS: &str = "inverted_lists";
+const CF_HINTS: &str = "hints";
 
-#[derive(Clone)]
-pub struct RocksVectorStore {
-    db: Arc<DBWithThreadMode<MultiThreaded>>,
-    namespace: Option<String>,
-    max_payload_size: usize,
+const ALL_CFS: &[&str] = &[
+    CF_VECTORS,
+    CF_PAYLOADS,
+    CF_METADATA,
+    CF_INVERTED_LISTS,
+    CF_HINTS,
+];
+
+pub struct RekhaStore {
+    db: Arc<DB>,
 }
 
-impl RocksVectorStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, RekhaError> {
-        let path = path.as_ref();
-        let mut opts = Options::default();
+impl RekhaStore {
+    pub fn open(path: &str) -> Result<Self, RekhaError> {
+        let existing = DB::list_cf(&rocksdb::Options::default(), path).unwrap_or_default();
+
+        let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let required: Vec<&str> = vec![CF_VECTORS, CF_PAYLOADS, CF_METADATA, CF_HINTS];
-        let existing_list = DBWithThreadMode::<MultiThreaded>::list_cf(&opts, path)
-            .unwrap_or_default();
+        let cfs: Vec<rocksdb::ColumnFamilyDescriptor> = ALL_CFS
+            .iter()
+            .map(|name| rocksdb::ColumnFamilyDescriptor::new(*name, rocksdb::Options::default()))
+            .collect();
 
-        let mut all_cf_names = required.clone();
-        if !existing_list.is_empty() {
-            for name in &existing_list {
-                if !all_cf_names.contains(&name.as_str()) {
-                    all_cf_names.push(name.as_str());
+        let mut db = DB::open_cf_descriptors(&opts, path, cfs)
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+
+        if !existing.is_empty() {
+            for name in ALL_CFS {
+                if !existing.contains(&name.to_string()) {
+                    db.create_cf(name, &rocksdb::Options::default())
+                        .map_err(|e| RekhaError::Storage(e.to_string()))?;
                 }
             }
         }
 
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> =
-            all_cf_names.iter().map(|name| {
-                let mut cf_opts = Options::default();
-                cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                ColumnFamilyDescriptor::new(*name, cf_opts)
-            }).collect();
-
-        let db =
-            DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&opts, path, cf_descriptors)
-                .map_err(|e| StorageError::DbOpen {
-                    path: path.display().to_string(),
-                    msg: e.to_string(),
-                })?;
-
-        Ok(Self {
-            db: Arc::new(db),
-            namespace: None,
-            max_payload_size: 1024 * 1024,
-        })
+        Ok(RekhaStore { db: Arc::new(db) })
     }
 
-    pub fn from_db(db: Arc<DBWithThreadMode<MultiThreaded>>, namespace: Option<String>) -> Self {
-        Self {
-            db,
-            namespace,
-            max_payload_size: 1024 * 1024,
-        }
-    }
-
-    pub fn with_namespace(mut self, namespace: String) -> Self {
-        self.namespace = Some(namespace);
-        self
-    }
-
-    pub fn get_namespace(&self) -> Option<&str> {
-        self.namespace.as_deref()
-    }
-
-    pub fn with_max_payload_size(mut self, max: usize) -> Self {
-        self.max_payload_size = max;
-        self
-    }
-
-    pub fn db(&self) -> &Arc<DBWithThreadMode<MultiThreaded>> {
+    pub fn db(&self) -> &Arc<DB> {
         &self.db
-    }
-
-    pub(crate) fn encode_key(&self, id: u64) -> Vec<u8> {
-        let mut key = Vec::with_capacity(8);
-        if let Some(ref ns) = self.namespace {
-            key.extend_from_slice(ns.as_bytes());
-            key.push(0);
-        }
-        key.extend_from_slice(&id.to_be_bytes());
-        key
-    }
-
-    fn decode_id(&self, key: &[u8]) -> Option<u64> {
-        if let Some(ref ns) = self.namespace {
-            let prefix_len = ns.len() + 1;
-            if key.len() < prefix_len + 8 || key[..prefix_len - 1] != ns.as_bytes()[..]
-                || key[prefix_len - 1] != 0
-            {
-                return None;
-            }
-            let id_bytes = &key[key.len() - 8..];
-            Some(u64::from_be_bytes(id_bytes.try_into().ok()?))
-        } else if key.len() >= 8 {
-            let id_bytes = &key[key.len() - 8..];
-            Some(u64::from_be_bytes(id_bytes.try_into().ok()?))
-        } else {
-            None
-        }
-    }
-
-    fn namespace_prefix(&self) -> Option<Vec<u8>> {
-        self.namespace.as_ref().map(|ns| {
-            let mut prefix = ns.as_bytes().to_vec();
-            prefix.push(0);
-            prefix
-        })
-    }
-
-    fn decode_vector_value(value: &[u8]) -> (u64, u8, &[u8]) {
-        if value.len() < 9 {
-            return (0, 0xFF, value);
-        }
-        let timestamp = u64::from_le_bytes(value[0..8].try_into().unwrap());
-        let flag = value[8];
-        (timestamp, flag, &value[9..])
-    }
-
-    pub(crate) fn encode_vector_value(timestamp: u64, flag: u8, data: &[f32]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(9 + data.len() * 4);
-        buf.extend_from_slice(&timestamp.to_le_bytes());
-        buf.push(flag);
-        for &v in data {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        buf
     }
 
     pub fn hint_store(&self) -> HintStore {
         HintStore::new(self.db.clone())
     }
 
-    pub fn scan_tombstones(&self) -> Result<Vec<(u64, u64)>, RekhaError> {
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_VECTORS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
+    fn cf(&self, name: &str) -> Result<&rocksdb::ColumnFamily, RekhaError> {
+        self.db
+            .cf_handle(name)
+            .ok_or_else(|| RekhaError::Internal(format!("column family {} not found", name)))
+    }
 
+    fn vector_key(collection: &str, id: u64) -> Vec<u8> {
+        let mut key = Vec::new();
+        key.extend_from_slice(collection.as_bytes());
+        key.push(0);
+        key.write_u64::<BigEndian>(id).unwrap();
+        key
+    }
+
+    pub fn put_vector(
+        &self,
+        collection: &str,
+        id: u64,
+        vector: &[f32],
+        timestamp: i64,
+        is_tombstone: bool,
+    ) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_VECTORS)?;
+        let key = Self::vector_key(collection, id);
+        let mut value = Vec::new();
+        value.write_i64::<LittleEndian>(timestamp).unwrap();
+        value.push(if is_tombstone { 1u8 } else { 0u8 });
+        for v in vector {
+            value.write_f32::<LittleEndian>(*v).unwrap();
+        }
+        self.db
+            .put_cf(cf, key, value)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn get_vector(
+        &self,
+        collection: &str,
+        id: u64,
+    ) -> Result<Option<VectorRecord>, RekhaError> {
+        let cf = self.cf(CF_VECTORS)?;
+        let key = Self::vector_key(collection, id);
+        let opt = self
+            .db
+            .get_cf(cf, key)
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        match opt {
+            Some(data) => {
+                let mut cursor = Cursor::new(&data);
+                let timestamp = cursor
+                    .read_i64::<LittleEndian>()
+                    .map_err(|e| RekhaError::Storage(e.to_string()))?;
+                let flags = cursor
+                    .read_u8()
+                    .map_err(|e| RekhaError::Storage(e.to_string()))?;
+                let is_tombstone = flags != 0;
+                let remaining = data.len() - cursor.position() as usize;
+                let elem_count = remaining / 4;
+                let mut vec_data = Vec::with_capacity(elem_count);
+                for _ in 0..elem_count {
+                    let v = cursor
+                        .read_f32::<LittleEndian>()
+                        .map_err(|e| RekhaError::Storage(e.to_string()))?;
+                    vec_data.push(v);
+                }
+                Ok(Some(VectorRecord {
+                    id,
+                    data: vec_data,
+                    timestamp,
+                    is_tombstone,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_vector(&self, collection: &str, id: u64) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_VECTORS)?;
+        let key = Self::vector_key(collection, id);
+        self.db
+            .delete_cf(cf, key)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn put_payload(&self, collection: &str, id: u64, payload: &[u8]) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_PAYLOADS)?;
+        let key = Self::vector_key(collection, id);
+        self.db
+            .put_cf(cf, key, payload)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn get_payload(&self, collection: &str, id: u64) -> Result<Option<Vec<u8>>, RekhaError> {
+        let cf = self.cf(CF_PAYLOADS)?;
+        let key = Self::vector_key(collection, id);
+        let opt = self
+            .db
+            .get_cf(cf, key)
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        Ok(opt.map(|v| v.to_vec()))
+    }
+
+    pub fn delete_payload(&self, collection: &str, id: u64) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_PAYLOADS)?;
+        let key = Self::vector_key(collection, id);
+        self.db
+            .delete_cf(cf, key)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    fn inverted_list_key(collection: &str, centroid_id: u32, id: u64) -> Vec<u8> {
+        let mut key = Vec::new();
+        key.extend_from_slice(collection.as_bytes());
+        key.push(0);
+        key.write_u32::<BigEndian>(centroid_id).unwrap();
+        key.write_u64::<BigEndian>(id).unwrap();
+        key
+    }
+
+    fn inverted_list_prefix(collection: &str, centroid_id: u32) -> Vec<u8> {
+        let mut key = Vec::new();
+        key.extend_from_slice(collection.as_bytes());
+        key.push(0);
+        key.write_u32::<BigEndian>(centroid_id).unwrap();
+        key
+    }
+
+    pub fn inverted_list_append(
+        &self,
+        collection: &str,
+        centroid_id: u32,
+        id: u64,
+        pq_code: &[u8],
+    ) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_INVERTED_LISTS)?;
+        let key = Self::inverted_list_key(collection, centroid_id, id);
+        self.db
+            .put_cf(cf, key, pq_code)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn inverted_list_scan(
+        &self,
+        collection: &str,
+        centroid_id: u32,
+    ) -> Result<Vec<(u64, Vec<u8>)>, RekhaError> {
+        let cf = self.cf(CF_INVERTED_LISTS)?;
+        let prefix = Self::inverted_list_prefix(collection, centroid_id);
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, rocksdb::Direction::Forward));
         let mut results = Vec::new();
-        let prefix = self.namespace_prefix();
-        let iter_mode = match &prefix {
-            Some(p) => IteratorMode::From(p, rocksdb::Direction::Forward),
-            None => IteratorMode::Start,
-        };
-        let prefix_len = prefix.as_ref().map(|p| p.len());
-
-        let iter = self.db.iterator_cf(&cf, iter_mode);
         for item in iter {
-            let (key, value) = item.map_err(|e| RekhaError::Internal {
-                detail: format!("db iteration error: {e}"),
-            })?;
-            if let Some(plen) = prefix_len {
-                if key.len() < plen || &key[..plen] != prefix.as_ref().unwrap() {
-                    break;
-                }
+            let (key, value) = item.map_err(|e| RekhaError::Storage(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
             }
-            let (ts, flag, _) = Self::decode_vector_value(&value);
-            if flag == 0x01 {
-                if let Some(id) = self.decode_id(&key) {
-                    results.push((id, ts));
-                }
-            }
+            let id = (&key[key.len() - 8..])
+                .read_u64::<BigEndian>()
+                .map_err(|e| RekhaError::Storage(e.to_string()))?;
+            results.push((id, value.to_vec()));
         }
         Ok(results)
     }
 
-    pub fn physically_delete_vectors(&self, ids: &[u64]) -> Result<(), RekhaError> {
-        let cf_v = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_VECTORS.into(),
-                msg: "handle not found".into(),
+    pub fn inverted_list_remove(
+        &self,
+        collection: &str,
+        centroid_id: u32,
+        id: u64,
+    ) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_INVERTED_LISTS)?;
+        let key = Self::inverted_list_key(collection, centroid_id, id);
+        self.db
+            .delete_cf(cf, key)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn store_assignment(
+        &self,
+        collection: &str,
+        id: u64,
+        centroid_id: u32,
+    ) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:assign:{}", collection, id);
+        let data = centroid_id.to_le_bytes();
+        self.db
+            .put_cf(cf, key.as_bytes(), data)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn load_assignment(
+        &self,
+        collection: &str,
+        id: u64,
+    ) -> Result<Option<u32>, RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:assign:{}", collection, id);
+        let opt = self
+            .db
+            .get_cf(cf, key.as_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        match opt {
+            Some(data) if data.len() >= 4 => {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&data[..4]);
+                Ok(Some(u32::from_le_bytes(buf)))
             }
-        })?;
-        let cf_p = self.db.cf_handle(CF_PAYLOADS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_PAYLOADS.into(),
-                msg: "handle not found".into(),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn delete_assignment(
+        &self,
+        collection: &str,
+        id: u64,
+    ) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:assign:{}", collection, id);
+        self.db
+            .delete_cf(cf, key.as_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn store_centroids(
+        &self,
+        collection: &str,
+        centroids: &[Vec<f32>],
+    ) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:centroids", collection);
+        let data =
+            bincode::serialize(centroids).map_err(|e| RekhaError::Serialization(e.to_string()))?;
+        self.db
+            .put_cf(cf, key.as_bytes(), data)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn load_centroids(&self, collection: &str) -> Result<Vec<Vec<f32>>, RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:centroids", collection);
+        let opt = self
+            .db
+            .get_cf(cf, key.as_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        match opt {
+            Some(data) => {
+                bincode::deserialize(&data).map_err(|e| RekhaError::Serialization(e.to_string()))
             }
-        })?;
-        for &id in ids {
-            let key = self.encode_key(id);
-            self.db.delete_cf(&cf_v, &key).map_err(|e| RekhaError::Internal {
-                detail: format!("physical vector delete failed: {e}"),
-            })?;
-            self.db.delete_cf(&cf_p, &key).map_err(|e| RekhaError::Internal {
-                detail: format!("physical payload delete failed: {e}"),
-            })?;
+            None => Err(RekhaError::NotFound("centroids not found".into())),
+        }
+    }
+
+    pub fn store_pq_codebook(
+        &self,
+        collection: &str,
+        m: usize,
+        k: usize,
+        sub_dim: usize,
+        codebooks: &[Vec<Vec<f32>>],
+    ) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:pq_codebook", collection);
+        let data = bincode::serialize(&(m, k, sub_dim, codebooks))
+            .map_err(|e| RekhaError::Serialization(e.to_string()))?;
+        self.db
+            .put_cf(cf, key.as_bytes(), data)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn load_pq_codebook(
+        &self,
+        collection: &str,
+    ) -> Result<(usize, usize, usize, Vec<Vec<Vec<f32>>>), RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:pq_codebook", collection);
+        let opt = self
+            .db
+            .get_cf(cf, key.as_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        match opt {
+            Some(data) => {
+                bincode::deserialize(&data).map_err(|e| RekhaError::Serialization(e.to_string()))
+            }
+            None => Err(RekhaError::NotFound("pq codebook not found".into())),
+        }
+    }
+
+    pub fn store_collection_config(
+        &self,
+        collection: &str,
+        config: &IvfConfig,
+    ) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("collection:{}", collection);
+        let data =
+            serde_json::to_vec(config).map_err(|e| RekhaError::Serialization(e.to_string()))?;
+        self.db
+            .put_cf(cf, key.as_bytes(), data)
+            .map_err(|e| RekhaError::Storage(e.to_string()))
+    }
+
+    pub fn load_collection_config(&self, collection: &str) -> Result<IvfConfig, RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("collection:{}", collection);
+        let opt = self
+            .db
+            .get_cf(cf, key.as_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        match opt {
+            Some(data) => {
+                serde_json::from_slice(&data).map_err(|e| RekhaError::Serialization(e.to_string()))
+            }
+            None => Err(RekhaError::NotFound(format!(
+                "collection {} not found",
+                collection
+            ))),
+        }
+    }
+
+    pub fn list_collections(&self) -> Result<Vec<String>, RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let prefix = b"collection:";
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let mut collections = Vec::new();
+        for item in iter {
+            let (key, _) = item.map_err(|e| RekhaError::Storage(e.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if let Ok(name) = String::from_utf8(key[prefix.len()..].to_vec()) {
+                collections.push(name);
+            }
+        }
+        Ok(collections)
+    }
+
+    pub fn delete_collection_metadata(&self, collection: &str) -> Result<(), RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let prefix = format!("collection:{}", collection);
+        let keys_to_delete: Vec<Vec<u8>> = self
+            .db
+            .iterator_cf(cf, rocksdb::IteratorMode::From(
+                prefix.as_bytes(),
+                rocksdb::Direction::Forward,
+            ))
+            .filter_map(|item| {
+                let (key, _) = item.ok()?;
+                if key.starts_with(prefix.as_bytes()) {
+                    Some(key.to_vec())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in keys_to_delete {
+            self.db.delete_cf(cf, key).map_err(|e| RekhaError::Storage(e.to_string()))?;
         }
         Ok(())
     }
-}
 
-impl Drop for RocksVectorStore {
-    fn drop(&mut self) {
-        let _ = self.db.flush_wal(true);
+    pub fn increment_vector_count(&self, collection: &str) -> Result<u64, RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:vector_count", collection);
+        let current = self
+            .db
+            .get_cf(cf, key.as_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        let count = match current {
+            Some(data) => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[..8.min(data.len())]);
+                u64::from_le_bytes(buf) + 1
+            }
+            None => 1,
+        };
+        self.db
+            .put_cf(cf, key.as_bytes(), count.to_le_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        Ok(count)
     }
-}
 
-impl RocksVectorStore {
-    pub fn delete_all_in_namespace(&self) -> Result<u64, RekhaError> {
-        let prefix = self
-            .namespace_prefix()
-            .ok_or_else(|| RekhaError::Internal {
-                detail: "delete_all_in_namespace requires a namespace".into(),
-            })?;
+    pub fn decrement_vector_count(&self, collection: &str) -> Result<u64, RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:vector_count", collection);
+        let current = self
+            .db
+            .get_cf(cf, key.as_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        let count = match current {
+            Some(data) => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[..8.min(data.len())]);
+                let c = u64::from_le_bytes(buf);
+                if c > 0 { c - 1 } else { 0 }
+            }
+            None => 0,
+        };
+        self.db
+            .put_cf(cf, key.as_bytes(), count.to_le_bytes())
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        Ok(count)
+    }
+
+    pub fn get_vector_count(&self, collection: &str) -> Result<u64, RekhaError> {
+        let cf = self.cf(CF_METADATA)?;
+        let key = format!("{}:vector_count", collection);
+        match self.db.get_cf(cf, key.as_bytes()) {
+            Ok(Some(data)) if data.len() >= 8 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[..8]);
+                Ok(u64::from_le_bytes(buf))
+            }
+            Ok(_) => Ok(0),
+            Err(e) => Err(RekhaError::Storage(e.to_string())),
+        }
+    }
+
+    pub fn count_vectors(&self, collection: &str) -> Result<u64, RekhaError> {
+        let cf = self.cf(CF_VECTORS)?;
+        let prefix = format!("{}\0", collection);
+        let iter = self.db.iterator_cf(
+            cf,
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
         let mut count = 0u64;
-        for cf_name in &[CF_VECTORS, CF_PAYLOADS] {
-            let cf = self
-                .db
-                .cf_handle(cf_name)
-                .ok_or_else(|| StorageError::ColumnFamily {
-                    name: cf_name.to_string(),
-                    msg: "handle not found".into(),
-                })?;
-            let mut batch = rocksdb::WriteBatch::default();
-            let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
-            for result in iter {
-                let (key, _) = result.map_err(|e| RekhaError::Internal {
-                    detail: format!("db iteration error: {e}"),
-                })?;
-                if key.len() < prefix.len() || key[..prefix.len()] != prefix[..] {
-                    break;
-                }
-                batch.delete_cf(&cf, &key);
+        for item in iter {
+            let (key, value) = item.map_err(|e| RekhaError::Storage(e.to_string()))?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if value.len() >= 9 && value[8] == 0 {
                 count += 1;
             }
-            self.db.write(batch).map_err(|e| RekhaError::Internal {
-                detail: format!("failed to delete namespace keys: {e}"),
-            })?;
         }
         Ok(count)
     }
 
-    pub fn get_storage_estimate(&self) -> Result<u64, RekhaError> {
-        self.iter_ids().map(|ids| ids.len() as u64)
-    }
-
-    pub fn put_metadata(&self, key: &str, value: &[u8]) -> Result<(), RekhaError> {
-        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_METADATA.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        self.db.put_cf(&cf, key, value).map_err(|e| {
-            RekhaError::Internal {
-                detail: format!("metadata write failed: {e}"),
-            }
-        })
-    }
-
-    pub fn get_metadata(&self, key: &str) -> Result<Option<Vec<u8>>, RekhaError> {
-        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_METADATA.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        self.db.get_cf(&cf, key).map_err(|e| RekhaError::Internal {
-            detail: format!("metadata read failed: {e}"),
-        })
-    }
-
-    pub fn delete_metadata(&self, key: &str) -> Result<(), RekhaError> {
-        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_METADATA.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        self.db.delete_cf(&cf, key).map_err(|e| RekhaError::Internal {
-            detail: format!("metadata delete failed: {e}"),
-        })
-    }
-
-    pub fn iter_metadata_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, RekhaError> {
-        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_METADATA.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        let mut results = Vec::new();
-        let iter = self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
-        for item in iter {
-            let (key, value) = item.map_err(|e| RekhaError::Internal {
-                detail: format!("metadata iteration failed: {e}"),
-            })?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            let key_str = String::from_utf8(key.to_vec()).unwrap_or_default();
-            results.push((key_str, value.to_vec()));
-        }
-        Ok(results)
-    }
-}
-
-impl VectorStoreBackend for RocksVectorStore {
-    fn put_vector(&self, id: u64, data: &[f32], timestamp: u64) -> Result<(), RekhaError> {
-        let key = self.encode_key(id);
-        let value = Self::encode_vector_value(timestamp, 0x00, data);
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_VECTORS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        self.db.put_cf(&cf, key, value).map_err(|e| {
-            StorageError::Write {
-                msg: e.to_string(),
-            }
-            .into()
-        })
-    }
-
-    fn get_vector(&self, id: u64) -> Result<Option<Vec<f32>>, RekhaError> {
-        let key = self.encode_key(id);
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_VECTORS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        match self.db.get_cf(&cf, key) {
-            Ok(Some(bytes)) => {
-                let (_ts, flag, rest) = Self::decode_vector_value(&bytes);
-                if flag == 0x01 || flag == 0xFF {
-                    Ok(None)
-                } else {
-                    let v: Vec<f32> = rest
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                        .collect();
-                    Ok(Some(v))
-                }
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(StorageError::Read {
-                key: id.to_be_bytes().to_vec(),
-                msg: e.to_string(),
-            }
-            .into()),
-        }
-    }
-
-    fn get_vector_record(&self, id: u64) -> Result<Option<VectorRecord>, RekhaError> {
-        let key = self.encode_key(id);
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_VECTORS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        match self.db.get_cf(&cf, key) {
-            Ok(Some(bytes)) => {
-                let (timestamp, flag, rest) = Self::decode_vector_value(&bytes);
-                if flag == 0x01 {
-                    Ok(Some(VectorRecord {
-                        id,
-                        timestamp,
-                        data: None,
-                        is_tombstone: true,
-                    }))
-                } else if flag == 0x00 {
-                    let data: Vec<f32> = rest
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                        .collect();
-                    Ok(Some(VectorRecord {
-                        id,
-                        timestamp,
-                        data: Some(data),
-                        is_tombstone: false,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(StorageError::Read {
-                key: id.to_be_bytes().to_vec(),
-                msg: e.to_string(),
-            }
-            .into()),
-        }
-    }
-
-    fn put_tombstone(&self, id: u64, timestamp: u64) -> Result<(), RekhaError> {
-        let key = self.encode_key(id);
-        let value = Self::encode_vector_value(timestamp, 0x01, &[]);
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_VECTORS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        self.db.put_cf(&cf, key, value).map_err(|e| {
-            StorageError::Write {
-                msg: e.to_string(),
-            }
-            .into()
-        })
-    }
-
-    fn put_payload(&self, id: u64, payload: &[u8]) -> Result<(), RekhaError> {
-        if payload.len() > self.max_payload_size {
-            return Err(StorageError::PayloadTooLarge {
-                size: payload.len(),
-                max: self.max_payload_size,
-            }
-            .into());
-        }
-        let key = self.encode_key(id);
-        let cf = self.db.cf_handle(CF_PAYLOADS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_PAYLOADS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        self.db.put_cf(&cf, key, payload).map_err(|e| {
-            StorageError::Write {
-                msg: e.to_string(),
-            }
-            .into()
-        })
-    }
-
-    fn get_payload(&self, id: u64) -> Result<Option<Vec<u8>>, RekhaError> {
-        let key = self.encode_key(id);
-        let cf = self.db.cf_handle(CF_PAYLOADS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_PAYLOADS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        self.db.get_cf(&cf, key).map_err(|e| StorageError::Read {
-            key: id.to_be_bytes().to_vec(),
-            msg: e.to_string(),
-        }
-        .into())
-    }
-
-    fn delete(&self, ids: &[u64]) -> Result<u64, RekhaError> {
-        let timestamp = now_micros();
-        let cf_p = self.db.cf_handle(CF_PAYLOADS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_PAYLOADS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        for &id in ids {
-            self.put_tombstone(id, timestamp)?;
-            let key = self.encode_key(id);
-            self.db.delete_cf(&cf_p, &key).map_err(|e| {
-                RekhaError::Internal {
-                    detail: format!("payload delete failed: {e}"),
-                }
-            })?;
-        }
-        Ok(ids.len() as u64)
-    }
-
-    fn iter_ids(&self) -> Result<Vec<u64>, RekhaError> {
-        let cf = self.db.cf_handle(CF_VECTORS).ok_or_else(|| {
-            StorageError::ColumnFamily {
-                name: CF_VECTORS.into(),
-                msg: "handle not found".into(),
-            }
-        })?;
-        let mut ids = Vec::new();
-
-        let prefix = self.namespace_prefix();
-        let iter_mode = match &prefix {
-            Some(p) => IteratorMode::From(p, rocksdb::Direction::Forward),
-            None => IteratorMode::Start,
-        };
-        let prefix_len = prefix.as_ref().map(|p| p.len());
-
-        let iter = self.db.iterator_cf(&cf, iter_mode);
-        for result in iter {
-            let (key, value) = result.map_err(|e| RekhaError::Internal {
-                detail: format!("db iteration error: {e}"),
-            })?;
-            if let Some(plen) = prefix_len {
-                if key.len() < plen || &key[..plen] != prefix.as_ref().unwrap() {
-                    break;
-                }
-            }
-            let (_ts, flag, _) = Self::decode_vector_value(&value);
-            if flag == 0x01 {
-                continue;
-            }
-            if let Some(id) = self.decode_id(&key) {
-                ids.push(id);
-            }
-        }
-
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+    pub fn flush(&self) -> Result<(), RekhaError> {
+        self.db
+            .flush()
+            .map_err(|e| RekhaError::Storage(e.to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use rekha_core::DistanceMetric;
+    use tempfile::TempDir;
 
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn setup_store(name: &str) -> RocksVectorStore {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("{}_{}", name, id));
-        let _ = std::fs::remove_dir_all(&dir);
-        RocksVectorStore::open(&dir).unwrap()
+    fn setup() -> (TempDir, RekhaStore) {
+        let dir = TempDir::new().unwrap();
+        let store = RekhaStore::open(dir.path().to_str().unwrap()).unwrap();
+        (dir, store)
     }
 
     #[test]
-    fn vector_roundtrip() {
-        let store = setup_store("rekha_test_store1");
-        let v = vec![1.0, 2.0, 3.0, 4.0];
-        store.put_vector(42, &v, 100).unwrap();
-        let retrieved = store.get_vector(42).unwrap().unwrap();
-        assert_eq!(v, retrieved);
+    fn test_open_and_store() {
+        let (_dir, store) = setup();
+        store
+            .put_vector("test", 1, &[0.1, 0.2, 0.3], 1000, false)
+            .unwrap();
+        let record = store.get_vector("test", 1).unwrap().unwrap();
+        assert_eq!(record.id, 1);
+        assert_eq!(record.data.len(), 3);
+        assert!(!record.is_tombstone);
+        assert_eq!(record.timestamp, 1000);
     }
 
     #[test]
-    fn payload_roundtrip() {
-        let store = setup_store("rekha_test_store2");
-        let payload = b"hello world".to_vec();
-        store.put_payload(42, &payload).unwrap();
-        let retrieved = store.get_payload(42).unwrap().unwrap();
-        assert_eq!(retrieved, payload);
+    fn test_vector_tombstone() {
+        let (_dir, store) = setup();
+        store
+            .put_vector("test", 1, &[0.1, 0.2], 1000, true)
+            .unwrap();
+        let record = store.get_vector("test", 1).unwrap().unwrap();
+        assert!(record.is_tombstone);
     }
 
     #[test]
-    fn delete_vector() {
-        let store = setup_store("rekha_test_delete");
-        store.put_vector(1, &[1.0, 2.0], 100).unwrap();
-        store.put_vector(2, &[3.0, 4.0], 100).unwrap();
-        let deleted = store.delete(&[1, 2]).unwrap();
-        assert_eq!(deleted, 2);
-        assert!(store.get_vector(1).unwrap().is_none());
-        assert!(store.get_vector(2).unwrap().is_none());
-    }
-
-    #[test]
-    fn get_nonexistent_vector() {
-        let store = setup_store("rekha_test_nonexist");
-        let result = store.get_vector(999).unwrap();
+    fn test_vector_not_found() {
+        let (_dir, store) = setup();
+        let result = store.get_vector("test", 999).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn iter_ids_empty() {
-        let store = setup_store("rekha_test_iter_empty");
-        let ids = store.iter_ids().unwrap();
-        assert!(ids.is_empty());
+    fn test_delete_vector() {
+        let (_dir, store) = setup();
+        store.put_vector("test", 1, &[0.1], 1000, false).unwrap();
+        store.delete_vector("test", 1).unwrap();
+        let result = store.get_vector("test", 1).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
-    fn iter_ids_after_inserts() {
-        let store = setup_store("rekha_test_iter_ids");
-        let store_ns = store.clone().with_namespace("col".into());
+    fn test_payload_crud() {
+        let (_dir, store) = setup();
+        store.put_payload("test", 1, b"payload-data").unwrap();
+        let payload = store.get_payload("test", 1).unwrap().unwrap();
+        assert_eq!(payload, b"payload-data");
 
-        store.put_vector(10, &[0.1], 100).unwrap();
-        store_ns.put_vector(20, &[0.2], 100).unwrap();
-        store_ns.put_vector(30, &[0.3], 100).unwrap();
-
-        let mut all = store.iter_ids().unwrap();
-        all.sort();
-        assert_eq!(all, vec![10, 20, 30]);
-
-        let mut ns_ids = store_ns.iter_ids().unwrap();
-        ns_ids.sort();
-        assert_eq!(ns_ids, vec![20, 30]);
+        store.delete_payload("test", 1).unwrap();
+        let payload = store.get_payload("test", 1).unwrap();
+        assert!(payload.is_none());
     }
 
     #[test]
-    fn metadata_roundtrip() {
-        let store = setup_store("rekha_test_meta");
-        store.put_metadata("my_key", b"my_value").unwrap();
-        let val = store.get_metadata("my_key").unwrap().unwrap();
-        assert_eq!(val, b"my_value");
+    fn test_inverted_list() {
+        let (_dir, store) = setup();
+        store
+            .inverted_list_append("test", 0, 1, b"\x01\x02")
+            .unwrap();
+        store
+            .inverted_list_append("test", 0, 2, b"\x03\x04")
+            .unwrap();
 
-        let missing = store.get_metadata("nonexistent").unwrap();
-        assert!(missing.is_none());
+        let entries = store.inverted_list_scan("test", 0).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        store.inverted_list_remove("test", 0, 1).unwrap();
+        let entries = store.inverted_list_scan("test", 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, 2);
     }
 
     #[test]
-    fn metadata_delete() {
-        let store = setup_store("rekha_test_meta_del");
-        store.put_metadata("del_key", b"data").unwrap();
-        assert!(store.get_metadata("del_key").unwrap().is_some());
-        store.delete_metadata("del_key").unwrap();
-        assert!(store.get_metadata("del_key").unwrap().is_none());
+    fn test_centroids() {
+        let (_dir, store) = setup();
+        let centroids = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        store.store_centroids("test", &centroids).unwrap();
+        let loaded = store.load_centroids("test").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!((loaded[0][0] - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn metadata_iter_prefix() {
-        let store = setup_store("rekha_test_meta_iter");
-
-        store.put_metadata("collection:a", b"config_a").unwrap();
-        store.put_metadata("collection:b", b"config_b").unwrap();
-        store.put_metadata("other", b"other_data").unwrap();
-
-        let collections = store.iter_metadata_prefix("collection:").unwrap();
-        assert_eq!(collections.len(), 2);
-        let keys: Vec<String> = collections.into_iter().map(|(k, _)| k).collect();
-        assert!(keys.contains(&"collection:a".to_string()));
-        assert!(keys.contains(&"collection:b".to_string()));
+    fn test_collection_config() {
+        let (_dir, store) = setup();
+        let config = IvfConfig {
+            dim: 128,
+            nlist: 1024,
+            nprobe: 32,
+            pq_m: 16,
+            pq_k: 256,
+            replication_factor: 3,
+            distance_metric: DistanceMetric::L2,
+        };
+        store.store_collection_config("test", &config).unwrap();
+        let loaded = store.load_collection_config("test").unwrap();
+        assert_eq!(loaded.dim, 128);
+        assert_eq!(loaded.nlist, 1024);
     }
 
     #[test]
-    fn metadata_overwrite() {
-        let store = setup_store("rekha_test_meta_ovw");
-        store.put_metadata("key", b"v1").unwrap();
-        store.put_metadata("key", b"v2").unwrap();
-        let val = store.get_metadata("key").unwrap().unwrap();
-        assert_eq!(val, b"v2");
+    fn test_list_collections() {
+        let (_dir, store) = setup();
+        let cfg = IvfConfig::default();
+        store.store_collection_config("a", &cfg).unwrap();
+        store.store_collection_config("b", &cfg).unwrap();
+        let names = store.list_collections().unwrap();
+        assert!(names.contains(&"a".to_string()));
+        assert!(names.contains(&"b".to_string()));
     }
 
     #[test]
-    fn test_tombstone_write_and_read() {
-        let store = setup_store("rekha_test_tombstone_rw");
-        store.put_vector(1, &[1.0, 2.0, 3.0], 100).unwrap();
-        store.put_tombstone(1, 200).unwrap();
-        assert!(store.get_vector(1).unwrap().is_none());
-        let rec = store.get_vector_record(1).unwrap().unwrap();
-        assert!(rec.is_tombstone);
-        assert!(rec.data.is_none());
-        assert_eq!(rec.timestamp, 200);
+    fn test_pq_codebook() {
+        let (_dir, store) = setup();
+        let codebooks = vec![vec![vec![0.1f32, 0.2f32], vec![0.3f32, 0.4f32]]];
+        store
+            .store_pq_codebook("test", 1, 2, 2, &codebooks)
+            .unwrap();
+        let (m, k, sub_dim, loaded) = store.load_pq_codebook("test").unwrap();
+        assert_eq!(m, 1);
+        assert_eq!(k, 2);
+        assert_eq!(sub_dim, 2);
+        assert_eq!(loaded.len(), 1);
     }
 
     #[test]
-    fn test_timestamped_vector() {
-        let store = setup_store("rekha_test_ts_vec");
-        store.put_vector(1, &[1.0, 2.0], 42).unwrap();
-        let rec = store.get_vector_record(1).unwrap().unwrap();
-        assert_eq!(rec.timestamp, 42);
-        assert!(!rec.is_tombstone);
-        assert_eq!(rec.data, Some(vec![1.0, 2.0]));
+    fn test_payload_not_found() {
+        let (_dir, store) = setup();
+        let result = store.get_payload("test", 999).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_timestamp_lww() {
-        let store = setup_store("rekha_test_ts_lww");
-        store.put_vector(1, &[1.0, 2.0], 100).unwrap();
-        store.put_vector(1, &[3.0, 4.0], 50).unwrap();
-        let rec = store.get_vector_record(1).unwrap().unwrap();
-        assert_eq!(rec.timestamp, 50);
-        assert_eq!(rec.data, Some(vec![3.0, 4.0]));
+    fn test_delete_collection_metadata() {
+        let (_dir, store) = setup();
+        let cfg = IvfConfig::default();
+        store.store_collection_config("test", &cfg).unwrap();
+        store.delete_collection_metadata("test").unwrap();
+        assert!(store.load_collection_config("test").is_err());
     }
-
-    #[test]
-    fn test_iter_ids_skips_tombstones() {
-        let store = setup_store("rekha_test_iter_skip_ts");
-        store.put_vector(1, &[1.0], 100).unwrap();
-        store.put_vector(2, &[2.0], 200).unwrap();
-        store.put_tombstone(2, 300).unwrap();
-        store.put_vector(3, &[3.0], 400).unwrap();
-        store.put_tombstone(1, 500).unwrap();
-        let mut ids = store.iter_ids().unwrap();
-        ids.sort();
-        assert_eq!(ids, vec![3]);
-    }
-
-    #[test]
-    fn test_scan_tombstones() {
-        let store = setup_store("rekha_test_scan_ts");
-        store.put_vector(1, &[1.0], 100).unwrap();
-        store.put_tombstone(2, 200).unwrap();
-        store.put_vector(3, &[3.0], 300).unwrap();
-        store.put_tombstone(4, 400).unwrap();
-
-        let tombstones = store.scan_tombstones().unwrap();
-        let mut pairs: Vec<(u64, u64)> = tombstones;
-        pairs.sort();
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0], (2, 200));
-        assert_eq!(pairs[1], (4, 400));
-    }
-
-    #[test]
-    fn test_physically_delete_vectors() {
-        let store = setup_store("rekha_test_phys_del");
-        store.put_vector(1, &[1.0], 100).unwrap();
-        store.put_payload(1, b"data").unwrap();
-        store.physically_delete_vectors(&[1]).unwrap();
-        assert!(store.get_vector(1).unwrap().is_none());
-        assert!(store.get_payload(1).unwrap().is_none());
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn key_encode_decode_roundtrip() {
-        let store = setup_store("rekha_key_rt");
-        let store_ns = store.clone().with_namespace("test_ns".into());
-        for id in [0u64, 1, u64::MAX, u64::from_le_bytes([0, 0, 0, 0, 0, 0, 0x80, 0])] {
-            // Round-trip without namespace
-            let key = store.encode_key(id);
-            let decoded = store.decode_id(&key).unwrap();
-            assert_eq!(id, decoded, "decode_id roundtrip failed for {id}");
-
-            // Round-trip with namespace
-            let key_ns = store_ns.encode_key(id);
-            let decoded_ns = store_ns.decode_id(&key_ns).unwrap();
-            assert_eq!(id, decoded_ns, "decode_id with namespace roundtrip failed for {id}");
-        }
-    }
-
-    #[test]
-    fn test_decode_vector_value_short() {
-        let (_ts, flag, _rest) = RocksVectorStore::decode_vector_value(&[0u8; 4]);
-        assert_eq!(flag, 0xFF);
-        let (_ts2, flag2, _rest2) = RocksVectorStore::decode_vector_value(&[0u8; 9]);
-        assert_eq!(flag2, 0x00);
-    }
-
 }

@@ -1,10 +1,5 @@
-mod collection;
-mod config;
-mod coordinator;
-mod membership;
-mod peer_pool;
-mod read_path;
-mod write_path;
+pub mod coordinator;
+pub mod peer_pool;
 
-pub use config::CoordinatorConfig;
 pub use coordinator::Coordinator;
+pub use peer_pool::PeerPool;

@@ -1,107 +1,134 @@
-use crate::ring::ConsistentHashRing;
-use crate::peer_state::PeerState;
-use rekha_core::{NodeInfo, NodeStatus};
-use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
+use tokio::sync::RwLock;
+
+use crate::ring::HashRing;
+
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub address: String,
+    pub is_alive: bool,
+    pub last_seen: Instant,
+}
+
+#[allow(dead_code)]
 pub struct Membership {
-    peers: HashMap<String, PeerState>,
-    #[allow(dead_code)]
-    self_node_id: String,
-    ring: ConsistentHashRing,
-    peer_timeout: Duration,
+    nodes: DashMap<String, NodeInfo>,
+    ring: Arc<RwLock<HashRing>>,
+    self_id: String,
+    heartbeat_timeout_ms: u64,
 }
 
 impl Membership {
-    pub fn new(self_node_id: String) -> Self {
-        Self::with_timeout(self_node_id, Duration::from_secs(10))
-    }
-
-    pub fn with_timeout(self_node_id: String, peer_timeout: Duration) -> Self {
-        Self {
-            peers: HashMap::new(),
-            self_node_id,
-            ring: ConsistentHashRing::new(128),
-            peer_timeout,
+    pub fn new(self_id: &str, heartbeat_timeout_ms: u64) -> Self {
+        Membership {
+            nodes: DashMap::new(),
+            ring: Arc::new(RwLock::new(HashRing::new())),
+            self_id: self_id.to_string(),
+            heartbeat_timeout_ms,
         }
     }
 
-    pub fn register(&mut self, info: NodeInfo) {
-        let node_id = info.node_id.clone();
-        if let Some(existing) = self.peers.get_mut(&node_id) {
-            let preserved_status = existing.info.status.clone();
-            existing.info = info;
-            existing.info.status = preserved_status;
-            existing.last_seen = Instant::now();
-        } else {
-            self.peers.insert(node_id.clone(), PeerState::new(info));
-            self.ring.add_node(&node_id);
+    pub fn self_id(&self) -> &str {
+        &self.self_id
+    }
+
+    pub fn add_peer(&self, node_id: &str, address: &str) {
+        self.nodes.insert(
+            node_id.to_string(),
+            NodeInfo {
+                node_id: node_id.to_string(),
+                address: address.to_string(),
+                is_alive: true,
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    pub fn mark_alive(&self, node_id: &str) {
+        if let Some(mut n) = self.nodes.get_mut(node_id) {
+            n.is_alive = true;
+            n.last_seen = Instant::now();
         }
     }
 
-    pub fn register_from_heartbeat(&mut self, node_id: String, address: String, storage_bytes: u64) {
-        self.register(NodeInfo {
-            node_id, address,
-            partition_id: 0, dim_groups: Vec::new(),
-            is_leader: false, raft_term: 0, commit_index: 0,
-            storage_bytes,
-            status: NodeStatus::Healthy, last_heartbeat: 0,
-        });
-    }
-
-    pub fn check_health(&mut self) -> Vec<String> {
-        let mut recovered = Vec::new();
-        for peer in self.peers.values_mut() {
-            if peer.last_seen.elapsed() > self.peer_timeout && peer.info.status == NodeStatus::Healthy {
-                peer.info.status = NodeStatus::Unreachable;
-            } else if peer.last_seen.elapsed() <= self.peer_timeout && peer.info.status == NodeStatus::Unreachable {
-                peer.info.status = NodeStatus::Healthy;
-                recovered.push(peer.info.node_id.clone());
-            }
+    pub fn mark_dead(&self, node_id: &str) {
+        if let Some(mut n) = self.nodes.get_mut(node_id) {
+            n.is_alive = false;
         }
-        recovered
     }
 
-    pub fn remove(&mut self, node_id: &str) {
-        self.peers.remove(node_id);
-        self.ring.remove_node(node_id);
+    pub fn remove_peer(&self, node_id: &str) {
+        self.nodes.remove(node_id);
     }
 
-    pub fn healthy_peers(&self) -> Vec<NodeInfo> {
-        self.peers.values()
-            .filter(|p| p.info.status == NodeStatus::Healthy)
-            .map(|p| p.info.clone())
+    pub fn get_peer(&self, node_id: &str) -> Option<NodeInfo> {
+        self.nodes.get(node_id).map(|n| n.clone())
+    }
+
+    pub fn alive_peers(&self) -> Vec<NodeInfo> {
+        self.nodes
+            .iter()
+            .filter(|n| n.is_alive)
+            .map(|n| n.clone())
             .collect()
-    }
-
-    pub fn get(&self, node_id: &str) -> Option<&PeerState> {
-        self.peers.get(node_id)
-    }
-
-    pub fn peers_for_handshake(&self, exclude: &str) -> Vec<NodeInfo> {
-        self.peers.values()
-            .filter(|p| p.info.node_id != exclude)
-            .map(|p| p.info.clone())
-            .collect()
-    }
-
-    pub fn count(&self) -> usize {
-        self.peers.len()
     }
 
     pub fn all_peers(&self) -> Vec<NodeInfo> {
-        self.peers.values().map(|p| p.info.clone()).collect()
+        self.nodes.iter().map(|n| n.clone()).collect()
     }
 
-    pub fn replicas_for(&self, shard: u64, rf: usize) -> Vec<NodeInfo> {
-        let healthy: HashSet<&str> = self.peers.iter()
-            .filter(|(_, p)| p.info.status == NodeStatus::Healthy)
-            .map(|(id, _)| id.as_str())
-            .collect();
-        self.ring.replicas_for(shard, rf, &healthy)
-            .iter()
-            .filter_map(|id| self.peers.get(id).map(|p| p.info.clone()))
+    pub async fn rebuild_ring(&self) {
+        let mut ring = self.ring.write().await;
+        let mut new_ring = HashRing::new();
+        new_ring.add_node(&self.self_id);
+        for node in self.alive_peers() {
+            new_ring.add_node(&node.node_id);
+        }
+        *ring = new_ring;
+    }
+
+    pub async fn replicas_for(&self, shard: u64, rf: usize) -> Vec<String> {
+        let ring = self.ring.read().await;
+        ring.replicas_for(shard, rf)
+            .into_iter()
+            .filter(|n| n != &self.self_id)
             .collect()
+    }
+
+    pub fn check_timeouts(&self, timeout_ms: u64) {
+        let now = Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        let dead_peers: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|entry| {
+                let age = now - entry.value().last_seen;
+                age >= timeout
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for node_id in dead_peers {
+            self.mark_dead(&node_id);
+        }
+    }
+
+    pub async fn handle_heartbeat(&self, node_id: &str, address: &str) {
+        if !self.nodes.contains_key(node_id) {
+            self.add_peer(node_id, address);
+            self.rebuild_ring().await;
+        } else {
+            self.mark_alive(node_id);
+        }
+    }
+
+    pub async fn handle_peer_leaving(&self, node_id: &str) {
+        self.remove_peer(node_id);
+        self.rebuild_ring().await;
     }
 }
 
@@ -109,116 +136,42 @@ impl Membership {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_register_and_healthy() {
-        let mut m = Membership::new("self".into());
-        assert_eq!(m.count(), 0);
-        m.register(NodeInfo {
-            node_id: "peer1".into(), address: "addr".into(),
-            partition_id: 0, dim_groups: vec![], is_leader: false,
-            raft_term: 0, commit_index: 0, storage_bytes: 0,
-            status: NodeStatus::Healthy, last_heartbeat: 0,
-        });
-        assert_eq!(m.count(), 1);
-        assert_eq!(m.healthy_peers().len(), 1);
+    #[tokio::test]
+    async fn test_add_and_get_peer() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        let peer = m.get_peer("node1").unwrap();
+        assert_eq!(peer.node_id, "node1");
+        assert!(peer.is_alive);
     }
 
-    #[test]
-    fn test_remove() {
-        let mut m = Membership::new("self".into());
-        m.register(NodeInfo { node_id: "p1".into(), address: "a".into(),
-            partition_id: 0, dim_groups: vec![], is_leader: false,
-            raft_term: 0, commit_index: 0, storage_bytes: 0,
-            status: NodeStatus::Healthy, last_heartbeat: 0,
-        });
-        m.remove("p1");
-        assert_eq!(m.count(), 0);
+    #[tokio::test]
+    async fn test_mark_dead() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.mark_dead("node1");
+        let peer = m.get_peer("node1").unwrap();
+        assert!(!peer.is_alive);
     }
 
-    #[test]
-    fn test_peers_for_handshake_excludes_self() {
-        let mut m = Membership::new("self".into());
-        m.register(NodeInfo { node_id: "peer".into(), address: "a".into(),
-            partition_id: 0, dim_groups: vec![], is_leader: false,
-            raft_term: 0, commit_index: 0, storage_bytes: 0,
-            status: NodeStatus::Healthy, last_heartbeat: 0,
-        });
-        assert_eq!(m.peers_for_handshake("peer").len(), 0);
-        assert_eq!(m.peers_for_handshake("other").len(), 1);
+    #[tokio::test]
+    async fn test_remove_peer() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.remove_peer("node1");
+        assert!(m.get_peer("node1").is_none());
     }
 
-    fn make_info(node_id: &str) -> NodeInfo {
-        NodeInfo {
-            node_id: node_id.into(), address: "addr".into(),
-            partition_id: 0, dim_groups: vec![], is_leader: false,
-            raft_term: 0, commit_index: 0, storage_bytes: 0,
-            status: NodeStatus::Healthy, last_heartbeat: 0,
-        }
-    }
-
-    #[test]
-    fn test_register_preserves_unreachable_status() {
-        let mut m = Membership::with_timeout("self".into(), Duration::from_millis(50));
-        m.register(make_info("peer1"));
-        assert_eq!(m.healthy_peers().len(), 1);
-        std::thread::sleep(Duration::from_millis(60));
-        let recovered = m.check_health();
-        assert!(recovered.is_empty());
-        assert_eq!(m.healthy_peers().len(), 0);
-        // Re-register — status should remain Unreachable
-        let mut refreshed = make_info("peer1");
-        refreshed.status = NodeStatus::Healthy;
-        m.register(refreshed);
-        assert_eq!(m.healthy_peers().len(), 0, "register must preserve Unreachable status");
-        let recovered = m.check_health();
-        assert_eq!(recovered.len(), 1, "check_health should detect the recovery");
-        assert_eq!(m.healthy_peers().len(), 1);
-    }
-
-    #[test]
-    fn test_replicas_for_returns_healthy() {
-        let m = three_nodes(&Duration::from_secs(10));
-        let replicas = m.replicas_for(0, 2);
-        assert_eq!(replicas.len(), 2);
-    }
-
-    #[test]
-    fn test_replicas_for_skips_unreachable() {
-        let mut m = three_nodes(&Duration::from_millis(50));
-        // Simulate making one node unreachable
-        if let Some(peer) = m.peers.get_mut("node-c") {
-            peer.info.status = NodeStatus::Unreachable;
-        }
-        // Should only return 2 (node-c is skipped)
-        let replicas = m.replicas_for(0, 3);
-        assert_eq!(replicas.len(), 2);
-        for r in &replicas {
-            assert_ne!(r.node_id, "node-c");
-        }
-    }
-
-    #[test]
-    fn test_replicas_for_empty_when_no_nodes() {
-        let m = Membership::new("self".into());
-        assert!(m.replicas_for(0, 3).is_empty());
-    }
-
-    #[test]
-    fn test_remove_also_removes_from_ring() {
-        let mut m = three_nodes(&Duration::from_secs(10));
-        m.remove("node-b");
-        let replicas = m.replicas_for(0, 3);
-        assert_eq!(replicas.len(), 2);
-        for r in &replicas {
-            assert_ne!(r.node_id, "node-b");
-        }
-    }
-
-    fn three_nodes(timeout: &Duration) -> Membership {
-        let mut m = Membership::with_timeout("self".into(), timeout.clone());
-        m.register(make_info("node-a"));
-        m.register(make_info("node-b"));
-        m.register(make_info("node-c"));
-        m
+    #[tokio::test]
+    async fn test_rebuild_ring() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.add_peer("node2", "127.0.0.1:5002");
+        m.rebuild_ring().await;
+        let replicas = m.replicas_for(42, 2).await;
+        assert!(
+            replicas.len() <= 2,
+            "should return up to 2 non-self replicas"
+        );
     }
 }

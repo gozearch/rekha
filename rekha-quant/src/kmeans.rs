@@ -1,54 +1,75 @@
 use rand::Rng;
-use rand::SeedableRng;
-use rekha_core::distance::l2_squared;
 use rekha_core::RekhaError;
 
 pub struct KMeans {
-    pub k: usize,
+    pub centroids: Vec<Vec<f32>>,
+    pub n_clusters: usize,
     pub max_iter: usize,
     pub tolerance: f32,
-    pub seed: u64,
+    pub dim: usize,
 }
 
 impl KMeans {
-    pub fn new(k: usize) -> Self {
-        Self {
-            k,
-            max_iter: 20,
-            tolerance: 1e-4,
-            seed: 42,
+    pub fn new(n_clusters: usize, dim: usize, max_iter: usize, tolerance: f32) -> Self {
+        KMeans {
+            centroids: Vec::new(),
+            n_clusters,
+            max_iter,
+            tolerance,
+            dim,
         }
     }
 
-    pub fn with_params(k: usize, max_iter: usize, tolerance: f32, seed: u64) -> Self {
-        Self { k, max_iter, tolerance, seed }
+    pub fn is_trained(&self) -> bool {
+        !self.centroids.is_empty()
     }
 
-    pub fn train(&self, vectors: &[&[f32]], dim: usize) -> Result<Vec<Vec<f32>>, RekhaError> {
-        if vectors.is_empty() || self.k == 0 {
-            return Err(RekhaError::InvalidArgument(
-                "k-means: no vectors or zero clusters".into(),
-            ));
+    pub fn fit(&mut self, data: &[Vec<f32>]) -> Result<(), RekhaError> {
+        if data.is_empty() || data.len() < self.n_clusters {
+            return Err(RekhaError::InvalidArgument(format!(
+                "need at least {} samples for KMeans",
+                self.n_clusters
+            )));
         }
-        let mut rng = rand::rngs::StdRng::seed_from_u64(self.seed);
-        let n = vectors.len();
+        let dim = data[0].len();
+        if dim != self.dim {
+            return Err(RekhaError::InvalidArgument(format!(
+                "expected dim {}, got {}",
+                self.dim, dim
+            )));
+        }
 
-        let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(self.k);
+        self.centroids = Self::kmeans_plus_plus(data, self.n_clusters);
+        let mut rng = rand::thread_rng();
 
-        let first_idx = rng.gen_range(0..n);
-        centroids.push(vectors[first_idx].to_vec());
-
-        let mut min_dists = vec![f32::MAX; n];
-        for c in 1..self.k {
-            let mut total = 0.0f32;
-            for (i, v) in vectors.iter().enumerate() {
-                let d = l2_squared(v, &centroids[c - 1]);
-                if d < min_dists[i] {
-                    min_dists[i] = d;
-                }
-                total += min_dists[i];
+        for _iter in 0..self.max_iter {
+            let assignments = self.assign(data);
+            let new_centroids = self.recompute(data, &assignments, &mut rng);
+            let diff = self.centroid_shift(&new_centroids);
+            self.centroids = new_centroids;
+            if diff < self.tolerance {
+                break;
             }
+        }
 
+        Ok(())
+    }
+
+    fn kmeans_plus_plus(data: &[Vec<f32>], k: usize) -> Vec<Vec<f32>> {
+        let mut rng = rand::thread_rng();
+        let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
+        let first_idx = rng.gen_range(0..data.len());
+        centroids.push(data[first_idx].clone());
+
+        let mut min_dists = vec![f32::MAX; data.len()];
+
+        for _ in 1..k {
+            let mut total = 0.0f32;
+            for (i, point) in data.iter().enumerate() {
+                let d = Self::min_distance(point, &centroids);
+                min_dists[i] = d;
+                total += d;
+            }
             let threshold = rng.gen::<f32>() * total;
             let mut cumulative = 0.0f32;
             let mut chosen = 0;
@@ -59,79 +80,138 @@ impl KMeans {
                     break;
                 }
             }
-            centroids.push(vectors[chosen].to_vec());
+            centroids.push(data[chosen].clone());
         }
 
-        let mut assignments = vec![0usize; n];
-
-        for _iter in 0..self.max_iter {
-            let mut changed = false;
-
-            for (i, point) in vectors.iter().enumerate() {
-                    let nearest = (0..self.k)
-                        .min_by(|&a, &b| {
-                            let da = l2_squared(point, &centroids[a]);
-                            let db = l2_squared(point, &centroids[b]);
-                            da.total_cmp(&db)
-                        })
-                        .unwrap_or(0);
-
-                if assignments[i] != nearest {
-                    assignments[i] = nearest;
-                    changed = true;
-                }
-            }
-
-            if !changed {
-                break;
-            }
-
-            let mut sums = vec![vec![0.0f32; dim]; self.k];
-            let mut counts = vec![0usize; self.k];
-
-            for (i, point) in vectors.iter().enumerate() {
-                let cluster = assignments[i];
-                for d in 0..dim {
-                    sums[cluster][d] += point[d];
-                }
-                counts[cluster] += 1;
-            }
-
-            let mut max_movement = 0.0f32;
-            for c in 0..self.k {
-                if counts[c] > 0 {
-                    let new_centroid: Vec<f32> =
-                        sums[c].iter().map(|s| s / counts[c] as f32).collect();
-                    let movement = l2_squared(&centroids[c], &new_centroid);
-                    if movement > max_movement {
-                        max_movement = movement;
-                    }
-                    centroids[c] = new_centroid;
-                }
-            }
-
-            if max_movement < self.tolerance {
-                break;
-            }
-        }
-
-        Ok(centroids)
+        centroids
     }
 
-    pub fn assign(&self, vector: &[f32], centroids: &[Vec<f32>]) -> usize {
-        self.compute_distances(vector, centroids)
-            .into_iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(idx, _)| idx)
-            .unwrap_or(0)
-    }
-
-    pub fn compute_distances(&self, vector: &[f32], centroids: &[Vec<f32>]) -> Vec<f32> {
+    fn min_distance(point: &[f32], centroids: &[Vec<f32>]) -> f32 {
         centroids
             .iter()
-            .map(|c| l2_squared(vector, c))
+            .map(|c| {
+                point
+                    .iter()
+                    .zip(c.iter())
+                    .map(|(x, y)| {
+                        let d = x - y;
+                        d * d
+                    })
+                    .sum::<f32>()
+            })
+            .fold(f32::MAX, f32::min)
+    }
+
+    fn assign(&self, data: &[Vec<f32>]) -> Vec<usize> {
+        data.iter()
+            .map(|point| {
+                let mut best = 0;
+                let mut best_dist = f32::MAX;
+                for (j, centroid) in self.centroids.iter().enumerate() {
+                    let d: f32 = point
+                        .iter()
+                        .zip(centroid.iter())
+                        .map(|(x, y)| {
+                            let diff = x - y;
+                            diff * diff
+                        })
+                        .sum();
+                    if d < best_dist {
+                        best_dist = d;
+                        best = j;
+                    }
+                }
+                best
+            })
             .collect()
+    }
+
+    fn recompute(
+        &self,
+        data: &[Vec<f32>],
+        assignments: &[usize],
+        rng: &mut impl Rng,
+    ) -> Vec<Vec<f32>> {
+        let mut new_centroids = vec![vec![0.0f32; self.dim]; self.n_clusters];
+        let mut counts = vec![0usize; self.n_clusters];
+
+        for (i, &cluster) in assignments.iter().enumerate() {
+            for (j, &val) in data[i].iter().enumerate() {
+                new_centroids[cluster][j] += val;
+            }
+            counts[cluster] += 1;
+        }
+
+        for (i, centroid) in new_centroids.iter_mut().enumerate() {
+            if counts[i] > 0 {
+                let inv = 1.0 / counts[i] as f32;
+                for val in centroid.iter_mut() {
+                    *val *= inv;
+                }
+            } else {
+                *centroid = data[rng.gen_range(0..data.len())].clone();
+            }
+        }
+
+        new_centroids
+    }
+
+    fn centroid_shift(&self, new_centroids: &[Vec<f32>]) -> f32 {
+        self.centroids
+            .iter()
+            .zip(new_centroids.iter())
+            .map(|(old, new)| {
+                old.iter()
+                    .zip(new.iter())
+                    .map(|(x, y)| {
+                        let d = x - y;
+                        d * d
+                    })
+                    .sum::<f32>()
+            })
+            .sum::<f32>()
+            / self.n_clusters as f32
+    }
+
+    pub fn predict(&self, point: &[f32]) -> usize {
+        let mut best = 0;
+        let mut best_dist = f32::MAX;
+        for (j, centroid) in self.centroids.iter().enumerate() {
+            let d: f32 = point
+                .iter()
+                .zip(centroid.iter())
+                .map(|(x, y)| {
+                    let diff = x - y;
+                    diff * diff
+                })
+                .sum();
+            if d < best_dist {
+                best_dist = d;
+                best = j;
+            }
+        }
+        best
+    }
+
+    pub fn predict_with_distances(&self, point: &[f32]) -> Vec<(usize, f32)> {
+        let mut distances: Vec<(usize, f32)> = self
+            .centroids
+            .iter()
+            .enumerate()
+            .map(|(j, centroid)| {
+                let d: f32 = point
+                    .iter()
+                    .zip(centroid.iter())
+                    .map(|(x, y)| {
+                        let diff = x - y;
+                        diff * diff
+                    })
+                    .sum();
+                (j, d)
+            })
+            .collect();
+        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        distances
     }
 }
 
@@ -140,69 +220,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_kmeans_convergence() {
-        let km = KMeans::new(2);
+    fn test_kmeans_fit_and_predict() {
         let data: Vec<Vec<f32>> = vec![
-            vec![0.0, 0.0], vec![0.1, 0.1], vec![0.2, 0.2],
-            vec![5.0, 5.0], vec![5.1, 5.1], vec![5.2, 5.2],
+            vec![1.0, 1.0],
+            vec![1.5, 1.5],
+            vec![2.0, 2.0],
+            vec![10.0, 10.0],
+            vec![10.5, 10.5],
+            vec![11.0, 11.0],
         ];
-        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
-        let centroids = km.train(&refs, 2).unwrap();
-        assert_eq!(centroids.len(), 2);
-        assert_eq!(centroids[0].len(), 2);
+        let mut km = KMeans::new(2, 2, 20, 1e-4);
+        km.fit(&data).unwrap();
+        assert!(km.is_trained());
+        assert_eq!(km.centroids.len(), 2);
+
+        let c1 = km.predict(&[1.0, 1.0]);
+        let c2 = km.predict(&[10.0, 10.0]);
+        assert_ne!(c1, c2);
     }
 
     #[test]
-    fn test_kmeans_assign() {
-        let km = KMeans::new(2);
-        let centroids = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
-        assert_eq!(km.assign(&[1.0, 1.0], &centroids), 0);
-        assert_eq!(km.assign(&[9.0, 9.0], &centroids), 1);
+    fn test_kmeans_not_enough_data() {
+        let data = vec![vec![1.0, 1.0]];
+        let mut km = KMeans::new(2, 2, 20, 1e-4);
+        assert!(km.fit(&data).is_err());
     }
 
     #[test]
-    fn test_kmeans_empty_vectors() {
-        let km = KMeans::new(3);
-        let result = km.train(&[], 4);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_kmeans_k_too_large() {
-        // When k > n, KMeans produces unused centroids that stay at their
-        // initial values (k-means++ picks them, but they may get 0 assignments).
-        let km = KMeans::new(10);
-        let data: Vec<Vec<f32>> = (0..3).map(|i| vec![i as f32; 2]).collect();
-        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
-        let centroids = km.train(&refs, 2).unwrap();
-        assert_eq!(centroids.len(), 10);
-        assert_eq!(centroids[0].len(), 2);
-    }
-
-    #[test]
-    fn test_kmeans_single_cluster() {
-        let km = KMeans::new(1);
-        let data: Vec<Vec<f32>> = (0..10).map(|i| vec![i as f32; 4]).collect();
-        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
-        let centroids = km.train(&refs, 4).unwrap();
-        assert_eq!(centroids.len(), 1);
-    }
-
-    #[test]
-    fn test_kmeans_compute_distances() {
-        let km = KMeans::new(2);
-        let centroids = vec![vec![0.0, 0.0], vec![3.0, 4.0]];
-        let dists = km.compute_distances(&[0.0, 0.0], &centroids);
-        assert!((dists[0] - 0.0).abs() < 1e-6);
-        assert!((dists[1] - 25.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_kmeans_with_params() {
-        let km = KMeans::with_params(3, 5, 1e-2, 123);
-        assert_eq!(km.k, 3);
-        assert_eq!(km.max_iter, 5);
-        assert!((km.tolerance - 1e-2).abs() < 1e-6);
-        assert_eq!(km.seed, 123);
+    fn test_predict_with_distances() {
+        let data = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
+        let mut km = KMeans::new(2, 2, 5, 1e-4);
+        km.fit(&data).unwrap();
+        let dists = km.predict_with_distances(&[0.0, 0.0]);
+        assert_eq!(dists.len(), 2);
+        assert!(dists[0].1 <= dists[1].1);
     }
 }

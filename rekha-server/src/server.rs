@@ -3,10 +3,9 @@ use std::time::Duration;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rekha_cluster::chord::{ChordNode, hash_to_chord_id};
+use rekha_cluster::chord::{hash_to_chord_id, ChordNode};
 use rekha_cluster::Membership;
 use rekha_coordinator::{Coordinator, PeerPool};
-use rekha_core::ConsistencyLevel;
 use rekha_proto::proto::rekha_server::RekhaServer;
 use rekha_storage::RekhaStore;
 use tokio::sync::RwLock;
@@ -35,12 +34,7 @@ impl ServerInstance {
         )));
 
         let node_id_num: u64 = farmhash(&node_id);
-
-        let consistency = match config.cluster.default_write_consistency.to_lowercase().as_str() {
-            "one" => ConsistencyLevel::One,
-            "all" => ConsistencyLevel::All,
-            _ => ConsistencyLevel::Quorum,
-        };
+        let consistency = config.cluster.default_write_consistency;
 
         let chord_id = hash_to_chord_id(format!("{}:{}", node_id, config.advertise()).as_bytes());
         let chord = Arc::new(ChordNode::new(chord_id, config.advertise()));
@@ -106,7 +100,14 @@ impl ServerInstance {
         let hb_self_id = self.config.node_id.clone();
         let hb_advertise = self.config.advertise().to_string();
         tokio::spawn(async move {
-            heartbeat_loop(hb_coordinator, &hb_seeds, hb_interval, &hb_self_id, &hb_advertise).await;
+            heartbeat_loop(
+                hb_coordinator,
+                &hb_seeds,
+                hb_interval,
+                &hb_self_id,
+                &hb_advertise,
+            )
+            .await;
         });
 
         let gc_coordinator = self.coordinator.clone();
@@ -125,7 +126,9 @@ impl ServerInstance {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                if shutdown_stab.load(Ordering::Relaxed) { break; }
+                if shutdown_stab.load(Ordering::Relaxed) {
+                    break;
+                }
                 // stabilize: ask successor for predecessor, update if needed
                 if let Some((succ_id, succ_addr)) = chord_stab.successor() {
                     chord_stab.stabilize_with(&succ_id, &succ_addr);
@@ -138,10 +141,10 @@ impl ServerInstance {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if shutdown_fix.load(Ordering::Relaxed) { break; }
-                chord_fix.fix_next_finger(|_start| {
-                    None
-                });
+                if shutdown_fix.load(Ordering::Relaxed) {
+                    break;
+                }
+                chord_fix.fix_next_finger(|_start| None);
             }
         });
 
@@ -150,7 +153,9 @@ impl ServerInstance {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                if shutdown_check.load(Ordering::Relaxed) { break; }
+                if shutdown_check.load(Ordering::Relaxed) {
+                    break;
+                }
                 chord_check.check_predecessor(false);
             }
         });
@@ -161,7 +166,9 @@ impl ServerInstance {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                if shutdown_rap.load(Ordering::Relaxed) { break; }
+                if shutdown_rap.load(Ordering::Relaxed) {
+                    break;
+                }
                 let memb = reaper_membership.read().await;
                 memb.check_timeouts(reaper_timeout);
             }
@@ -251,7 +258,12 @@ async fn heartbeat_loop(
                         let mut sl = coordinator.chord.successor_list.write().await;
                         if !sl.contains(&peer_parsed.to_string()) {
                             sl.push(peer_parsed.to_string());
-                            coordinator.chord.successor_addresses.write().await.push(peer_parsed.to_string());
+                            coordinator
+                                .chord
+                                .successor_addresses
+                                .write()
+                                .await
+                                .push(peer_parsed.to_string());
                         }
                     }
                 }

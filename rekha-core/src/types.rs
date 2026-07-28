@@ -25,10 +25,16 @@ pub struct IvfConfig {
     pub distance_metric: DistanceMetric,
 }
 
-fn default_pq_m() -> u32 { 4 }
-fn default_pq_k() -> u16 { 256 }
+fn default_pq_m() -> u32 {
+    4
+}
+fn default_pq_k() -> u16 {
+    256
+}
 
-fn default_replication_factor() -> u32 { 3 }
+fn default_replication_factor() -> u32 {
+    3
+}
 
 impl Default for IvfConfig {
     fn default() -> Self {

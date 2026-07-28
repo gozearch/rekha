@@ -209,11 +209,18 @@ async fn main() -> anyhow::Result<()> {
                 loop {
                     match lines.next_line().await {
                         Ok(Some(line)) => {
-                            if line.trim().is_empty() { continue; }
+                            if line.trim().is_empty() {
+                                continue;
+                            }
                             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
                                 let id = parsed["id"].as_u64().unwrap_or(0);
-                                let vector: Vec<f32> = parsed["vector"].as_array()
-                                    .map(|arr| arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
+                                let vector: Vec<f32> = parsed["vector"]
+                                    .as_array()
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                            .collect()
+                                    })
                                     .unwrap_or_default();
                                 let payload_str = parsed["payload"].as_str().map(|s| s.to_string());
                                 let ts = parsed["timestamp"].as_u64().unwrap_or(0);
@@ -232,7 +239,10 @@ async fn main() -> anyhow::Result<()> {
                                 });
                             }
                             if batch.len() >= 500
-                                && batch_tx.send(std::mem::take(&mut batch)).await.is_err() { return; }
+                                && batch_tx.send(std::mem::take(&mut batch)).await.is_err()
+                            {
+                                return;
+                            }
                         }
                         Ok(None) => break,
                         Err(_) => break,
@@ -243,14 +253,27 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
-            let resp = client.import_stream(tokio_stream::wrappers::ReceiverStream::new(batch_rx)).await?;
-            println!("imported {} vectors ({} errors)", resp.inserted_count, resp.errors.len());
+            let resp = client
+                .import_stream(tokio_stream::wrappers::ReceiverStream::new(batch_rx))
+                .await?;
+            println!(
+                "imported {} vectors ({} errors)",
+                resp.inserted_count,
+                resp.errors.len()
+            );
         }
-        Command::Export { collection, output, offset, limit } => {
+        Command::Export {
+            collection,
+            output,
+            offset,
+            limit,
+        } => {
             let address = std::env::var("REKHA_ADDRESS")
                 .unwrap_or_else(|_| "http://0.0.0.0:50051".to_string());
             let mut client = rekha_client::Client::connect(&address).await?;
-            let mut stream = client.export_stream(&collection, offset, limit, true, true).await?;
+            let mut stream = client
+                .export_stream(&collection, offset, limit, true, true)
+                .await?;
 
             let file = tokio::fs::File::create(&output).await?;
             let mut writer = tokio::io::BufWriter::new(file);
@@ -263,8 +286,14 @@ async fn main() -> anyhow::Result<()> {
                 let line = format!(
                     r#"{{"id":{},"vector":[{}],"payload":{},"timestamp":{}}}"#,
                     v.id,
-                    v.vector.iter().map(|x| format!("{:.6}", x)).collect::<Vec<_>>().join(","),
-                    v.payload.as_ref().map(|p| format!("\"{}\"", String::from_utf8_lossy(p)))
+                    v.vector
+                        .iter()
+                        .map(|x| format!("{:.6}", x))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    v.payload
+                        .as_ref()
+                        .map(|p| format!("\"{}\"", String::from_utf8_lossy(p)))
                         .unwrap_or_else(|| "null".to_string()),
                     v.timestamp,
                 );

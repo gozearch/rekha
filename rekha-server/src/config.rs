@@ -1,9 +1,29 @@
-use serde::{Deserialize, Serialize};
+use rekha_core::ConsistencyLevel;
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn deserialize_consistency<'de, D>(deserializer: D) -> Result<ConsistencyLevel, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(match s.to_lowercase().as_str() {
+        "one" => ConsistencyLevel::One,
+        "all" => ConsistencyLevel::All,
+        _ => ConsistencyLevel::Quorum,
+    })
+}
+
+fn default_consistency() -> ConsistencyLevel {
+    ConsistencyLevel::Quorum
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
-    #[serde(default = "default_write_consistency")]
-    pub default_write_consistency: String,
+    #[serde(
+        default = "default_consistency",
+        deserialize_with = "deserialize_consistency"
+    )]
+    pub default_write_consistency: ConsistencyLevel,
     #[serde(default = "default_true")]
     pub hinted_handoff_enabled: bool,
     #[serde(default = "default_max_hint_window")]
@@ -18,10 +38,8 @@ pub struct ClusterConfig {
     pub default_rf: u32,
 }
 
-fn default_rf() -> u32 { 3 }
-
-fn default_write_consistency() -> String {
-    "quorum".to_string()
+fn default_rf() -> u32 {
+    3
 }
 
 fn default_true() -> bool {
@@ -43,7 +61,7 @@ fn default_heartbeat_timeout() -> u64 {
 impl Default for ClusterConfig {
     fn default() -> Self {
         ClusterConfig {
-            default_write_consistency: default_write_consistency(),
+            default_write_consistency: default_consistency(),
             hinted_handoff_enabled: true,
             max_hint_window_secs: default_max_hint_window(),
             heartbeat_interval_ms: default_heartbeat_interval(),
@@ -93,8 +111,7 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TlsConfig {
     pub enabled: bool,
     pub cert_path: Option<String>,
@@ -102,7 +119,6 @@ pub struct TlsConfig {
     #[serde(default)]
     pub client_ca_cert_path: Option<String>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilityConfig {

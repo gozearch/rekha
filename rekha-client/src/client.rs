@@ -230,9 +230,12 @@ impl Client {
         let chunk = proto::ImportChunk { requests };
         use tokio_stream::wrappers::ReceiverStream;
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tx.send(chunk).await.map_err(|_| RekhaError::Internal("channel closed".into()))?;
+        tx.send(chunk)
+            .await
+            .map_err(|_| RekhaError::Internal("channel closed".into()))?;
         drop(tx);
-        let resp = self.inner
+        let resp = self
+            .inner
             .import(tonic::Request::new(ReceiverStream::new(rx)))
             .await
             .map_err(|e| RekhaError::Unavailable(e.to_string()))?
@@ -255,7 +258,9 @@ impl Client {
             include_vectors,
             include_payloads,
         });
-        let mut resp = self.inner.export(req)
+        let mut resp = self
+            .inner
+            .export(req)
             .await
             .map_err(|e| RekhaError::Unavailable(e.to_string()))?
             .into_inner();
@@ -283,12 +288,17 @@ impl Client {
         tokio::spawn(async move {
             while let Some(requests) = chunks.next().await {
                 let chunk = proto::ImportChunk { requests };
-                if tx.send(chunk).await.is_err() { break; }
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
             }
         });
 
-        let resp = self.inner
-            .import(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        let resp = self
+            .inner
+            .import(tonic::Request::new(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
             .await
             .map_err(|e| RekhaError::Unavailable(e.to_string()))?
             .into_inner();
@@ -302,17 +312,26 @@ impl Client {
         limit: u64,
         include_vectors: bool,
         include_payloads: bool,
-    ) -> Result<impl tokio_stream::Stream<Item = Result<rekha_core::ExportedVector, RekhaError>>, RekhaError> {
+    ) -> Result<
+        impl tokio_stream::Stream<Item = Result<rekha_core::ExportedVector, RekhaError>>,
+        RekhaError,
+    > {
         let req = tonic::Request::new(proto::ExportRequest {
             collection_name: collection.to_string(),
-            offset, limit, include_vectors, include_payloads,
+            offset,
+            limit,
+            include_vectors,
+            include_payloads,
         });
-        let resp = self.inner.export(req)
+        let resp = self
+            .inner
+            .export(req)
             .await
             .map_err(|e| RekhaError::Unavailable(e.to_string()))?
             .into_inner();
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<rekha_core::ExportedVector, RekhaError>>(64);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<rekha_core::ExportedVector, RekhaError>>(64);
         tokio::spawn(async move {
             use tokio_stream::StreamExt;
             let mut stream = resp;
@@ -326,7 +345,9 @@ impl Client {
                                 payload: v.payload.map(|p| p.data),
                                 timestamp: v.timestamp,
                             };
-                            if tx.send(Ok(ev)).await.is_err() { return; }
+                            if tx.send(Ok(ev)).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
@@ -350,7 +371,9 @@ impl Client {
             collection_name: collection.to_string(),
             target_node_id: target_node_id.to_string(),
         });
-        let mut stream = self.inner.transfer_shard(req)
+        let mut stream = self
+            .inner
+            .transfer_shard(req)
             .await
             .map_err(|e| RekhaError::Unavailable(e.to_string()))?
             .into_inner();
@@ -370,7 +393,9 @@ impl Client {
         let req = tonic::Request::new(proto::RepairCollectionRequest {
             collection_name: collection.to_string(),
         });
-        let mut stream = self.inner.repair_collection(req)
+        let mut stream = self
+            .inner
+            .repair_collection(req)
             .await
             .map_err(|e| RekhaError::Unavailable(e.to_string()))?
             .into_inner();

@@ -55,11 +55,14 @@ impl PeerPool {
         }
         let client = self.connect(address).await?;
         let mut peers = self.peers.write().await;
-        peers.insert(address.to_string(), PeerConnection {
-            client: client.clone(),
-            last_used: Instant::now(),
-            error_count: 0,
-        });
+        peers.insert(
+            address.to_string(),
+            PeerConnection {
+                client: client.clone(),
+                last_used: Instant::now(),
+                error_count: 0,
+            },
+        );
         Ok(client)
     }
 
@@ -172,12 +175,7 @@ impl PeerPool {
         Ok(resp.success)
     }
 
-    pub fn evict(&self, address: &str) {
-        let mut peers = futures::executor::block_on(self.peers.write());
-        peers.remove(address);
-    }
-
-    pub async fn evict_async(&self, address: &str) {
+    pub async fn evict(&self, address: &str) {
         let mut peers = self.peers.write().await;
         peers.remove(address);
     }

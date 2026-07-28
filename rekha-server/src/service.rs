@@ -39,7 +39,18 @@ impl Rekha for RekhaService {
         let req = request.into_inner();
         let config: IvfConfig = req.config.map(IvfConfig::from).unwrap_or_default();
         let consistency = ConsistencyLevel::from(req.consistency());
-        match self.coordinator.create_collection(&req.name, config, &req.origin_node_id, req.timestamp as i64, consistency, req.is_replication).await {
+        match self
+            .coordinator
+            .create_collection(
+                &req.name,
+                config,
+                &req.origin_node_id,
+                req.timestamp as i64,
+                consistency,
+                req.is_replication,
+            )
+            .await
+        {
             Ok(_) => Ok(Response::new(proto::CreateCollectionResponse {
                 success: true,
                 error: String::new(),
@@ -57,7 +68,17 @@ impl Rekha for RekhaService {
     ) -> Result<Response<proto::DropCollectionResponse>, Status> {
         let req = request.into_inner();
         let consistency = ConsistencyLevel::from(req.consistency());
-        match self.coordinator.drop_collection(&req.name, &req.origin_node_id, req.timestamp as i64, consistency, req.is_replication).await {
+        match self
+            .coordinator
+            .drop_collection(
+                &req.name,
+                &req.origin_node_id,
+                req.timestamp as i64,
+                consistency,
+                req.is_replication,
+            )
+            .await
+        {
             Ok(_) => Ok(Response::new(proto::DropCollectionResponse {
                 success: true,
                 error: String::new(),
@@ -116,16 +137,20 @@ impl Rekha for RekhaService {
             for req in chunk.requests {
                 let consistency: ConsistencyLevel = req.consistency().into();
                 let payload = req.payload.map(|p| p.data);
-                match self.coordinator.insert(
-                    &req.collection_name,
-                    req.id,
-                    req.vector,
-                    payload,
-                    req.timestamp as i64,
-                    &req.origin_node_id,
-                    consistency,
-                    req.is_replication,
-                ).await {
+                match self
+                    .coordinator
+                    .insert(
+                        &req.collection_name,
+                        req.id,
+                        req.vector,
+                        payload,
+                        req.timestamp as i64,
+                        &req.origin_node_id,
+                        consistency,
+                        req.is_replication,
+                    )
+                    .await
+                {
                     Ok(_) => inserted += 1,
                     Err(e) => errors.push(e.to_string()),
                 }
@@ -147,8 +172,12 @@ impl Rekha for RekhaService {
         let req = request.into_inner();
 
         let mut rx = self.coordinator.export_stream(
-            &req.collection_name, req.offset, req.limit,
-            req.include_vectors, req.include_payloads, 500,
+            &req.collection_name,
+            req.offset,
+            req.limit,
+            req.include_vectors,
+            req.include_payloads,
+            500,
         );
 
         let (tx, out_rx) = tokio::sync::mpsc::channel(4);
@@ -157,17 +186,22 @@ impl Rekha for RekhaService {
                 match batch_result {
                     Ok(vectors) => {
                         let chunk = proto::ExportChunk {
-                            vectors: vectors.into_iter().map(|v| proto::ExportedVector {
-                                id: v.id,
-                                vector: v.vector,
-                                payload: v.payload.map(|data| proto::Payload {
-                                    content_type: "application/octet-stream".into(),
-                                    data,
-                                }),
-                                timestamp: v.timestamp,
-                            }).collect(),
+                            vectors: vectors
+                                .into_iter()
+                                .map(|v| proto::ExportedVector {
+                                    id: v.id,
+                                    vector: v.vector,
+                                    payload: v.payload.map(|data| proto::Payload {
+                                        content_type: "application/octet-stream".into(),
+                                        data,
+                                    }),
+                                    timestamp: v.timestamp,
+                                })
+                                .collect(),
                         };
-                        if tx.send(Ok(chunk)).await.is_err() { break; }
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(Err(map_err(e))).await;
@@ -178,8 +212,7 @@ impl Rekha for RekhaService {
         });
 
         Ok(Response::new(
-            Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx))
-                as Self::ExportStream
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx)) as Self::ExportStream,
         ))
     }
 
@@ -192,12 +225,30 @@ impl Rekha for RekhaService {
         let req = request.into_inner();
         let consistency = ConsistencyLevel::from(req.consistency());
         let payload = req.payload.map(|p| p.data);
-        match self.coordinator.insert(
-            &req.collection_name, req.id, req.vector, payload,
-            req.timestamp as i64, &req.origin_node_id, consistency, req.is_replication,
-        ).await {
-            Ok(_) => Ok(Response::new(proto::InsertResponse { id: req.id, success: true, error: String::new() })),
-            Err(e) => Ok(Response::new(proto::InsertResponse { id: req.id, success: false, error: e.to_string() })),
+        match self
+            .coordinator
+            .insert(
+                &req.collection_name,
+                req.id,
+                req.vector,
+                payload,
+                req.timestamp as i64,
+                &req.origin_node_id,
+                consistency,
+                req.is_replication,
+            )
+            .await
+        {
+            Ok(_) => Ok(Response::new(proto::InsertResponse {
+                id: req.id,
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(proto::InsertResponse {
+                id: req.id,
+                success: false,
+                error: e.to_string(),
+            })),
         }
     }
 
@@ -211,10 +262,20 @@ impl Rekha for RekhaService {
         while let Some(req) = stream.message().await.unwrap_or(None) {
             let consistency = ConsistencyLevel::from(req.consistency());
             let payload = req.payload.map(|p| p.data);
-            match self.coordinator.insert(
-                &req.collection_name, req.id, req.vector, payload,
-                req.timestamp as i64, &req.origin_node_id, consistency, req.is_replication,
-            ).await {
+            match self
+                .coordinator
+                .insert(
+                    &req.collection_name,
+                    req.id,
+                    req.vector,
+                    payload,
+                    req.timestamp as i64,
+                    &req.origin_node_id,
+                    consistency,
+                    req.is_replication,
+                )
+                .await
+            {
                 Ok(_) => count += 1,
                 Err(e) => errors.push(e.to_string()),
             }
@@ -233,9 +294,18 @@ impl Rekha for RekhaService {
         metrics::record_delete();
         let req = request.into_inner();
         let consistency = ConsistencyLevel::from(req.consistency());
-        match self.coordinator.delete(
-            &req.collection_name, &req.ids, req.timestamp as i64, &req.origin_node_id, consistency, req.is_replication,
-        ).await {
+        match self
+            .coordinator
+            .delete(
+                &req.collection_name,
+                &req.ids,
+                req.timestamp as i64,
+                &req.origin_node_id,
+                consistency,
+                req.is_replication,
+            )
+            .await
+        {
             Ok(deleted) => Ok(Response::new(proto::DeleteResponse {
                 deleted_count: deleted,
                 error: String::new(),
@@ -394,7 +464,12 @@ impl Rekha for RekhaService {
         let mut sl = self.coordinator.chord.successor_list.write().await;
         if !sl.contains(&req.node_id) {
             sl.push(req.node_id.clone());
-            self.coordinator.chord.successor_addresses.write().await.push(req.address.clone());
+            self.coordinator
+                .chord
+                .successor_addresses
+                .write()
+                .await
+                .push(req.address.clone());
         }
         drop(sl);
 
@@ -436,7 +511,12 @@ impl Rekha for RekhaService {
         let mut sl = self.coordinator.chord.successor_list.write().await;
         if !sl.contains(&req.node_id) {
             sl.push(req.node_id.clone());
-            self.coordinator.chord.successor_addresses.write().await.push(req.address.clone());
+            self.coordinator
+                .chord
+                .successor_addresses
+                .write()
+                .await
+                .push(req.address.clone());
         }
 
         Ok(Response::new(proto::HeartbeatResponse { success: true }))
@@ -450,14 +530,18 @@ impl Rekha for RekhaService {
         request: Request<proto::TransferShardRequest>,
     ) -> Result<Response<Self::TransferShardStream>, Status> {
         let req = request.into_inner();
-        let mut rx = self.coordinator.transfer_shard_stream(&req.collection_name, 500);
+        let mut rx = self
+            .coordinator
+            .transfer_shard_stream(&req.collection_name, 500);
 
         let (tx, out_rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
             while let Some(chunk_result) = rx.recv().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        if tx.send(Ok(chunk)).await.is_err() { break; }
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(Err(map_err(e))).await;
@@ -469,7 +553,7 @@ impl Rekha for RekhaService {
 
         Ok(Response::new(
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx))
-                as Self::TransferShardStream
+                as Self::TransferShardStream,
         ))
     }
 
@@ -481,7 +565,9 @@ impl Rekha for RekhaService {
         request: Request<proto::RepairCollectionRequest>,
     ) -> Result<Response<Self::RepairCollectionStream>, Status> {
         let req = request.into_inner();
-        let progress = self.coordinator.repair_collection(&req.collection_name)
+        let progress = self
+            .coordinator
+            .repair_collection(&req.collection_name)
             .await
             .map_err(map_err)?;
 
@@ -492,7 +578,7 @@ impl Rekha for RekhaService {
 
         Ok(Response::new(
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
-                as Self::RepairCollectionStream
+                as Self::RepairCollectionStream,
         ))
     }
 
@@ -501,7 +587,10 @@ impl Rekha for RekhaService {
         request: Request<proto::FindSuccessorRequest>,
     ) -> Result<Response<proto::FindSuccessorResponse>, Status> {
         let req = request.into_inner();
-        let id_bytes: [u8; 16] = req.id.as_slice().try_into()
+        let id_bytes: [u8; 16] = req
+            .id
+            .as_slice()
+            .try_into()
             .map_err(|_| Status::invalid_argument("id must be 16 bytes"))?;
         let id = u128::from_le_bytes(id_bytes);
         let result = self.coordinator.chord.handle_find_successor(id);
@@ -556,9 +645,13 @@ impl Rekha for RekhaService {
         request: Request<proto::NotifyChordRequest>,
     ) -> Result<Response<proto::NotifyChordResponse>, Status> {
         let req = request.into_inner();
-        let node = req.node.ok_or_else(|| Status::invalid_argument("node required"))?;
+        let node = req
+            .node
+            .ok_or_else(|| Status::invalid_argument("node required"))?;
         let accepted = self.coordinator.chord.notify(&node.node_id, &node.address);
-        Ok(Response::new(proto::NotifyChordResponse { success: accepted }))
+        Ok(Response::new(proto::NotifyChordResponse {
+            success: accepted,
+        }))
     }
 
     async fn get_successor_list(
@@ -566,15 +659,20 @@ impl Rekha for RekhaService {
         _request: Request<proto::GetSuccessorListRequest>,
     ) -> Result<Response<proto::GetSuccessorListResponse>, Status> {
         let successors = self.coordinator.chord.successor_list.read().await;
-        let infos: Vec<proto::NodeInfo> = successors.iter().map(|id| proto::NodeInfo {
-            node_id: id.clone(),
-            address: String::new(),
-            partition_id: 0,
-            dim_groups: vec![],
-            storage_bytes: 0,
-            status: "alive".to_string(),
-        }).collect();
-        Ok(Response::new(proto::GetSuccessorListResponse { successors: infos }))
+        let infos: Vec<proto::NodeInfo> = successors
+            .iter()
+            .map(|id| proto::NodeInfo {
+                node_id: id.clone(),
+                address: String::new(),
+                partition_id: 0,
+                dim_groups: vec![],
+                storage_bytes: 0,
+                status: "alive".to_string(),
+            })
+            .collect();
+        Ok(Response::new(proto::GetSuccessorListResponse {
+            successors: infos,
+        }))
     }
 }
 

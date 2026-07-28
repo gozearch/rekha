@@ -53,10 +53,6 @@ impl RekhaStore {
         Ok(RekhaStore { db: Arc::new(db) })
     }
 
-    pub fn db(&self) -> &Arc<DB> {
-        &self.db
-    }
-
     pub fn hint_store(&self) -> HintStore {
         HintStore::new(self.db.clone())
     }
@@ -253,11 +249,7 @@ impl RekhaStore {
             .map_err(|e| RekhaError::Storage(e.to_string()))
     }
 
-    pub fn load_assignment(
-        &self,
-        collection: &str,
-        id: u64,
-    ) -> Result<Option<u32>, RekhaError> {
+    pub fn load_assignment(&self, collection: &str, id: u64) -> Result<Option<u32>, RekhaError> {
         let cf = self.cf(CF_METADATA)?;
         let key = format!("{}:assign:{}", collection, id);
         let opt = self
@@ -274,11 +266,7 @@ impl RekhaStore {
         }
     }
 
-    pub fn delete_assignment(
-        &self,
-        collection: &str,
-        id: u64,
-    ) -> Result<(), RekhaError> {
+    pub fn delete_assignment(&self, collection: &str, id: u64) -> Result<(), RekhaError> {
         let cf = self.cf(CF_METADATA)?;
         let key = format!("{}:assign:{}", collection, id);
         self.db
@@ -407,10 +395,10 @@ impl RekhaStore {
         let prefix = format!("collection:{}", collection);
         let keys_to_delete: Vec<Vec<u8>> = self
             .db
-            .iterator_cf(cf, rocksdb::IteratorMode::From(
-                prefix.as_bytes(),
-                rocksdb::Direction::Forward,
-            ))
+            .iterator_cf(
+                cf,
+                rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            )
             .filter_map(|item| {
                 let (key, _) = item.ok()?;
                 if key.starts_with(prefix.as_bytes()) {
@@ -421,7 +409,9 @@ impl RekhaStore {
             })
             .collect();
         for key in keys_to_delete {
-            self.db.delete_cf(cf, key).map_err(|e| RekhaError::Storage(e.to_string()))?;
+            self.db
+                .delete_cf(cf, key)
+                .map_err(|e| RekhaError::Storage(e.to_string()))?;
         }
         Ok(())
     }
@@ -459,7 +449,11 @@ impl RekhaStore {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&data[..8.min(data.len())]);
                 let c = u64::from_le_bytes(buf);
-                if c > 0 { c - 1 } else { 0 }
+                if c > 0 {
+                    c - 1
+                } else {
+                    0
+                }
             }
             None => 0,
         };
@@ -501,6 +495,124 @@ impl RekhaStore {
             }
         }
         Ok(count)
+    }
+
+    pub fn vector_prefix(collection: &str) -> Vec<u8> {
+        let mut key = Vec::new();
+        key.extend_from_slice(collection.as_bytes());
+        key.push(0);
+        key
+    }
+
+    pub fn parse_vector_id(key: &[u8]) -> u64 {
+        let id_start = key.len() - 8;
+        u64::from_be_bytes([
+            key[id_start],
+            key[id_start + 1],
+            key[id_start + 2],
+            key[id_start + 3],
+            key[id_start + 4],
+            key[id_start + 5],
+            key[id_start + 6],
+            key[id_start + 7],
+        ])
+    }
+
+    pub fn parse_vector_value(value: &[u8]) -> Result<(i64, bool, Vec<f32>), RekhaError> {
+        if value.len() < 9 {
+            return Err(RekhaError::Storage(
+                "invalid vector value: too short".into(),
+            ));
+        }
+        let mut cursor = Cursor::new(value);
+        let timestamp = cursor
+            .read_i64::<LittleEndian>()
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        let flags = cursor
+            .read_u8()
+            .map_err(|e| RekhaError::Storage(e.to_string()))?;
+        let is_tombstone = flags != 0;
+        let remaining = value.len() - cursor.position() as usize;
+        let elem_count = remaining / 4;
+        let mut vec_data = Vec::with_capacity(elem_count);
+        for _ in 0..elem_count {
+            let v = cursor
+                .read_f32::<LittleEndian>()
+                .map_err(|e| RekhaError::Storage(e.to_string()))?;
+            vec_data.push(v);
+        }
+        Ok((timestamp, is_tombstone, vec_data))
+    }
+
+    pub fn iterate_vector_ids(&self, collection: &str) -> Result<Vec<u64>, RekhaError> {
+        let cf = self.cf(CF_VECTORS)?;
+        let prefix = Self::vector_prefix(collection);
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        let mut ids = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| RekhaError::Storage(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if value.len() >= 9 && value[8] == 0 {
+                ids.push(Self::parse_vector_id(&key));
+            }
+        }
+        Ok(ids)
+    }
+
+    pub fn iterate_vectors(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(u64, Vec<f32>, i64)>, RekhaError> {
+        let cf = self.cf(CF_VECTORS)?;
+        let prefix = Self::vector_prefix(collection);
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| RekhaError::Storage(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if value.len() < 9 || value[8] != 0 {
+                continue;
+            }
+            let id = Self::parse_vector_id(&key);
+            let (_ts, _tombstone, vec_data) = Self::parse_vector_value(&value)?;
+            results.push((id, vec_data, _ts));
+        }
+        Ok(results)
+    }
+
+    pub fn iterate_tombstones(&self, collection: &str) -> Result<Vec<(u64, i64)>, RekhaError> {
+        let cf = self.cf(CF_VECTORS)?;
+        let prefix = Self::vector_prefix(collection);
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| RekhaError::Storage(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if value.len() < 9 || value[8] == 0 {
+                continue;
+            }
+            let id = Self::parse_vector_id(&key);
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&value[..8]);
+            let timestamp = i64::from_le_bytes(buf);
+            results.push((id, timestamp));
+        }
+        Ok(results)
     }
 
     pub fn flush(&self) -> Result<(), RekhaError> {

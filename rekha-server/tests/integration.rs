@@ -1,4 +1,4 @@
-use rekha_cluster::chord::{ChordNode, hash_to_chord_id};
+use rekha_cluster::chord::{hash_to_chord_id, ChordNode};
 use rekha_coordinator::{Coordinator, PeerPool};
 use rekha_core::{ConsistencyLevel, DistanceMetric, IvfConfig, SearchParams};
 use rekha_storage::RekhaStore;
@@ -23,10 +23,29 @@ async fn test_single_node_insert_and_search() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
     let membership = Arc::new(RwLock::new(rekha_cluster::Membership::new("n1", 5000)));
-    let coord = Arc::new(Coordinator::new(store.clone(), membership, 1, "n1".to_string(), true, 3600, ConsistencyLevel::Quorum, 3, Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")), Arc::new(PeerPool::new()), 86400));
+    let coord = Arc::new(Coordinator::new(
+        store.clone(),
+        membership,
+        1,
+        "n1".to_string(),
+        true,
+        3600,
+        ConsistencyLevel::Quorum,
+        3,
+        Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")),
+        Arc::new(PeerPool::new()),
+        86400,
+    ));
     coord.initialize().await.unwrap();
     coord
-        .create_collection("test", ivf_config(4), "n1", 0, ConsistencyLevel::Quorum, false)
+        .create_collection(
+            "test",
+            ivf_config(4),
+            "n1",
+            0,
+            ConsistencyLevel::Quorum,
+            false,
+        )
         .await
         .unwrap();
 
@@ -57,24 +76,68 @@ async fn test_multi_collection() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
     let membership = Arc::new(RwLock::new(rekha_cluster::Membership::new("n1", 5000)));
-    let coord = Arc::new(Coordinator::new(store.clone(), membership, 1, "n1".to_string(), true, 3600, ConsistencyLevel::Quorum, 3, Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")), Arc::new(PeerPool::new()), 86400));
+    let coord = Arc::new(Coordinator::new(
+        store.clone(),
+        membership,
+        1,
+        "n1".to_string(),
+        true,
+        3600,
+        ConsistencyLevel::Quorum,
+        3,
+        Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")),
+        Arc::new(PeerPool::new()),
+        86400,
+    ));
     coord.initialize().await.unwrap();
 
     coord
-        .create_collection("dim4", ivf_config(4), "n1", 0, ConsistencyLevel::Quorum, false)
+        .create_collection(
+            "dim4",
+            ivf_config(4),
+            "n1",
+            0,
+            ConsistencyLevel::Quorum,
+            false,
+        )
         .await
         .unwrap();
     coord
-        .create_collection("dim8", ivf_config(8), "n1", 0, ConsistencyLevel::Quorum, false)
+        .create_collection(
+            "dim8",
+            ivf_config(8),
+            "n1",
+            0,
+            ConsistencyLevel::Quorum,
+            false,
+        )
         .await
         .unwrap();
 
     coord
-        .insert("dim4", 1, vec![0.5; 4], None, 1000, "n1", ConsistencyLevel::One, false)
+        .insert(
+            "dim4",
+            1,
+            vec![0.5; 4],
+            None,
+            1000,
+            "n1",
+            ConsistencyLevel::One,
+            false,
+        )
         .await
         .unwrap();
     coord
-        .insert("dim8", 1, vec![0.5; 8], None, 1000, "n1", ConsistencyLevel::One, false)
+        .insert(
+            "dim8",
+            1,
+            vec![0.5; 8],
+            None,
+            1000,
+            "n1",
+            ConsistencyLevel::One,
+            false,
+        )
         .await
         .unwrap();
 
@@ -95,15 +158,43 @@ async fn test_delete() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
     let membership = Arc::new(RwLock::new(rekha_cluster::Membership::new("n1", 5000)));
-    let coord = Arc::new(Coordinator::new(store.clone(), membership, 1, "n1".to_string(), true, 3600, ConsistencyLevel::Quorum, 3, Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")), Arc::new(PeerPool::new()), 86400));
+    let coord = Arc::new(Coordinator::new(
+        store.clone(),
+        membership,
+        1,
+        "n1".to_string(),
+        true,
+        3600,
+        ConsistencyLevel::Quorum,
+        3,
+        Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")),
+        Arc::new(PeerPool::new()),
+        86400,
+    ));
     coord.initialize().await.unwrap();
     coord
-        .create_collection("test", ivf_config(4), "n1", 0, ConsistencyLevel::Quorum, false)
+        .create_collection(
+            "test",
+            ivf_config(4),
+            "n1",
+            0,
+            ConsistencyLevel::Quorum,
+            false,
+        )
         .await
         .unwrap();
 
     coord
-        .insert("test", 1, vec![0.5; 4], None, 1000, "n1", ConsistencyLevel::One, false)
+        .insert(
+            "test",
+            1,
+            vec![0.5; 4],
+            None,
+            1000,
+            "n1",
+            ConsistencyLevel::One,
+            false,
+        )
         .await
         .unwrap();
     let deleted = coord
@@ -124,10 +215,29 @@ async fn test_fetch() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
     let membership = Arc::new(RwLock::new(rekha_cluster::Membership::new("n1", 5000)));
-    let coord = Arc::new(Coordinator::new(store.clone(), membership, 1, "n1".to_string(), true, 3600, ConsistencyLevel::Quorum, 3, Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")), Arc::new(PeerPool::new()), 86400));
+    let coord = Arc::new(Coordinator::new(
+        store.clone(),
+        membership,
+        1,
+        "n1".to_string(),
+        true,
+        3600,
+        ConsistencyLevel::Quorum,
+        3,
+        Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")),
+        Arc::new(PeerPool::new()),
+        86400,
+    ));
     coord.initialize().await.unwrap();
     coord
-        .create_collection("test", ivf_config(4), "n1", 0, ConsistencyLevel::Quorum, false)
+        .create_collection(
+            "test",
+            ivf_config(4),
+            "n1",
+            0,
+            ConsistencyLevel::Quorum,
+            false,
+        )
         .await
         .unwrap();
 
@@ -156,7 +266,19 @@ async fn test_list_collections() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
     let membership = Arc::new(RwLock::new(rekha_cluster::Membership::new("n1", 5000)));
-    let coord = Arc::new(Coordinator::new(store.clone(), membership, 1, "n1".to_string(), true, 3600, ConsistencyLevel::Quorum, 3, Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")), Arc::new(PeerPool::new()), 86400));
+    let coord = Arc::new(Coordinator::new(
+        store.clone(),
+        membership,
+        1,
+        "n1".to_string(),
+        true,
+        3600,
+        ConsistencyLevel::Quorum,
+        3,
+        Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")),
+        Arc::new(PeerPool::new()),
+        86400,
+    ));
     coord.initialize().await.unwrap();
 
     let names = coord.list_collections().await.unwrap();
@@ -166,7 +288,14 @@ async fn test_list_collections() {
     );
 
     coord
-        .create_collection("extra", ivf_config(4), "n1", 0, ConsistencyLevel::Quorum, false)
+        .create_collection(
+            "extra",
+            ivf_config(4),
+            "n1",
+            0,
+            ConsistencyLevel::Quorum,
+            false,
+        )
         .await
         .unwrap();
     let names = coord.list_collections().await.unwrap();
@@ -178,10 +307,29 @@ async fn test_rebuild_index() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
     let membership = Arc::new(RwLock::new(rekha_cluster::Membership::new("n1", 5000)));
-    let coord = Arc::new(Coordinator::new(store.clone(), membership, 1, "n1".to_string(), true, 3600, ConsistencyLevel::Quorum, 3, Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")), Arc::new(PeerPool::new()), 86400));
+    let coord = Arc::new(Coordinator::new(
+        store.clone(),
+        membership,
+        1,
+        "n1".to_string(),
+        true,
+        3600,
+        ConsistencyLevel::Quorum,
+        3,
+        Arc::new(ChordNode::new(hash_to_chord_id(b"n1"), "127.0.0.1:5000")),
+        Arc::new(PeerPool::new()),
+        86400,
+    ));
     coord.initialize().await.unwrap();
     coord
-        .create_collection("test", ivf_config(4), "n1", 0, ConsistencyLevel::Quorum, false)
+        .create_collection(
+            "test",
+            ivf_config(4),
+            "n1",
+            0,
+            ConsistencyLevel::Quorum,
+            false,
+        )
         .await
         .unwrap();
 

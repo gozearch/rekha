@@ -93,14 +93,16 @@ impl DiskIvfIndex {
 
         self.store
             .inverted_list_append(&self.collection, centroid_id, id, &pq_code)?;
-        self.store.store_assignment(&self.collection, id, centroid_id)?;
+        self.store
+            .store_assignment(&self.collection, id, centroid_id)?;
 
         Ok(())
     }
 
     pub fn remove(&self, id: u64) -> Result<(), RekhaError> {
         if let Some(centroid_id) = self.store.load_assignment(&self.collection, id)? {
-            self.store.inverted_list_remove(&self.collection, centroid_id, id)?;
+            self.store
+                .inverted_list_remove(&self.collection, centroid_id, id)?;
             self.store.delete_assignment(&self.collection, id)?;
         }
         Ok(())
@@ -221,9 +223,11 @@ impl DiskIvfIndex {
         let mut kmeans = KMeans::new(nlist, dim, 20, 1e-4);
         kmeans.fit(&sample)?;
         self.centroids = kmeans.centroids;
-        self.store.store_centroids(&self.collection, &self.centroids)?;
+        self.store
+            .store_centroids(&self.collection, &self.centroids)?;
 
-        let mut pq_obj = ProductQuantizer::new(self.config.pq_m as usize, self.config.pq_k as usize);
+        let mut pq_obj =
+            ProductQuantizer::new(self.config.pq_m as usize, self.config.pq_k as usize);
         pq_obj.train(&sample)?;
         self.store.store_pq_codebook(
             &self.collection,
@@ -237,7 +241,8 @@ impl DiskIvfIndex {
         for cid in 0..nlist as u32 {
             let entries = self.store.inverted_list_scan(&self.collection, cid)?;
             for (vid, _) in &entries {
-                self.store.inverted_list_remove(&self.collection, cid, *vid)?;
+                self.store
+                    .inverted_list_remove(&self.collection, cid, *vid)?;
             }
         }
 
@@ -247,8 +252,14 @@ impl DiskIvfIndex {
                     let centroid_id = self.assign_to_centroid(&record.data) as u32;
                     let pq_ref = self.pq.as_ref().unwrap();
                     let pq_code = pq_ref.encode(&record.data);
-                    self.store.inverted_list_append(&self.collection, centroid_id, vid, &pq_code)?;
-                    self.store.store_assignment(&self.collection, vid, centroid_id)?;
+                    self.store.inverted_list_append(
+                        &self.collection,
+                        centroid_id,
+                        vid,
+                        &pq_code,
+                    )?;
+                    self.store
+                        .store_assignment(&self.collection, vid, centroid_id)?;
                 }
             }
         }
@@ -312,28 +323,7 @@ impl DiskIvfIndex {
     }
 
     fn collect_all_ids(&self) -> Result<Vec<u64>, RekhaError> {
-        use rocksdb::IteratorMode;
-        let cf = self.store.db().cf_handle("vectors")
-            .ok_or_else(|| RekhaError::Internal("vectors cf not found".into()))?;
-        let prefix = format!("{}\0", self.collection);
-        let mut ids = Vec::new();
-        let iter = self.store.db().iterator_cf(cf, IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-        for item in iter {
-            let (key, _) = item.map_err(|e| RekhaError::Storage(e.to_string()))?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            let id_start = key.len() - 8;
-            let id = u64::from_be_bytes([
-                key[id_start], key[id_start+1], key[id_start+2], key[id_start+3],
-                key[id_start+4], key[id_start+5], key[id_start+6], key[id_start+7],
-            ]);
-            ids.push(id);
-        }
-        Ok(ids)
+        self.store.iterate_vector_ids(&self.collection)
     }
 }
 

@@ -3,5 +3,5 @@ pub mod membership;
 
 mod ring;
 
-pub use chord::{ChordId, ChordNode, FingerEntry, between, hash_to_chord_id};
+pub use chord::{between, hash_to_chord_id, ChordId, ChordNode, FingerEntry};
 pub use membership::Membership;

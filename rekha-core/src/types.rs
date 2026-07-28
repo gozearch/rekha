@@ -15,13 +15,18 @@ pub struct IvfConfig {
     pub dim: u32,
     pub nlist: u32,
     pub nprobe: u32,
+    #[serde(default = "default_pq_m")]
     pub pq_m: u32,
+    #[serde(default = "default_pq_k")]
     pub pq_k: u16,
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u32,
     #[serde(default)]
     pub distance_metric: DistanceMetric,
 }
+
+fn default_pq_m() -> u32 { 4 }
+fn default_pq_k() -> u16 { 256 }
 
 fn default_replication_factor() -> u32 { 3 }
 

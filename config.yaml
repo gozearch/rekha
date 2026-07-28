@@ -1,18 +1,17 @@
+listen: "0.0.0.0:50051"
+data_dir: "/tmp/rekha-data"
+node_id: "node-1"
+
 cluster:
-  node_id: "node-1"
   seed_nodes:
     - "127.0.0.1:50051"
-  bind_addr: "0.0.0.0:50051"
-  data_dir: "/tmp/rekha-data"
 
 storage:
   max_payload_size: 1048576
-  max_inline_size: 1048576
 
 tls:
   enabled: false
 
 observability:
-  metrics: "prometheus"
-  tracing: "none"
-  logging: "structured"
+  enable_tracing: false
+  enable_metrics: false

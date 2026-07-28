@@ -118,32 +118,29 @@ impl Coordinator {
         _consistency: ConsistencyLevel,
         is_replication: bool,
     ) -> Result<(), RekhaError> {
-        let mut indexes = self.indexes.write().await;
-        if indexes.contains_key(name) {
-            return Err(RekhaError::InvalidArgument(format!(
-                "collection {} already exists",
-                name
-            )));
-        }
-
-        if is_replication {
-            if let Ok(_existing_meta) = self.store.load_collection_config(name) {
-                return Ok(());
+        {
+            let mut indexes = self.indexes.write().await;
+            if indexes.contains_key(name) {
+                return Err(RekhaError::InvalidArgument(format!(
+                    "collection {} already exists",
+                    name
+                )));
             }
+            if is_replication {
+                if let Ok(_existing_meta) = self.store.load_collection_config(name) {
+                    return Ok(());
+                }
+            }
+            self.store.store_collection_config(name, &config)?;
+            indexes.insert(name.to_string(), IndexState::Pending { config });
         }
-
-        self.store.store_collection_config(name, &config)?;
-        indexes.insert(
-            name.to_string(),
-            IndexState::Pending { config },
-        );
 
         if !is_replication {
-            let rf = self.default_rf as usize;
             let name_hash = hash_to_chord_id(name.as_bytes());
-            let replicas = self.chord.replicas_for_chord_id(name_hash, rf).await;
+            let replicas = self.chord.replicas_for_chord_id(name_hash, self.default_rf as usize).await;
             for replica in &replicas {
-                if replica.node_id == self.node_id_str { continue; }
+                if replica.address == self.chord.address { continue; }
+                if replica.address.is_empty() { continue; }
                 let req = proto::CreateCollectionRequest {
                     name: name.to_string(),
                     config: Some(config.into()),
@@ -242,16 +239,18 @@ impl Coordinator {
         _consistency: ConsistencyLevel,
         is_replication: bool,
     ) -> Result<(), RekhaError> {
-        let mut indexes = self.indexes.write().await;
-        indexes.remove(name);
-        self.store.delete_collection_metadata(name)?;
+        {
+            let mut indexes = self.indexes.write().await;
+            indexes.remove(name);
+            self.store.delete_collection_metadata(name)?;
+        }
 
         if !is_replication {
-            let rf = self.default_rf as usize;
             let name_hash = hash_to_chord_id(name.as_bytes());
-            let replicas = self.chord.replicas_for_chord_id(name_hash, rf).await;
+            let replicas = self.chord.replicas_for_chord_id(name_hash, self.default_rf as usize).await;
             for replica in &replicas {
-                if replica.node_id == self.node_id_str { continue; }
+                if replica.address == self.chord.address { continue; }
+                if replica.address.is_empty() { continue; }
                 let req = proto::DropCollectionRequest {
                     name: name.to_string(),
                     is_replication: true,
@@ -348,7 +347,7 @@ impl Coordinator {
             let needed = ConsistencyGate::required_acks(rf.clamp(1, 3), consistency) as u64;
 
             for replica in &replicas {
-                if replica.node_id == self.node_id_str {
+                if replica.address == self.chord.address {
                     continue;
                 }
                 let req = proto::InsertRequest {
@@ -532,7 +531,7 @@ impl Coordinator {
             let replicas = self.chord.replicas_for_chord_id(query_hash, rf).await;
 
             for replica in &replicas {
-                if replica.node_id == self.node_id_str { continue; }
+                if replica.address == self.chord.address { continue; }
                 if replica.address.is_empty() { continue; }
 
                 let req = proto::SearchRequest {
@@ -631,8 +630,10 @@ impl Coordinator {
                 let rf = self.default_rf as usize;
                 let vector_hash = hash_to_chord_id(&id.to_le_bytes());
                 let replicas = self.chord.replicas_for_chord_id(vector_hash, rf).await;
-                for replica in &replicas {
-                    if replica.node_id == self.node_id_str { continue; }
+            for replica in &replicas {
+                if replica.node_id == self.chord.self_id_string { continue; }
+                if replica.address == self.chord.address { continue; }
+                if replica.address.is_empty() { continue; }
                     let req = proto::DeleteRequest {
                         ids: vec![id],
                         collection_name: collection.to_string(),
@@ -1427,5 +1428,35 @@ mod tests {
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_collection_with_self_only_replica_no_deadlock() {
+        let (_dir, coord) = setup_coordinator().await;
+        let chord = coord.chord.clone();
+        let self_addr = chord.address.clone();
+        chord.set_successor("self", &self_addr);
+        chord.successor_list.write().await.push("self".to_string());
+        chord.successor_addresses.write().await.push(self_addr);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            coord.create_collection("deadlock_test", IvfConfig::default(), "tester", 1000, ConsistencyLevel::One, false),
+        ).await;
+        assert!(result.is_ok(), "create_collection should not deadlock with self as only replica");
+    }
+
+    #[tokio::test]
+    async fn test_create_collection_with_empty_address_replica() {
+        let (_dir, coord) = setup_coordinator().await;
+        let chord = coord.chord.clone();
+        chord.successor_list.write().await.push("ghost".to_string());
+        chord.successor_addresses.write().await.push(String::new());
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            coord.create_collection("empty_addr_test", IvfConfig::default(), "tester", 1000, ConsistencyLevel::One, false),
+        ).await;
+        assert!(result.is_ok(), "create_collection should skip replicas with empty addresses");
     }
 }

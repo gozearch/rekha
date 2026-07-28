@@ -390,6 +390,14 @@ impl Rekha for RekhaService {
         membership
             .handle_heartbeat(&req.node_id, &req.address)
             .await;
+
+        let mut sl = self.coordinator.chord.successor_list.write().await;
+        if !sl.contains(&req.node_id) {
+            sl.push(req.node_id.clone());
+            self.coordinator.chord.successor_addresses.write().await.push(req.address.clone());
+        }
+        drop(sl);
+
         let peers: Vec<proto::NodeInfo> = membership
             .all_peers()
             .iter()
@@ -424,6 +432,13 @@ impl Rekha for RekhaService {
         membership
             .handle_heartbeat(&req.node_id, &req.address)
             .await;
+
+        let mut sl = self.coordinator.chord.successor_list.write().await;
+        if !sl.contains(&req.node_id) {
+            sl.push(req.node_id.clone());
+            self.coordinator.chord.successor_addresses.write().await.push(req.address.clone());
+        }
+
         Ok(Response::new(proto::HeartbeatResponse { success: true }))
     }
 

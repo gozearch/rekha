@@ -93,10 +93,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::CreateCollection {
             collection,
-            rf: _,
+            rf,
             config,
         } => {
-            let ivf_config: IvfConfig = serde_json::from_str(&config)?;
+            let mut ivf_config: IvfConfig = serde_json::from_str(&config)?;
+            ivf_config.replication_factor = rf as u32;
             let address =
                 std::env::var("REKHA_ADDRESS").unwrap_or_else(|_| "http://0.0.0.0:50051".into());
             let mut client = rekha_client::Client::connect(&address).await?;

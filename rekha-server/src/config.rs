@@ -132,6 +132,7 @@ impl Default for ObservabilityConfig {
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
+    pub advertise_address: Option<String>,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
     #[serde(default = "default_node_id")]
@@ -144,6 +145,12 @@ pub struct ServerConfig {
     pub tls: TlsConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+}
+
+impl ServerConfig {
+    pub fn advertise(&self) -> &str {
+        self.advertise_address.as_deref().unwrap_or(&self.listen)
+    }
 }
 
 fn default_listen() -> String {
@@ -162,6 +169,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             listen: default_listen(),
+            advertise_address: None,
             data_dir: default_data_dir(),
             node_id: default_node_id(),
             cluster: ClusterConfig::default(),
@@ -209,5 +217,42 @@ mod tests {
         let cfg = ServerConfig::default();
         assert!(!cfg.tls.enabled);
         assert!(cfg.tls.cert_path.is_none());
+    }
+
+    #[test]
+    fn test_config_yaml_parses_listen_and_seed_nodes() {
+        let yaml = r#"
+listen: "0.0.0.0:50051"
+data_dir: "/data"
+node_id: "node-1"
+cluster:
+  seed_nodes:
+    - "node-1:50051"
+    - "node-2:50051"
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:50051");
+        assert_eq!(cfg.data_dir, "/data");
+        assert_eq!(cfg.node_id, "node-1");
+        assert_eq!(cfg.cluster.seed_nodes.len(), 2);
+        assert!(cfg.cluster.seed_nodes.contains(&"node-1:50051".to_string()));
+        assert!(cfg.cluster.seed_nodes.contains(&"node-2:50051".to_string()));
+    }
+
+    #[test]
+    fn test_advertise_address_fallback() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.advertise(), cfg.listen);
+    }
+
+    #[test]
+    fn test_advertise_address_override() {
+        let yaml = r#"
+listen: "0.0.0.0:50051"
+advertise_address: "node-2:50051"
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.advertise(), "node-2:50051");
+        assert_eq!(cfg.listen, "0.0.0.0:50051");
     }
 }

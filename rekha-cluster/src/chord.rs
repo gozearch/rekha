@@ -46,6 +46,7 @@ pub struct FingerEntry {
 pub struct ChordNode {
     pub id: ChordId,
     pub address: String,
+    pub self_id_string: String,
     pub predecessor: Arc<RwLock<Option<String>>>,
     pub predecessor_address: Arc<RwLock<Option<String>>>,
     pub finger: Arc<RwLock<Vec<FingerEntry>>>,
@@ -63,9 +64,11 @@ impl ChordNode {
             node_address: None,
         }).collect();
 
+        let self_id_string = id.to_string();
         ChordNode {
             id,
             address: address.to_string(),
+            self_id_string,
             predecessor: Arc::new(RwLock::new(None)),
             predecessor_address: Arc::new(RwLock::new(None)),
             finger: Arc::new(RwLock::new(finger)),
@@ -215,21 +218,76 @@ impl ChordNode {
         let mut results = Vec::new();
 
         results.push(NodeInfo {
-            node_id: self.id.to_string(),
+            node_id: self.self_id_string.clone(),
             address: self.address.clone(),
             is_alive: true,
         });
 
         let successors = self.successor_list.read().await;
-        for succ in successors.iter() {
+        let addresses = self.successor_addresses.read().await;
+        for (i, succ) in successors.iter().enumerate() {
             if results.len() >= rf { break; }
+            let addr = addresses.get(i).cloned().unwrap_or_default();
             results.push(NodeInfo {
                 node_id: succ.clone(),
-                address: String::new(),
+                address: addr,
                 is_alive: true,
             });
         }
+        drop(addresses);
 
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_chord() -> ChordNode {
+        let id = hash_to_chord_id(b"test-node");
+        ChordNode::new(id, "127.0.0.1:5000")
+    }
+
+    #[tokio::test]
+    async fn test_replicas_for_chord_id_returns_addresses() {
+        let chord = test_chord();
+        chord.successor_list.write().await.push("nodeA".to_string());
+        chord.successor_list.write().await.push("nodeB".to_string());
+        chord.successor_addresses.write().await.push("addrA:5001".to_string());
+        chord.successor_addresses.write().await.push("addrB:5002".to_string());
+
+        let replicas = chord.replicas_for_chord_id(0, 3).await;
+        assert_eq!(replicas.len(), 3, "should return self + 2 successors");
+
+        assert_eq!(replicas[0].node_id, chord.self_id_string, "first should be self");
+        assert!(!replicas[1].address.is_empty(), "successor address must not be empty");
+        assert!(!replicas[2].address.is_empty(), "successor address must not be empty");
+        assert_eq!(replicas[1].address, "addrA:5001", "address should match successor_addresses entry");
+        assert_eq!(replicas[2].address, "addrB:5002", "address should match successor_addresses entry");
+    }
+
+    #[tokio::test]
+    async fn test_replicas_for_chord_id_with_empty_successors() {
+        let chord = test_chord();
+        let replicas = chord.replicas_for_chord_id(0, 3).await;
+        assert_eq!(replicas.len(), 1, "only self when no successors");
+        assert_eq!(replicas[0].node_id, chord.self_id_string);
+    }
+
+    #[tokio::test]
+    async fn test_replicas_for_chord_id_truncates_by_rf() {
+        let chord = test_chord();
+        for i in 0..5 {
+            chord.successor_list.write().await.push(format!("node{}", i));
+            chord.successor_addresses.write().await.push(format!("addr{}.local:{}", i, 5000 + i));
+        }
+
+        // rf=3 means 3 total entries (1 self + up to 2 successors)
+        let replicas = chord.replicas_for_chord_id(0, 3).await;
+        assert_eq!(replicas.len(), 3, "rf=3 should return self + 2 successors = 3");
+        assert_eq!(replicas[0].node_id, chord.self_id_string);
+        assert_eq!(replicas[1].node_id, "node0");
+        assert_eq!(replicas[2].node_id, "node1");
     }
 }

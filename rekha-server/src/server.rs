@@ -42,9 +42,19 @@ impl ServerInstance {
             _ => ConsistencyLevel::Quorum,
         };
 
-        let chord_id = hash_to_chord_id(format!("{}:{}", node_id, config.listen).as_bytes());
-        let chord = Arc::new(ChordNode::new(chord_id, &config.listen));
-        chord.set_successor(&node_id, &config.listen);
+        let chord_id = hash_to_chord_id(format!("{}:{}", node_id, config.advertise()).as_bytes());
+        let chord = Arc::new(ChordNode::new(chord_id, config.advertise()));
+        chord.set_successor(&node_id, config.advertise());
+
+        for seed in &config.cluster.seed_nodes {
+            if seed != config.advertise() {
+                let mut sl = chord.successor_list.write().await;
+                if !sl.contains(seed) {
+                    sl.push(seed.clone());
+                    chord.successor_addresses.write().await.push(seed.clone());
+                }
+            }
+        }
 
         let peer_pool = Arc::new(PeerPool::new());
 
@@ -94,9 +104,9 @@ impl ServerInstance {
         let hb_seeds = self.config.cluster.seed_nodes.clone();
         let hb_interval = self.config.cluster.heartbeat_interval_ms;
         let hb_self_id = self.config.node_id.clone();
-        let hb_listen = self.config.listen.clone();
+        let hb_advertise = self.config.advertise().to_string();
         tokio::spawn(async move {
-            heartbeat_loop(hb_coordinator, &hb_seeds, hb_interval, &hb_self_id, &hb_listen).await;
+            heartbeat_loop(hb_coordinator, &hb_seeds, hb_interval, &hb_self_id, &hb_advertise).await;
         });
 
         let gc_coordinator = self.coordinator.clone();
@@ -229,7 +239,6 @@ async fn heartbeat_loop(
     let interval = Duration::from_millis(interval_ms.max(100));
     let mut tick = 0u64;
     loop {
-        tokio::time::sleep(interval).await;
         tick += 1;
 
         for seed in seed_nodes {
@@ -237,6 +246,13 @@ async fn heartbeat_loop(
                 Ok(mut client) => {
                     if let Err(e) = client.send_heartbeat(self_id, listen_addr).await {
                         warn!("heartbeat to {} failed: {}", seed, e);
+                    } else {
+                        let peer_parsed = seed.trim_start_matches("http://");
+                        let mut sl = coordinator.chord.successor_list.write().await;
+                        if !sl.contains(&peer_parsed.to_string()) {
+                            sl.push(peer_parsed.to_string());
+                            coordinator.chord.successor_addresses.write().await.push(peer_parsed.to_string());
+                        }
                     }
                 }
                 Err(e) => {
@@ -248,6 +264,8 @@ async fn heartbeat_loop(
         if tick.is_multiple_of(10) {
             coordinator.membership.write().await.rebuild_ring().await;
         }
+
+        tokio::time::sleep(interval).await;
     }
 }
 

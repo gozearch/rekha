@@ -145,4 +145,108 @@ mod tests {
         let r2 = store.iter_hints_for_node(b"node2:").unwrap();
         assert_eq!(r2.len(), 1);
     }
+
+    #[test]
+    fn test_hint_count_empty() {
+        let (_dir, store) = setup();
+        assert_eq!(store.hint_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_hint_count_with_entries() {
+        let (_dir, store) = setup();
+        store.put_hint(b"node1:hint1", b"value1").unwrap();
+        store.put_hint(b"node1:hint2", b"value2").unwrap();
+        store.put_hint(b"node2:hint1", b"value3").unwrap();
+        assert_eq!(store.hint_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_hint_count_after_delete() {
+        let (_dir, store) = setup();
+        store.put_hint(b"node1:hint1", b"value1").unwrap();
+        store.put_hint(b"node1:hint2", b"value2").unwrap();
+        store.delete_hint(b"node1:hint1").unwrap();
+        assert_eq!(store.hint_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_iter_all_empty() {
+        let (_dir, store) = setup();
+        let results = store.iter_all().unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_iter_all_returns_all_entries() {
+        let (_dir, store) = setup();
+        store.put_hint(b"node1:a", b"val1").unwrap();
+        store.put_hint(b"node1:b", b"val2").unwrap();
+        store.put_hint(b"node2:a", b"val3").unwrap();
+
+        let results = store.iter_all().unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_iter_all_preserves_key_value() {
+        let (_dir, store) = setup();
+        store.put_hint(b"node1:key1", b"value1").unwrap();
+
+        let results = store.iter_all().unwrap();
+        assert_eq!(results[0].0, b"node1:key1");
+        assert_eq!(results[0].1, b"value1");
+    }
+
+    #[test]
+    fn test_delete_expired_hints_none_to_delete() {
+        let (_dir, store) = setup();
+        store.put_hint(b"node1:hint1", b"value1").unwrap();
+        store.put_hint(b"node1:hint2", b"value2").unwrap();
+
+        let deleted = store.delete_expired_hints(b"node0:").unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(store.hint_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_delete_expired_hints_deletes_matching() {
+        let (_dir, store) = setup();
+        store.put_hint(b"node1:hint1", b"value1").unwrap();
+        store.put_hint(b"node1:hint2", b"value2").unwrap();
+        store.put_hint(b"node2:hint1", b"value3").unwrap();
+
+        let deleted = store.delete_expired_hints(b"node1:hint1").unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(store.hint_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_delete_expired_hints_deletes_multiple() {
+        let (_dir, store) = setup();
+        store.put_hint(b"node1:hint1", b"value1").unwrap();
+        store.put_hint(b"node1:hint2", b"value2").unwrap();
+
+        let deleted = store.delete_expired_hints(b"node1:hint9").unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(store.hint_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_delete_expired_hints_does_not_affect_other_nodes() {
+        let (_dir, store) = setup();
+        store.put_hint(b"node1:hint1", b"value1").unwrap();
+        store.put_hint(b"node2:hint1", b"value2").unwrap();
+
+        // Use a cutoff that only affects node1 entries
+        store.delete_expired_hints(b"node0:").unwrap();
+        assert_eq!(store.hint_count().unwrap(), 2);
+
+        // Delete all node1 entries
+        store.delete_expired_hints(b"node1z").unwrap();
+        assert_eq!(store.hint_count().unwrap(), 1);
+
+        let remaining = store.iter_hints_for_node(b"node2:").unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
 }

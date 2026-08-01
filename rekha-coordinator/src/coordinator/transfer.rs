@@ -3,6 +3,474 @@ use rekha_proto::proto;
 
 use crate::coordinator::Coordinator;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer_pool::PeerPool;
+    use rekha_cluster::chord::ChordNode;
+    use rekha_cluster::Membership;
+    use rekha_core::{ConsistencyLevel, DistanceMetric, IvfConfig};
+    use rekha_storage::RekhaStore;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    async fn setup_coordinator_with_collection() -> (TempDir, Coordinator, String) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
+        let membership = Arc::new(RwLock::new(Membership::new("node1", 5000)));
+        let chord_id = rekha_cluster::hash_to_chord_id(b"node1");
+        let chord = Arc::new(ChordNode::new(chord_id, "127.0.0.1:5001"));
+        let coord = Coordinator::new(
+            store.clone(),
+            membership,
+            1,
+            "node1".to_string(),
+            true,
+            3600,
+            ConsistencyLevel::Quorum,
+            3,
+            chord,
+            Arc::new(PeerPool::new()),
+            86400,
+        );
+        coord.initialize().await.unwrap();
+
+        let config = IvfConfig {
+            dim: 4,
+            nlist: 2,
+            nprobe: 2,
+            pq_m: 2,
+            pq_k: 4,
+            replication_factor: 3,
+            distance_metric: DistanceMetric::L2,
+        };
+        coord
+            .create_collection("test", config, "node1", 0, ConsistencyLevel::Quorum, false)
+            .await
+            .unwrap();
+
+        for i in 1..=10 {
+            coord
+                .insert(
+                    "test",
+                    i,
+                    vec![i as f32 * 0.1; 4],
+                    Some(vec![i as u8; 4]),
+                    1000 + i as i64,
+                    "node1",
+                    ConsistencyLevel::One,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        (dir, coord, "test".to_string())
+    }
+
+    #[tokio::test]
+    async fn test_export_collection_basic() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let exported = coord
+            .export_collection(&collection, 0, 10, true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(exported.len(), 10);
+        for (idx, ev) in exported.iter().enumerate() {
+            assert_eq!(ev.id, (idx + 1) as u64);
+            assert_eq!(ev.vector.len(), 4);
+            assert_eq!(ev.payload, Some(vec![(idx + 1) as u8; 4]));
+            assert_eq!(ev.timestamp, 1000 + (idx + 1) as i64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_collection_without_vectors() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let exported = coord
+            .export_collection(&collection, 0, 10, false, true)
+            .await
+            .unwrap();
+
+        assert_eq!(exported.len(), 10);
+        for ev in exported {
+            assert!(ev.vector.is_empty());
+            assert!(ev.payload.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_collection_without_payloads() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let exported = coord
+            .export_collection(&collection, 0, 10, true, false)
+            .await
+            .unwrap();
+
+        assert_eq!(exported.len(), 10);
+        for ev in exported {
+            assert!(!ev.vector.is_empty());
+            assert!(ev.payload.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_collection_with_offset_and_limit() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let exported = coord
+            .export_collection(&collection, 2, 5, true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(exported.len(), 5);
+        assert_eq!(exported[0].id, 3);
+        assert_eq!(exported[1].id, 4);
+        assert_eq!(exported[4].id, 7);
+    }
+
+    #[tokio::test]
+    async fn test_export_collection_limit_exceeds_data() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let exported = coord
+            .export_collection(&collection, 0, 100, true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(exported.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_export_stream_basic() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let mut rx = coord.export_stream(&collection, 0, 10, true, true, 3);
+        let mut total = 0;
+        while let Some(batch_result) = rx.recv().await {
+            let batch = batch_result.unwrap();
+            total += batch.len();
+            assert!(batch.len() <= 3);
+            for ev in batch {
+                assert!(!ev.vector.is_empty());
+                assert!(ev.payload.is_some());
+            }
+        }
+        assert_eq!(total, 10);
+    }
+
+    #[tokio::test]
+    async fn test_export_stream_with_offset_and_limit() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let mut rx = coord.export_stream(&collection, 2, 5, true, true, 2);
+        let mut total = 0;
+        while let Some(batch_result) = rx.recv().await {
+            let batch = batch_result.unwrap();
+            total += batch.len();
+        }
+        assert_eq!(total, 5);
+    }
+
+    #[tokio::test]
+    async fn test_export_stream_without_vectors() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let mut rx = coord.export_stream(&collection, 0, 10, false, true, 5);
+        let mut total = 0;
+        while let Some(batch_result) = rx.recv().await {
+            let batch = batch_result.unwrap();
+            total += batch.len();
+            for ev in batch {
+                assert!(ev.vector.is_empty());
+                assert!(ev.payload.is_some());
+            }
+        }
+        assert_eq!(total, 10);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_out_basic() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let chunks = coord.transfer_shard_out(&collection, 5).await.unwrap();
+
+        assert!(!chunks.is_empty());
+        assert!(chunks.last().unwrap().final_chunk);
+
+        let first = &chunks[0];
+        assert!(!first.centroids.is_empty());
+        assert_eq!(first.nlist, 2);
+        assert_eq!(first.nprobe, 2);
+        assert_eq!(first.total_dim, 4);
+
+        let mut total_vectors = 0;
+        for chunk in &chunks {
+            for batch in &chunk.vector_batches {
+                total_vectors += batch.vectors.len();
+            }
+        }
+        assert_eq!(total_vectors, 10);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_out_single_batch() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let chunks = coord.transfer_shard_out(&collection, 20).await.unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].final_chunk);
+        assert!(!chunks[0].centroids.is_empty());
+
+        let total_vectors: usize = chunks[0]
+            .vector_batches
+            .iter()
+            .map(|b| b.vectors.len())
+            .sum();
+        assert_eq!(total_vectors, 10);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_out_batch_boundaries() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let chunks = coord.transfer_shard_out(&collection, 3).await.unwrap();
+
+        assert!(chunks.len() >= 3);
+        assert!(chunks.last().unwrap().final_chunk);
+
+        let mut total_vectors = 0;
+        for chunk in &chunks {
+            for batch in &chunk.vector_batches {
+                total_vectors += batch.vectors.len();
+            }
+        }
+        assert_eq!(total_vectors, 10);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_out_no_vectors() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
+        let membership = Arc::new(RwLock::new(Membership::new("node1", 5000)));
+        let chord_id = rekha_cluster::hash_to_chord_id(b"node1");
+        let chord = Arc::new(ChordNode::new(chord_id, "127.0.0.1:5001"));
+        let coord = Coordinator::new(
+            store,
+            membership,
+            1,
+            "node1".to_string(),
+            true,
+            3600,
+            ConsistencyLevel::Quorum,
+            3,
+            chord,
+            Arc::new(PeerPool::new()),
+            86400,
+        );
+        coord.initialize().await.unwrap();
+
+        let config = IvfConfig {
+            dim: 4,
+            nlist: 2,
+            nprobe: 2,
+            pq_m: 2,
+            pq_k: 4,
+            replication_factor: 3,
+            distance_metric: DistanceMetric::L2,
+        };
+        coord
+            .create_collection("empty", config, "node1", 0, ConsistencyLevel::Quorum, false)
+            .await
+            .unwrap();
+
+        let chunks = coord.transfer_shard_out("empty", 5).await.unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].final_chunk);
+        assert!(chunks[0].vector_batches[0].vectors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_stream_basic() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let mut rx = coord.transfer_shard_stream(&collection, 5);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk.unwrap());
+        }
+
+        assert!(!chunks.is_empty());
+        assert!(chunks.last().unwrap().final_chunk);
+        assert!(!chunks[0].centroids.is_empty());
+        assert_eq!(chunks[0].nlist, 2);
+
+        let mut total_vectors = 0;
+        for chunk in &chunks {
+            for batch in &chunk.vector_batches {
+                total_vectors += batch.vectors.len();
+            }
+        }
+        assert_eq!(total_vectors, 10);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_stream_single_batch() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let mut rx = coord.transfer_shard_stream(&collection, 20);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk.unwrap());
+        }
+
+        // First chunk has metadata (centroids), second has the vectors
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.last().unwrap().final_chunk);
+        assert!(!chunks[0].centroids.is_empty());
+        assert!(chunks[1].centroids.is_empty());
+
+        let total_vectors: usize = chunks
+            .iter()
+            .flat_map(|c| &c.vector_batches)
+            .map(|b| b.vectors.len())
+            .sum();
+        assert_eq!(total_vectors, 10);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_stream_batch_boundaries() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let mut rx = coord.transfer_shard_stream(&collection, 3);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk.unwrap());
+        }
+
+        assert!(chunks.len() >= 3);
+        assert!(chunks.last().unwrap().final_chunk);
+
+        let mut total_vectors = 0;
+        for chunk in &chunks {
+            for batch in &chunk.vector_batches {
+                total_vectors += batch.vectors.len();
+            }
+        }
+        assert_eq!(total_vectors, 10);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_shard_stream_no_vectors() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
+        let membership = Arc::new(RwLock::new(Membership::new("node1", 5000)));
+        let chord_id = rekha_cluster::hash_to_chord_id(b"node1");
+        let chord = Arc::new(ChordNode::new(chord_id, "127.0.0.1:5001"));
+        let coord = Coordinator::new(
+            store,
+            membership,
+            1,
+            "node1".to_string(),
+            true,
+            3600,
+            ConsistencyLevel::Quorum,
+            3,
+            chord,
+            Arc::new(PeerPool::new()),
+            86400,
+        );
+        coord.initialize().await.unwrap();
+
+        let config = IvfConfig {
+            dim: 4,
+            nlist: 2,
+            nprobe: 2,
+            pq_m: 2,
+            pq_k: 4,
+            replication_factor: 3,
+            distance_metric: DistanceMetric::L2,
+        };
+        coord
+            .create_collection("empty", config, "node1", 0, ConsistencyLevel::Quorum, false)
+            .await
+            .unwrap();
+
+        let mut rx = coord.transfer_shard_stream("empty", 5);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk.unwrap());
+        }
+
+        // With no vectors, stream sends 1 final chunk with metadata and empty vectors
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+        assert!(chunk.final_chunk);
+        assert!(chunk.vector_batches.is_empty() || chunk.vector_batches[0].vectors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_repair_collection_basic() {
+        let (_dir, coord, collection) = setup_coordinator_with_collection().await;
+
+        let progress = coord.repair_collection(&collection).await.unwrap();
+
+        assert_eq!(progress.total, 10);
+        assert_eq!(progress.repaired, 0);
+        assert_eq!(progress.current_node, "node1");
+    }
+
+    #[tokio::test]
+    async fn test_repair_collection_empty() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
+        let membership = Arc::new(RwLock::new(Membership::new("node1", 5000)));
+        let chord_id = rekha_cluster::hash_to_chord_id(b"node1");
+        let chord = Arc::new(ChordNode::new(chord_id, "127.0.0.1:5001"));
+        let coord = Coordinator::new(
+            store,
+            membership,
+            1,
+            "node1".to_string(),
+            true,
+            3600,
+            ConsistencyLevel::Quorum,
+            3,
+            chord,
+            Arc::new(PeerPool::new()),
+            86400,
+        );
+        coord.initialize().await.unwrap();
+
+        let config = IvfConfig {
+            dim: 4,
+            nlist: 2,
+            nprobe: 2,
+            pq_m: 2,
+            pq_k: 4,
+            replication_factor: 3,
+            distance_metric: DistanceMetric::L2,
+        };
+        coord
+            .create_collection("empty", config, "node1", 0, ConsistencyLevel::Quorum, false)
+            .await
+            .unwrap();
+
+        let progress = coord.repair_collection("empty").await.unwrap();
+
+        assert_eq!(progress.total, 0);
+        assert_eq!(progress.repaired, 0);
+        assert_eq!(progress.current_node, "node1");
+    }
+}
+
 impl Coordinator {
     pub async fn export_collection(
         &self,

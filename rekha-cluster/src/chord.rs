@@ -256,6 +256,217 @@ mod tests {
         ChordNode::new(id, "127.0.0.1:5000")
     }
 
+    #[test]
+    fn test_between_same_point() {
+        let id = 100;
+        assert!(between(id, 100, 100, true, true));
+        assert!(between(id, 100, 100, true, false));
+        assert!(between(id, 100, 100, false, true));
+        assert!(between(id, 100, 100, false, false));
+    }
+
+    #[test]
+    fn test_between_inclusive_a() {
+        let id = 50;
+        assert!(between(id, 50, 100, true, false));
+        assert!(!between(id, 50, 100, false, false));
+    }
+
+    #[test]
+    fn test_between_inclusive_b() {
+        let id = 100;
+        assert!(between(id, 50, 100, false, true));
+        assert!(!between(id, 50, 100, false, false));
+    }
+
+    #[test]
+    fn test_between_exclusive_both() {
+        assert!(between(75, 50, 100, false, false));
+        assert!(!between(50, 50, 100, false, false));
+        assert!(!between(100, 50, 100, false, false));
+    }
+
+    #[test]
+    fn test_between_wraps_around() {
+        let id = 10;
+        assert!(between(id, 200, 50, false, false));
+        assert!(between(id, 200, 50, true, false));
+        assert!(between(id, 200, 50, false, true));
+    }
+
+    #[test]
+    fn test_between_a_less_than_b() {
+        assert!(between(75, 50, 100, true, true));
+        assert!(between(75, 50, 100, false, false));
+        assert!(!between(25, 50, 100, true, true));
+        assert!(!between(125, 50, 100, true, true));
+    }
+
+    #[test]
+    fn test_advance_wraps() {
+        let id = u128::MAX;
+        assert_eq!(advance(id, 1), 0);
+        assert_eq!(advance(id, 2), 1);
+        assert_eq!(advance(u128::MAX - 5, 10), 4);
+    }
+
+    #[test]
+    fn test_advance_normal() {
+        assert_eq!(advance(100, 50), 150);
+        assert_eq!(advance(0, 100), 100);
+    }
+
+    #[tokio::test]
+    async fn test_is_owner_with_no_predecessor_returns_true() {
+        let chord = test_chord();
+        assert!(chord.is_owner(chord.id));
+    }
+
+    #[tokio::test]
+    async fn test_successor() {
+        let chord = test_chord();
+        assert!(chord.successor().is_none());
+
+        chord.set_successor("node1", "127.0.0.1:5001");
+        let succ = chord.successor();
+        assert!(succ.is_some());
+        let (id, addr) = succ.unwrap();
+        assert_eq!(id, "node1");
+        assert_eq!(addr, "127.0.0.1:5001");
+    }
+
+    #[tokio::test]
+    async fn test_set_successor() {
+        let chord = test_chord();
+        chord.set_successor("node1", "127.0.0.1:5001");
+        let succ = chord.successor().unwrap();
+        assert_eq!(succ.0, "node1");
+        assert_eq!(succ.1, "127.0.0.1:5001");
+    }
+
+    #[tokio::test]
+    async fn test_closest_preceding_node_empty() {
+        let chord = test_chord();
+        let result = chord.closest_preceding_node(chord.id + 100);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_closest_preceding_node_returns_none_when_no_finger_entries() {
+        let chord = test_chord();
+        let result = chord.closest_preceding_node(chord.id + 200);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_closest_preceding_node_returns_none_when_no_matching_entry() {
+        let chord = test_chord();
+        chord.set_successor("node1", "addr1");
+        let result = chord.closest_preceding_node(chord.id + 200);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_notify_no_current_predecessor() {
+        let chord = test_chord();
+        let result = chord.notify("new-node", "127.0.0.1:6000");
+        assert!(result);
+        let pred = chord.predecessor.read().await;
+        assert_eq!(*pred, Some("new-node".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_notify_updates_predecessor() {
+        let chord = test_chord();
+        chord.notify("first-node", "127.0.0.1:6000");
+
+        chord.notify("second-node", "127.0.0.1:7000");
+        let pred = chord.predecessor.read().await;
+        assert_eq!(*pred, Some("second-node".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_notify_returns_false_when_lock_contended() {
+        let chord = test_chord();
+        let result = chord.notify("new-node", "127.0.0.1:6000");
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_stabilize_with() {
+        let chord = test_chord();
+        chord.stabilize_with("succ-node", "127.0.0.1:5001");
+        let succ = chord.successor();
+        assert!(succ.is_some());
+        assert_eq!(succ.unwrap().0, "succ-node");
+    }
+
+    #[tokio::test]
+    async fn test_check_predecessor_alive_does_nothing() {
+        let chord = test_chord();
+        *chord.predecessor.write().await = Some("pred".to_string());
+        *chord.predecessor_address.write().await = Some("addr".to_string());
+
+        chord.check_predecessor(true);
+        let pred = chord.predecessor.read().await;
+        assert!(pred.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_check_predecessor_dead_clears_predecessor() {
+        let chord = test_chord();
+        *chord.predecessor.write().await = Some("pred".to_string());
+        *chord.predecessor_address.write().await = Some("addr".to_string());
+
+        chord.check_predecessor(false);
+        let pred = chord.predecessor.read().await;
+        assert!(pred.is_none());
+        let pred_addr = chord.predecessor_address.read().await;
+        assert!(pred_addr.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_find_successor_returns_self_when_owner() {
+        let chord = test_chord();
+        *chord.predecessor.write().await = Some("pred".to_string());
+
+        let result = chord.handle_find_successor(chord.id);
+        assert!(result.is_some());
+        let (id, _) = result.unwrap();
+        assert_eq!(id, chord.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_handle_find_successor_falls_back_to_successor() {
+        let chord = test_chord();
+        chord.set_successor("node1", "127.0.0.1:5001");
+
+        let result = chord.handle_find_successor(chord.id + 1000);
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_run_stabilize_completes() {
+        let chord = test_chord();
+        chord.set_successor("succ-node", "127.0.0.1:5001");
+
+        chord
+            .run_stabilize(|_, _| Some(("pred-of-succ".to_string(), "127.0.0.1:6000".to_string())))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_fix_next_finger_returns_true() {
+        let chord = test_chord();
+        chord.set_successor("node1", "addr1");
+
+        let result = chord.fix_next_finger(|_| None);
+        assert!(result);
+
+        let next = chord.next_finger.load(Ordering::Relaxed);
+        assert_eq!(next, 1);
+    }
+
     #[tokio::test]
     async fn test_replicas_for_chord_id_returns_addresses() {
         let chord = test_chord();

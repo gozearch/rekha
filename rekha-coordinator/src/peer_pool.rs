@@ -195,3 +195,44 @@ impl PeerPool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_peer_pool_new_creates_empty_pool() {
+        let pool = PeerPool::new();
+        let addresses = pool.peer_addresses().await;
+        assert!(addresses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_peer_pool_default_creates_empty_pool() {
+        let pool = PeerPool::default();
+        let addresses = pool.peer_addresses().await;
+        assert!(addresses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_peer_addresses_empty_when_no_peers() {
+        let pool = PeerPool::new();
+        let addresses = pool.peer_addresses().await;
+        assert_eq!(addresses.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_record_error_returns_zero_for_unknown_peer() {
+        let pool = PeerPool::new();
+        let error_count = pool.record_error("unknown_peer").await;
+        assert_eq!(error_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_evict_unknown_peer_does_not_panic() {
+        let pool = PeerPool::new();
+        pool.evict("unknown_peer").await;
+        let addresses = pool.peer_addresses().await;
+        assert!(addresses.is_empty());
+    }
+}

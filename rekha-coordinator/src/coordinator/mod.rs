@@ -447,4 +447,117 @@ mod tests {
             "create_collection should skip replicas with empty addresses"
         );
     }
+
+    #[tokio::test]
+    async fn test_list_collections() {
+        let (_dir, coord) = setup_coordinator().await;
+        coord.initialize().await.unwrap();
+
+        let config = IvfConfig {
+            dim: 4,
+            nlist: 2,
+            nprobe: 2,
+            pq_m: 2,
+            pq_k: 4,
+            replication_factor: 3,
+            distance_metric: DistanceMetric::L2,
+        };
+        coord
+            .create_collection(
+                "test1",
+                config.clone(),
+                "node1",
+                0,
+                ConsistencyLevel::Quorum,
+                false,
+            )
+            .await
+            .unwrap();
+        coord
+            .create_collection(
+                "test2",
+                config.clone(),
+                "node1",
+                0,
+                ConsistencyLevel::Quorum,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let collections = coord.list_collections().await.unwrap();
+        assert!(collections.contains(&"default".to_string()));
+        assert!(collections.contains(&"test1".to_string()));
+        assert!(collections.contains(&"test2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_collection_exists_returns_false_for_nonexistent() {
+        let (_dir, coord) = setup_coordinator().await;
+        coord.initialize().await.unwrap();
+        let exists = coord.collection_exists("nonexistent").await.unwrap();
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn test_gc_collection_empty() {
+        let (_dir, coord) = setup_coordinator().await;
+        coord.initialize().await.unwrap();
+        let gc_count = coord.gc_collection("default").await.unwrap();
+        assert_eq!(gc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_index_nonexistent_collection() {
+        let (_dir, coord) = setup_coordinator().await;
+        coord.initialize().await.unwrap();
+        let result = coord.rebuild_index("nonexistent").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_index_not_enough_vectors() {
+        let (_dir, coord) = setup_coordinator().await;
+        coord.initialize().await.unwrap();
+
+        let config = IvfConfig {
+            dim: 4,
+            nlist: 2,
+            nprobe: 2,
+            pq_m: 2,
+            pq_k: 4,
+            replication_factor: 3,
+            distance_metric: DistanceMetric::L2,
+        };
+        coord
+            .create_collection(
+                "small",
+                config.clone(),
+                "node1",
+                0,
+                ConsistencyLevel::Quorum,
+                false,
+            )
+            .await
+            .unwrap();
+
+        coord
+            .insert(
+                "small",
+                1,
+                vec![0.1, 0.2, 0.3, 0.4],
+                None,
+                1000,
+                "node1",
+                ConsistencyLevel::One,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let result = coord.rebuild_index("small").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not enough vectors"));
+    }
 }

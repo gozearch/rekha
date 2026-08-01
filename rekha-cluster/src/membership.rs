@@ -174,4 +174,89 @@ mod tests {
             "should return up to 2 non-self replicas"
         );
     }
+
+    #[tokio::test]
+    async fn test_mark_alive() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.mark_dead("node1");
+        assert!(!m.get_peer("node1").unwrap().is_alive);
+        m.mark_alive("node1");
+        assert!(m.get_peer("node1").unwrap().is_alive);
+    }
+
+    #[tokio::test]
+    async fn test_alive_peers() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.add_peer("node2", "127.0.0.1:5002");
+        m.mark_dead("node1");
+        let alive = m.alive_peers();
+        assert_eq!(alive.len(), 1);
+        assert_eq!(alive[0].node_id, "node2");
+    }
+
+    #[tokio::test]
+    async fn test_all_peers() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.add_peer("node2", "127.0.0.1:5002");
+        m.mark_dead("node1");
+        let all = m.all_peers();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_check_timeouts_marks_dead() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.add_peer("node2", "127.0.0.1:5002");
+        m.check_timeouts(5000);
+        assert!(m.get_peer("node1").unwrap().is_alive);
+        assert!(m.get_peer("node2").unwrap().is_alive);
+    }
+
+    #[tokio::test]
+    async fn test_check_timeouts_with_zero_timeout() {
+        let m = Membership::new("self", 0);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.check_timeouts(0);
+        assert!(!m.get_peer("node1").unwrap().is_alive);
+    }
+
+    #[tokio::test]
+    async fn test_handle_heartbeat_new_peer() {
+        let m = Membership::new("self", 5000);
+        m.handle_heartbeat("node1", "127.0.0.1:5001").await;
+        assert!(m.get_peer("node1").is_some());
+        assert!(m.get_peer("node1").unwrap().is_alive);
+    }
+
+    #[tokio::test]
+    async fn test_handle_heartbeat_existing_peer() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.mark_dead("node1");
+        assert!(!m.get_peer("node1").unwrap().is_alive);
+        m.handle_heartbeat("node1", "127.0.0.1:5001").await;
+        assert!(m.get_peer("node1").unwrap().is_alive);
+    }
+
+    #[tokio::test]
+    async fn test_handle_peer_leaving() {
+        let m = Membership::new("self", 5000);
+        m.add_peer("node1", "127.0.0.1:5001");
+        m.add_peer("node2", "127.0.0.1:5002");
+        m.rebuild_ring().await;
+        m.handle_peer_leaving("node1").await;
+        assert!(m.get_peer("node1").is_none());
+        let replicas = m.replicas_for(42, 2).await;
+        assert!(replicas.iter().all(|n| n != "node1"));
+    }
+
+    #[tokio::test]
+    async fn test_self_id() {
+        let m = Membership::new("myid", 5000);
+        assert_eq!(m.self_id(), "myid");
+    }
 }

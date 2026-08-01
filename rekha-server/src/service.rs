@@ -700,4 +700,74 @@ mod tests {
         let status = map_err(e);
         assert_eq!(status.code(), tonic::Code::Internal);
     }
+
+    #[test]
+    fn test_map_error_timeout() {
+        let e = RekhaError::Timeout("timed out".into());
+        let status = map_err(e);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    }
+
+    #[test]
+    fn test_map_error_unavailable() {
+        let e = RekhaError::Unavailable("unavailable".into());
+        let status = map_err(e);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn test_map_error_storage() {
+        let e = RekhaError::Storage("disk error".into());
+        let status = map_err(e);
+        assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_map_error_serialization() {
+        let e = RekhaError::Serialization("serialization error".into());
+        let status = map_err(e);
+        assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_map_error_index() {
+        let e = RekhaError::Index("index error".into());
+        let status = map_err(e);
+        assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_rekha_service_new() {
+        use rekha_cluster::chord::ChordNode;
+        use rekha_cluster::Membership;
+        use rekha_coordinator::{Coordinator, PeerPool};
+        use rekha_storage::RekhaStore;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
+        let membership = Arc::new(RwLock::new(Membership::new("node1", 5000)));
+        let chord = Arc::new(ChordNode::new(
+            rekha_cluster::hash_to_chord_id(b"node1"),
+            "127.0.0.1:5001",
+        ));
+        let coord = Coordinator::new(
+            store,
+            membership,
+            1,
+            "node1".to_string(),
+            true,
+            3600,
+            rekha_core::ConsistencyLevel::Quorum,
+            3,
+            chord,
+            Arc::new(PeerPool::new()),
+            86400,
+        );
+
+        let service = RekhaService::new(Arc::new(coord));
+        let _ = &service.coordinator;
+    }
 }

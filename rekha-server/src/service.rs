@@ -1,511 +1,678 @@
-use rekha_core::{NodeInfo, NodeStatus, Payload, RekhaError, SearchParams, VectorStoreBackend};
+use std::pin::Pin;
 use std::sync::Arc;
-use tonic::{Request, Response, Status};
-use tracing::info;
 
-use crate::coordinator::Coordinator;
-use crate::proto::{
-    self, rekha_server::Rekha, AppendEntriesRequest, CollectionExistsRequest,
-    CollectionExistsResponse, CreateCollectionRequest, CreateCollectionResponse, DeleteRequest,
-    DeleteResponse, DropCollectionRequest, DropCollectionResponse, FetchRequest, FetchResponse,
-    HandshakeRequest, HandshakeResponse, HeartbeatRequest, HeartbeatResponse, InsertBatchResponse,
-    InsertRequest, InsertResponse, ListCollectionsRequest, ListCollectionsResponse, RaftAck,
-    RaftSnapshotChunk, RaftVoteRequest, RaftVoteResponse, ScoredPoint, SearchRequest,
-    SearchResponse, TransferRequest, TransferResponse,
-};
-use rekha_core::RaftError;
+use futures::Stream;
+use rekha_coordinator::Coordinator;
+use rekha_core::{ConsistencyLevel, IvfConfig, RekhaError, SearchParams};
+use rekha_proto::proto::{self, rekha_server::Rekha};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
-/// gRPC service implementation for the Rekha distributed vector database.
+use crate::metrics;
+
 pub struct RekhaService {
-    coordinator: Arc<Coordinator>,
+    pub coordinator: Arc<Coordinator>,
 }
 
 impl RekhaService {
     pub fn new(coordinator: Arc<Coordinator>) -> Self {
-        Self { coordinator }
+        RekhaService { coordinator }
     }
+}
 
-    /// Map internal RekhaError to gRPC Status.
-    pub fn map_error(e: RekhaError) -> Status {
-        match &e {
-            RekhaError::NotFound(_) => Status::not_found(e.to_string()),
-            RekhaError::InvalidArgument(_) => Status::invalid_argument(e.to_string()),
-            RekhaError::IndexFull { .. } => Status::resource_exhausted(e.to_string()),
-            RekhaError::InvalidDimension { .. } => Status::invalid_argument(e.to_string()),
-            RekhaError::Timeout { .. } => Status::deadline_exceeded(e.to_string()),
-            RekhaError::Unavailable { .. } => Status::unavailable(e.to_string()),
-            RekhaError::Consensus(rekha_core::RaftError::NotLeader { .. }) => {
-                Status::failed_precondition(e.to_string())
-            }
-            RekhaError::Consensus(_) => Status::internal(e.to_string()),
-            _ => Status::internal(e.to_string()),
-        }
+fn map_err(e: RekhaError) -> Status {
+    match e {
+        RekhaError::NotFound(_) => Status::not_found(e.to_string()),
+        RekhaError::InvalidArgument(_) => Status::invalid_argument(e.to_string()),
+        RekhaError::Timeout(_) => Status::deadline_exceeded(e.to_string()),
+        RekhaError::Unavailable(_) => Status::unavailable(e.to_string()),
+        _ => Status::internal(e.to_string()),
     }
 }
 
 #[tonic::async_trait]
 impl Rekha for RekhaService {
-    // ── Insert ────────────────────────────────────────────────
-    async fn insert(
+    async fn create_collection(
         &self,
-        request: Request<InsertRequest>,
-    ) -> Result<Response<InsertResponse>, Status> {
+        request: Request<proto::CreateCollectionRequest>,
+    ) -> Result<Response<proto::CreateCollectionResponse>, Status> {
         let req = request.into_inner();
-        let payload = req.payload.map(|p| Payload {
-            content_type: match p.content_type.as_str() {
-                "json" => rekha_core::PayloadType::Json,
-                "text" => rekha_core::PayloadType::Text,
-                _ => rekha_core::PayloadType::Raw,
-            },
-            data: p.data,
+        let config: IvfConfig = req.config.map(IvfConfig::from).unwrap_or_default();
+        let consistency = ConsistencyLevel::from(req.consistency());
+        match self
+            .coordinator
+            .create_collection(
+                &req.name,
+                config,
+                &req.origin_node_id,
+                req.timestamp as i64,
+                consistency,
+                req.is_replication,
+            )
+            .await
+        {
+            Ok(_) => Ok(Response::new(proto::CreateCollectionResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(proto::CreateCollectionResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn drop_collection(
+        &self,
+        request: Request<proto::DropCollectionRequest>,
+    ) -> Result<Response<proto::DropCollectionResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = ConsistencyLevel::from(req.consistency());
+        match self
+            .coordinator
+            .drop_collection(
+                &req.name,
+                &req.origin_node_id,
+                req.timestamp as i64,
+                consistency,
+                req.is_replication,
+            )
+            .await
+        {
+            Ok(_) => Ok(Response::new(proto::DropCollectionResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(proto::DropCollectionResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn list_collections(
+        &self,
+        _request: Request<proto::ListCollectionsRequest>,
+    ) -> Result<Response<proto::ListCollectionsResponse>, Status> {
+        let names = self.coordinator.list_collections().await.map_err(map_err)?;
+        let mut collections = Vec::new();
+        for name in &names {
+            let config = self.coordinator.store.load_collection_config(name).ok();
+            let info = proto::CollectionInfo {
+                name: name.clone(),
+                config: config.map(proto::CollectionConfig::from),
+                vector_count: 0,
+                index_ready: true,
+                config_timestamp: 0,
+            };
+            collections.push(info);
+        }
+        Ok(Response::new(proto::ListCollectionsResponse {
+            collections,
+        }))
+    }
+
+    async fn collection_exists(
+        &self,
+        request: Request<proto::CollectionExistsRequest>,
+    ) -> Result<Response<proto::CollectionExistsResponse>, Status> {
+        let req = request.into_inner();
+        let exists = self
+            .coordinator
+            .collection_exists(&req.name)
+            .await
+            .map_err(map_err)?;
+        Ok(Response::new(proto::CollectionExistsResponse { exists }))
+    }
+
+    async fn import(
+        &self,
+        request: Request<tonic::Streaming<proto::ImportChunk>>,
+    ) -> Result<Response<proto::ImportResponse>, Status> {
+        let mut stream = request.into_inner();
+        let mut inserted = 0u64;
+        let mut errors = Vec::new();
+
+        while let Some(chunk) = stream.message().await.unwrap_or(None) {
+            for req in chunk.requests {
+                let consistency: ConsistencyLevel = req.consistency().into();
+                let payload = req.payload.map(|p| p.data);
+                match self
+                    .coordinator
+                    .insert(
+                        &req.collection_name,
+                        req.id,
+                        req.vector,
+                        payload,
+                        req.timestamp as i64,
+                        &req.origin_node_id,
+                        consistency,
+                        req.is_replication,
+                    )
+                    .await
+                {
+                    Ok(_) => inserted += 1,
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+        }
+
+        Ok(Response::new(proto::ImportResponse {
+            inserted_count: inserted,
+            errors,
+        }))
+    }
+
+    type ExportStream = Pin<Box<dyn Stream<Item = Result<proto::ExportChunk, Status>> + Send>>;
+
+    async fn export(
+        &self,
+        request: Request<proto::ExportRequest>,
+    ) -> Result<Response<Self::ExportStream>, Status> {
+        let req = request.into_inner();
+
+        let mut rx = self.coordinator.export_stream(
+            &req.collection_name,
+            req.offset,
+            req.limit,
+            req.include_vectors,
+            req.include_payloads,
+            500,
+        );
+
+        let (tx, out_rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(batch_result) = rx.recv().await {
+                match batch_result {
+                    Ok(vectors) => {
+                        let chunk = proto::ExportChunk {
+                            vectors: vectors
+                                .into_iter()
+                                .map(|v| proto::ExportedVector {
+                                    id: v.id,
+                                    vector: v.vector,
+                                    payload: v.payload.map(|data| proto::Payload {
+                                        content_type: "application/octet-stream".into(),
+                                        data,
+                                    }),
+                                    timestamp: v.timestamp,
+                                })
+                                .collect(),
+                        };
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(map_err(e))).await;
+                        break;
+                    }
+                }
+            }
         });
 
-        let result = self.coordinator.insert(req.id, req.vector, payload).await;
-        if let Err(ref e) = result {
-            if let RekhaError::Consensus(RaftError::NotLeader {
-                leader_hint: Some(leader_id),
-            }) = e
-            {
-                let addr = self.coordinator.peer_address(leader_id).await;
-                let detail = match addr {
-                    Some(a) => format!("not leader, try {leader_id}@{a}"),
-                    None => format!("not leader, try {leader_id}"),
-                };
-                return Err(Status::failed_precondition(detail));
-            }
-            return Err(Self::map_error(e.clone()));
-        }
-        let actual_id = result.unwrap();
+        Ok(Response::new(
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx)) as Self::ExportStream,
+        ))
+    }
 
-        Ok(Response::new(InsertResponse {
-            id: actual_id,
-            success: true,
-            error: String::new(),
-        }))
+    async fn insert(
+        &self,
+        request: Request<proto::InsertRequest>,
+    ) -> Result<Response<proto::InsertResponse>, Status> {
+        let _timer = metrics::TimerGuard::new("insert");
+        metrics::record_insert();
+        let req = request.into_inner();
+        let consistency = ConsistencyLevel::from(req.consistency());
+        let payload = req.payload.map(|p| p.data);
+        match self
+            .coordinator
+            .insert(
+                &req.collection_name,
+                req.id,
+                req.vector,
+                payload,
+                req.timestamp as i64,
+                &req.origin_node_id,
+                consistency,
+                req.is_replication,
+            )
+            .await
+        {
+            Ok(_) => Ok(Response::new(proto::InsertResponse {
+                id: req.id,
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(proto::InsertResponse {
+                id: req.id,
+                success: false,
+                error: e.to_string(),
+            })),
+        }
     }
 
     async fn insert_batch(
         &self,
-        request: Request<tonic::Streaming<InsertRequest>>,
-    ) -> Result<Response<InsertBatchResponse>, Status> {
+        request: Request<tonic::Streaming<proto::InsertRequest>>,
+    ) -> Result<Response<proto::InsertBatchResponse>, Status> {
         let mut stream = request.into_inner();
         let mut count = 0u64;
         let mut errors = Vec::new();
-
-        while let Some(item) = stream.message().await? {
-            let payload = item.payload.map(|p| Payload {
-                content_type: match p.content_type.as_str() {
-                    "json" => rekha_core::PayloadType::Json,
-                    "text" => rekha_core::PayloadType::Text,
-                    _ => rekha_core::PayloadType::Raw,
-                },
-                data: p.data,
-            });
-
-            match self.coordinator.insert(item.id, item.vector, payload).await {
-                Ok(_actual_id) => count += 1,
-                Err(e) => errors.push(format!("id {}: {}", item.id, e)),
+        while let Some(req) = stream.message().await.unwrap_or(None) {
+            let consistency = ConsistencyLevel::from(req.consistency());
+            let payload = req.payload.map(|p| p.data);
+            match self
+                .coordinator
+                .insert(
+                    &req.collection_name,
+                    req.id,
+                    req.vector,
+                    payload,
+                    req.timestamp as i64,
+                    &req.origin_node_id,
+                    consistency,
+                    req.is_replication,
+                )
+                .await
+            {
+                Ok(_) => count += 1,
+                Err(e) => errors.push(e.to_string()),
             }
         }
-
-        Ok(Response::new(InsertBatchResponse {
+        Ok(Response::new(proto::InsertBatchResponse {
             inserted_count: count,
             errors,
         }))
     }
 
-    // ── Delete ────────────────────────────────────────────────
     async fn delete(
         &self,
-        request: Request<DeleteRequest>,
-    ) -> Result<Response<DeleteResponse>, Status> {
+        request: Request<proto::DeleteRequest>,
+    ) -> Result<Response<proto::DeleteResponse>, Status> {
+        let _timer = metrics::TimerGuard::new("delete");
+        metrics::record_delete();
         let req = request.into_inner();
-        let deleted = self
-            .coordinator
-            .store()
-            .delete(&req.ids)
-            .map_err(Self::map_error)?;
-
-        Ok(Response::new(DeleteResponse {
-            deleted_count: deleted,
-            error: String::new(),
-        }))
-    }
-
-    // ── Fetch ─────────────────────────────────────────────────
-    async fn fetch(
-        &self,
-        request: Request<FetchRequest>,
-    ) -> Result<Response<FetchResponse>, Status> {
-        let req = request.into_inner();
-        let mut vectors = Vec::new();
-        let mut points = Vec::new();
-
-        for id in &req.ids {
-            match self.coordinator.store().get_vector(*id) {
-                Ok(Some(data)) => {
-                    vectors.push(proto::Vector { id: *id, data });
-                    if req.include_payloads {
-                        let payload = self.coordinator.store().get_payload(*id).ok().flatten();
-                        points.push(ScoredPoint {
-                            id: *id,
-                            score: 0.0,
-                            payload: payload.map(|data| proto::Payload {
-                                content_type: "raw".into(),
-                                data,
-                            }),
-                        });
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(Status::internal(format!("fetch error: {e}")));
-                }
-            }
-        }
-
-        Ok(Response::new(FetchResponse {
-            vectors,
-            points,
-            error: String::new(),
-        }))
-    }
-
-    // ── Search ────────────────────────────────────────────────
-    async fn search(
-        &self,
-        request: Request<SearchRequest>,
-    ) -> Result<Response<SearchResponse>, Status> {
-        let req = request.into_inner();
-        let params = req.params.unwrap_or_default();
-
-        let search_params = SearchParams {
-            ef_search: params.ef_search as usize,
-            beam_width: params.beam_width as usize,
-            include_payloads: params.include_payloads,
-            partition_hint: params.partition_hint,
-            local_only: req.local_only,
-        };
-
+        let consistency = ConsistencyLevel::from(req.consistency());
         match self
             .coordinator
-            .search(req.query_vector, req.top_k as usize, search_params)
+            .delete(
+                &req.collection_name,
+                &req.ids,
+                req.timestamp as i64,
+                &req.origin_node_id,
+                consistency,
+                req.is_replication,
+            )
             .await
         {
-            Ok((results, stats)) => {
-                let points: Vec<ScoredPoint> = results
-                    .into_iter()
-                    .map(|r| ScoredPoint {
-                        id: r.id,
-                        score: r.score,
-                        payload: r.payload.map(|p| proto::Payload {
-                            content_type: p.content_type.to_string(),
-                            data: p.data,
-                        }),
-                    })
-                    .collect();
-
-                Ok(Response::new(SearchResponse {
-                    results: points,
-                    stats: Some(proto::SearchStats {
-                        total_ms: stats.total_ms,
-                        nodes_contacted: stats.nodes_contacted,
-                        vectors_scanned: stats.vectors_scanned,
-                        warnings: stats.warnings,
-                    }),
-                }))
-            }
-            Err(e) => Err(Self::map_error(e)),
+            Ok(deleted) => Ok(Response::new(proto::DeleteResponse {
+                deleted_count: deleted,
+                error: String::new(),
+                timestamp: req.timestamp,
+            })),
+            Err(e) => Ok(Response::new(proto::DeleteResponse {
+                deleted_count: 0,
+                error: e.to_string(),
+                timestamp: req.timestamp,
+            })),
         }
     }
 
-    // ── Search Stream ─────────────────────────────────────────
-    type SearchStreamStream = ReceiverStream<Result<ScoredPoint, Status>>;
+    async fn fetch(
+        &self,
+        request: Request<proto::FetchRequest>,
+    ) -> Result<Response<proto::FetchResponse>, Status> {
+        let req = request.into_inner();
+        let points = self
+            .coordinator
+            .fetch(&req.collection_name, &req.ids, req.include_payloads)
+            .await
+            .map_err(map_err)?;
+        let proto_points: Vec<proto::ScoredPoint> = points
+            .into_iter()
+            .map(|sp| proto::ScoredPoint {
+                id: sp.id,
+                score: sp.score,
+                payload: sp.payload.map(|data| proto::Payload {
+                    content_type: "application/octet-stream".into(),
+                    data,
+                }),
+                timestamp: sp.timestamp as u64,
+            })
+            .collect();
+        Ok(Response::new(proto::FetchResponse {
+            vectors: vec![],
+            points: proto_points,
+            error: String::new(),
+        }))
+    }
+
+    async fn search(
+        &self,
+        request: Request<proto::SearchRequest>,
+    ) -> Result<Response<proto::SearchResponse>, Status> {
+        let _timer = metrics::TimerGuard::new("search");
+        metrics::record_search();
+        let req = request.into_inner();
+        let params = req.params.unwrap_or_default();
+        let search_params = SearchParams {
+            nprobe: params.nprobe,
+            k: req.top_k,
+            include_payloads: params.include_payloads,
+            pre_filter: None,
+            local_only: req.local_only,
+        };
+        match self
+            .coordinator
+            .search(
+                &req.collection_name,
+                req.query_vector,
+                req.top_k,
+                search_params,
+            )
+            .await
+        {
+            Ok(results) => {
+                let proto_results: Vec<proto::ScoredPoint> = results
+                    .into_iter()
+                    .map(|sp| proto::ScoredPoint {
+                        id: sp.id,
+                        score: sp.score,
+                        payload: sp.payload.map(|data| proto::Payload {
+                            content_type: "application/octet-stream".into(),
+                            data,
+                        }),
+                        timestamp: sp.timestamp as u64,
+                    })
+                    .collect();
+                Ok(Response::new(proto::SearchResponse {
+                    results: proto_results,
+                    stats: Some(proto::SearchStats::default()),
+                }))
+            }
+            Err(e) => Err(map_err(e)),
+        }
+    }
+
+    type SearchStreamStream =
+        Pin<Box<dyn Stream<Item = Result<proto::ScoredPoint, Status>> + Send>>;
 
     async fn search_stream(
         &self,
-        request: Request<SearchRequest>,
+        request: Request<proto::SearchRequest>,
     ) -> Result<Response<Self::SearchStreamStream>, Status> {
         let req = request.into_inner();
         let params = req.params.unwrap_or_default();
-
         let search_params = SearchParams {
-            ef_search: params.ef_search as usize,
-            beam_width: params.beam_width as usize,
+            nprobe: params.nprobe,
+            k: req.top_k,
             include_payloads: params.include_payloads,
-            partition_hint: params.partition_hint,
+            pre_filter: None,
             local_only: req.local_only,
         };
+        let results = self
+            .coordinator
+            .search(
+                &req.collection_name,
+                req.query_vector,
+                req.top_k,
+                search_params,
+            )
+            .await
+            .map_err(map_err)?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-        let coordinator = self.coordinator.clone();
-
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
-            match coordinator
-                .search(req.query_vector, req.top_k as usize, search_params.clone())
-                .await
-            {
-                Ok((results, _stats)) => {
-                    for r in results {
-                        let point = ScoredPoint {
-                            id: r.id,
-                            score: r.score,
-                            payload: r.payload.map(|p| proto::Payload {
-                                content_type: p.content_type.to_string(),
-                                data: p.data,
-                            }),
-                        };
-                        if tx.send(Ok(point)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+            for sp in results {
+                let proto_sp = proto::ScoredPoint {
+                    id: sp.id,
+                    score: sp.score,
+                    payload: sp.payload.map(|data| proto::Payload {
+                        content_type: "application/octet-stream".into(),
+                        data,
+                    }),
+                    timestamp: sp.timestamp as u64,
+                };
+                if tx.send(Ok(proto_sp)).await.is_err() {
+                    break;
                 }
             }
         });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::SearchStreamStream
+        ))
     }
 
-    // ── Cluster Management ────────────────────────────────────
+    async fn search_dim_range(
+        &self,
+        _request: Request<proto::SearchDimRangeRequest>,
+    ) -> Result<Response<proto::SearchDimRangeResponse>, Status> {
+        Err(Status::unimplemented("dim range search not implemented"))
+    }
+
     async fn handshake(
         &self,
-        request: Request<HandshakeRequest>,
-    ) -> Result<Response<HandshakeResponse>, Status> {
+        request: Request<proto::HandshakeRequest>,
+    ) -> Result<Response<proto::HandshakeResponse>, Status> {
         let req = request.into_inner();
-        info!("Handshake from node {} at {}", req.node_id, req.address);
+        let membership = self.coordinator.membership.read().await;
+        membership
+            .handle_heartbeat(&req.node_id, &req.address)
+            .await;
 
-        // Register the requester as a peer.
-        let peer_info = NodeInfo {
-            node_id: req.node_id.clone(),
-            address: req.address.clone(),
-            partition_id: 0,
-            dim_groups: (0..self.coordinator.config_ref().partition.num_dim_groups).collect(),
-            is_leader: false,
-            raft_term: 0,
-            commit_index: 0,
-            storage_bytes: 0,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        self.coordinator.register_peer(peer_info).await;
+        let mut sl = self.coordinator.chord.successor_list.write().await;
+        if !sl.contains(&req.node_id) {
+            sl.push(req.node_id.clone());
+            self.coordinator
+                .chord
+                .successor_addresses
+                .write()
+                .await
+                .push(req.address.clone());
+        }
+        drop(sl);
 
-        // Return known peers list (minus the requester).
-        let peers = self.coordinator.peers_for_handshake(&req.node_id).await;
-        let proto_peers = peers
-            .into_iter()
-            .map(|n| crate::proto::NodeInfo {
-                node_id: n.node_id,
-                address: n.address,
-                partition_id: n.partition_id,
-                dim_groups: n.dim_groups,
-                is_leader: n.is_leader,
-                raft_term: n.raft_term,
-                commit_index: n.commit_index,
-                storage_bytes: n.storage_bytes,
-                status: format!("{:?}", n.status).to_lowercase(),
+        let peers: Vec<proto::NodeInfo> = membership
+            .all_peers()
+            .iter()
+            .map(|n| proto::NodeInfo {
+                node_id: n.node_id.clone(),
+                address: n.address.clone(),
+                partition_id: 0,
+                dim_groups: vec![],
+                storage_bytes: 0,
+                status: if n.is_alive {
+                    "alive".to_string()
+                } else {
+                    "dead".to_string()
+                },
             })
             .collect();
+        drop(membership);
 
-        Ok(Response::new(HandshakeResponse {
-            cluster_id: self.coordinator.cluster_id().into(),
-            peers: proto_peers,
+        Ok(Response::new(proto::HandshakeResponse {
+            cluster_id: "rekha-cluster".to_string(),
+            peers,
             error: String::new(),
         }))
     }
 
     async fn heartbeat(
         &self,
-        request: Request<HeartbeatRequest>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
+        request: Request<proto::HeartbeatRequest>,
+    ) -> Result<Response<proto::HeartbeatResponse>, Status> {
         let req = request.into_inner();
-        let local = self.coordinator.local_node_info();
+        let membership = self.coordinator.membership.read().await;
+        membership
+            .handle_heartbeat(&req.node_id, &req.address)
+            .await;
 
-        // Register/update the sender.
-        let peer_info = NodeInfo {
-            node_id: req.node_id.clone(),
-            address: req.address.clone(),
-            partition_id: 0,
-            dim_groups: Vec::new(),
-            is_leader: false,
-            raft_term: req.raft_term,
-            commit_index: req.commit_index,
-            storage_bytes: req.storage_bytes,
-            status: NodeStatus::Healthy,
-            last_heartbeat: 0,
-        };
-        self.coordinator.register_peer(peer_info).await;
+        let mut sl = self.coordinator.chord.successor_list.write().await;
+        if !sl.contains(&req.node_id) {
+            sl.push(req.node_id.clone());
+            self.coordinator
+                .chord
+                .successor_addresses
+                .write()
+                .await
+                .push(req.address.clone());
+        }
 
-        Ok(Response::new(HeartbeatResponse {
-            success: true,
-            leader_hint: if local.is_leader {
-                local.node_id
-            } else {
-                String::new()
-            },
-            leader_term: local.raft_term,
-        }))
+        Ok(Response::new(proto::HeartbeatResponse { success: true }))
     }
+
+    type TransferShardStream =
+        Pin<Box<dyn Stream<Item = Result<proto::TransferShardChunk, Status>> + Send>>;
 
     async fn transfer_shard(
         &self,
-        _request: Request<TransferRequest>,
-    ) -> Result<Response<TransferResponse>, Status> {
-        Ok(Response::new(TransferResponse {
-            success: false,
-            transferred_count: 0,
-            error: "not implemented".into(),
+        request: Request<proto::TransferShardRequest>,
+    ) -> Result<Response<Self::TransferShardStream>, Status> {
+        let req = request.into_inner();
+        let mut rx = self
+            .coordinator
+            .transfer_shard_stream(&req.collection_name, 500);
+
+        let (tx, out_rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(chunk_result) = rx.recv().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(map_err(e))).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx))
+                as Self::TransferShardStream,
+        ))
+    }
+
+    type RepairCollectionStream =
+        Pin<Box<dyn Stream<Item = Result<proto::RepairProgress, Status>> + Send>>;
+
+    async fn repair_collection(
+        &self,
+        request: Request<proto::RepairCollectionRequest>,
+    ) -> Result<Response<Self::RepairCollectionStream>, Status> {
+        let req = request.into_inner();
+        let progress = self
+            .coordinator
+            .repair_collection(&req.collection_name)
+            .await
+            .map_err(map_err)?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(progress)).await;
+        });
+
+        Ok(Response::new(
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+                as Self::RepairCollectionStream,
+        ))
+    }
+
+    async fn find_successor(
+        &self,
+        request: Request<proto::FindSuccessorRequest>,
+    ) -> Result<Response<proto::FindSuccessorResponse>, Status> {
+        let req = request.into_inner();
+        let id_bytes: [u8; 16] = req
+            .id
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("id must be 16 bytes"))?;
+        let id = u128::from_le_bytes(id_bytes);
+        let result = self.coordinator.chord.handle_find_successor(id);
+        match result {
+            Some((node_id, address)) => Ok(Response::new(proto::FindSuccessorResponse {
+                successor: Some(proto::NodeInfo {
+                    node_id,
+                    address,
+                    partition_id: 0,
+                    dim_groups: vec![],
+                    storage_bytes: 0,
+                    status: "alive".to_string(),
+                }),
+            })),
+            None => Ok(Response::new(proto::FindSuccessorResponse {
+                successor: Some(proto::NodeInfo {
+                    node_id: self.coordinator.node_id_str.clone(),
+                    address: String::new(),
+                    partition_id: 0,
+                    dim_groups: vec![],
+                    storage_bytes: 0,
+                    status: "alive".to_string(),
+                }),
+            })),
+        }
+    }
+
+    async fn get_predecessor(
+        &self,
+        _request: Request<proto::GetPredecessorRequest>,
+    ) -> Result<Response<proto::GetPredecessorResponse>, Status> {
+        let pred = self.coordinator.chord.predecessor.read().await;
+        let pred_addr = self.coordinator.chord.predecessor_address.read().await;
+        let pred_info = match (pred.as_ref(), pred_addr.as_ref()) {
+            (Some(id), Some(addr)) => Some(proto::NodeInfo {
+                node_id: id.clone(),
+                address: addr.clone(),
+                partition_id: 0,
+                dim_groups: vec![],
+                storage_bytes: 0,
+                status: "alive".to_string(),
+            }),
+            _ => None,
+        };
+        Ok(Response::new(proto::GetPredecessorResponse {
+            predecessor: pred_info,
         }))
     }
 
-    // ── Raft ──────────────────────────────────────────────────
-    async fn raft_append_entries(
+    async fn notify_chord(
         &self,
-        request: Request<AppendEntriesRequest>,
-    ) -> Result<Response<RaftAck>, Status> {
+        request: Request<proto::NotifyChordRequest>,
+    ) -> Result<Response<proto::NotifyChordResponse>, Status> {
         let req = request.into_inner();
+        let node = req
+            .node
+            .ok_or_else(|| Status::invalid_argument("node required"))?;
+        let accepted = self.coordinator.chord.notify(&node.node_id, &node.address);
+        Ok(Response::new(proto::NotifyChordResponse {
+            success: accepted,
+        }))
+    }
 
-        // Find the Raft node for this partition.
-        let raft_node = self
-            .coordinator
-            .raft_node(req.partition_id)
-            .ok_or_else(|| Status::not_found("no raft node for partition"))?;
-
-        // Convert proto entries to RaftLogEntry.
-        let entries: Vec<_> = req
-            .entries
-            .into_iter()
-            .map(|e| rekha_raft::node::RaftLogEntry {
-                term: e.term,
-                index: e.index,
-                command: proto_raft_command_to_internal(e.command.unwrap_or_default()),
+    async fn get_successor_list(
+        &self,
+        _request: Request<proto::GetSuccessorListRequest>,
+    ) -> Result<Response<proto::GetSuccessorListResponse>, Status> {
+        let successors = self.coordinator.chord.successor_list.read().await;
+        let infos: Vec<proto::NodeInfo> = successors
+            .iter()
+            .map(|id| proto::NodeInfo {
+                node_id: id.clone(),
+                address: String::new(),
+                partition_id: 0,
+                dim_groups: vec![],
+                storage_bytes: 0,
+                status: "alive".to_string(),
             })
             .collect();
-
-        match raft_node
-            .handle_append_entries(
-                req.leader_term,
-                &req.leader_id,
-                req.prev_log_index,
-                req.prev_log_term,
-                entries,
-                req.leader_commit,
-            )
-            .await
-        {
-            Ok((success, current_term)) => Ok(Response::new(RaftAck {
-                success,
-                current_term,
-                commit_index: raft_node.commit_index().await,
-                error: String::new(),
-            })),
-            Err(e) => Ok(Response::new(RaftAck {
-                success: false,
-                current_term: raft_node.current_term().await,
-                commit_index: 0,
-                error: e.to_string(),
-            })),
-        }
-    }
-
-    async fn raft_request_vote(
-        &self,
-        request: Request<RaftVoteRequest>,
-    ) -> Result<Response<RaftVoteResponse>, Status> {
-        let req = request.into_inner();
-
-        let raft_node = self
-            .coordinator
-            .raft_node(req.partition_id)
-            .ok_or_else(|| {
-                Status::not_found(format!("no raft node for partition {}", req.partition_id))
-            })?;
-
-        match raft_node
-            .handle_request_vote(
-                req.term,
-                &req.candidate_id,
-                req.last_log_index,
-                req.last_log_term,
-            )
-            .await
-        {
-            Ok((vote_granted, term)) => Ok(Response::new(RaftVoteResponse { term, vote_granted })),
-            Err(e) => Err(Self::map_error(e)),
-        }
-    }
-
-    async fn raft_install_snapshot(
-        &self,
-        _request: Request<tonic::Streaming<RaftSnapshotChunk>>,
-    ) -> Result<Response<RaftAck>, Status> {
-        Ok(Response::new(RaftAck {
-            success: true,
-            current_term: 0,
-            commit_index: 0,
-            error: String::new(),
+        Ok(Response::new(proto::GetSuccessorListResponse {
+            successors: infos,
         }))
-    }
-
-    // ── Collection Management ──────────────────────────────────
-
-    async fn create_collection(
-        &self,
-        _request: Request<CreateCollectionRequest>,
-    ) -> Result<Response<CreateCollectionResponse>, Status> {
-        Err(Status::unimplemented(
-            "create_collection not yet implemented",
-        ))
-    }
-
-    async fn drop_collection(
-        &self,
-        _request: Request<DropCollectionRequest>,
-    ) -> Result<Response<DropCollectionResponse>, Status> {
-        Err(Status::unimplemented("drop_collection not yet implemented"))
-    }
-
-    async fn list_collections(
-        &self,
-        _request: Request<ListCollectionsRequest>,
-    ) -> Result<Response<ListCollectionsResponse>, Status> {
-        Err(Status::unimplemented(
-            "list_collections not yet implemented",
-        ))
-    }
-
-    async fn collection_exists(
-        &self,
-        _request: Request<CollectionExistsRequest>,
-    ) -> Result<Response<CollectionExistsResponse>, Status> {
-        Err(Status::unimplemented(
-            "collection_exists not yet implemented",
-        ))
-    }
-}
-
-/// Convert a proto RaftCommand to the internal RaftCommand type.
-fn proto_raft_command_to_internal(
-    cmd: crate::proto::RaftCommand,
-) -> rekha_raft::state::RaftCommand {
-    use crate::proto::raft_command::Cmd;
-    match cmd.cmd {
-        Some(Cmd::Insert(insert)) => rekha_raft::state::RaftCommand::Insert {
-            id: insert.id,
-            vector: insert.vector,
-            payload: insert.payload.and_then(|p| {
-                if p.data.is_empty() {
-                    None
-                } else {
-                    Some(p.data)
-                }
-            }),
-        },
-        Some(Cmd::Delete(delete)) => rekha_raft::state::RaftCommand::Delete { ids: delete.ids },
-        Some(Cmd::Custom(_)) | None => rekha_raft::state::RaftCommand::NoOp,
     }
 }
 
@@ -515,594 +682,92 @@ mod tests {
 
     #[test]
     fn test_map_error_not_found() {
-        let err = RekhaError::NotFound("test".into());
-        let status = RekhaService::map_error(err);
+        let e = RekhaError::NotFound("test".into());
+        let status = map_err(e);
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[test]
     fn test_map_error_invalid_argument() {
-        let err = RekhaError::InvalidArgument("bad".into());
-        let status = RekhaService::map_error(err);
+        let e = RekhaError::InvalidArgument("bad".into());
+        let status = map_err(e);
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
-    fn test_map_error_index_full() {
-        let err = RekhaError::IndexFull {
-            capacity: 100,
-            attempted: 101,
-        };
-        let status = RekhaService::map_error(err);
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-    }
-
-    #[test]
-    fn test_map_error_invalid_dimension() {
-        let err = RekhaError::InvalidDimension {
-            expected: 768,
-            actual: 64,
-        };
-        let status = RekhaService::map_error(err);
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    fn test_map_error_internal() {
+        let e = RekhaError::Internal("oops".into());
+        let status = map_err(e);
+        assert_eq!(status.code(), tonic::Code::Internal);
     }
 
     #[test]
     fn test_map_error_timeout() {
-        let err = RekhaError::Timeout {
-            operation: "search",
-            elapsed_ms: 5000,
-        };
-        let status = RekhaService::map_error(err);
+        let e = RekhaError::Timeout("timed out".into());
+        let status = map_err(e);
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
     }
 
     #[test]
     fn test_map_error_unavailable() {
-        let err = RekhaError::Unavailable {
-            detail: "down".into(),
-        };
-        let status = RekhaService::map_error(err);
+        let e = RekhaError::Unavailable("unavailable".into());
+        let status = map_err(e);
         assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     #[test]
-    fn test_map_error_not_leader() {
-        let err = RekhaError::Consensus(rekha_core::RaftError::NotLeader {
-            leader_hint: Some("n2".into()),
-        });
-        let status = RekhaService::map_error(err);
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn test_map_error_internal() {
-        let err = RekhaError::Internal {
-            detail: "oops".into(),
-        };
-        let status = RekhaService::map_error(err);
+    fn test_map_error_storage() {
+        let e = RekhaError::Storage("disk error".into());
+        let status = map_err(e);
         assert_eq!(status.code(), tonic::Code::Internal);
     }
 
     #[test]
-    fn test_map_error_storage() {
-        let err = RekhaError::Storage(rekha_core::StorageError::Corruption {
-            detail: "bad".into(),
-        });
-        let status = RekhaService::map_error(err);
+    fn test_map_error_serialization() {
+        let e = RekhaError::Serialization("serialization error".into());
+        let status = map_err(e);
         assert_eq!(status.code(), tonic::Code::Internal);
     }
 
     #[test]
     fn test_map_error_index() {
-        let err = RekhaError::Index(rekha_core::IndexError::EmptyIndex);
-        let status = RekhaService::map_error(err);
+        let e = RekhaError::Index("index error".into());
+        let status = map_err(e);
         assert_eq!(status.code(), tonic::Code::Internal);
     }
 
     #[test]
-    fn test_proto_raft_command_insert() {
-        let insert = crate::proto::InsertRequest {
-            id: 42,
-            vector: vec![1.0, 2.0, 3.0],
-            payload: Some(crate::proto::Payload {
-                content_type: "raw".into(),
-                data: vec![0, 1, 2],
-            }),
-            collection_name: String::new(),
-        };
-        let proto_cmd = crate::proto::RaftCommand {
-            cmd: Some(crate::proto::raft_command::Cmd::Insert(insert)),
-        };
-        let cmd = super::proto_raft_command_to_internal(proto_cmd);
-        match cmd {
-            rekha_raft::state::RaftCommand::Insert {
-                id,
-                vector,
-                payload,
-            } => {
-                assert_eq!(id, 42);
-                assert_eq!(vector, vec![1.0, 2.0, 3.0]);
-                assert_eq!(payload, Some(vec![0, 1, 2]));
-            }
-            _ => panic!("expected Insert variant"),
-        }
-    }
+    fn test_rekha_service_new() {
+        use rekha_cluster::chord::ChordNode;
+        use rekha_cluster::Membership;
+        use rekha_coordinator::{Coordinator, PeerPool};
+        use rekha_storage::RekhaStore;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use tokio::sync::RwLock;
 
-    #[test]
-    fn test_proto_raft_command_delete() {
-        let delete = crate::proto::DeleteRequest {
-            ids: vec![1, 2, 3],
-            collection_name: String::new(),
-        };
-        let proto_cmd = crate::proto::RaftCommand {
-            cmd: Some(crate::proto::raft_command::Cmd::Delete(delete)),
-        };
-        let cmd = super::proto_raft_command_to_internal(proto_cmd);
-        match cmd {
-            rekha_raft::state::RaftCommand::Delete { ids } => {
-                assert_eq!(ids, vec![1, 2, 3]);
-            }
-            _ => panic!("expected Delete variant"),
-        }
-    }
-
-    #[test]
-    fn test_proto_raft_command_custom() {
-        let proto_cmd = crate::proto::RaftCommand {
-            cmd: Some(crate::proto::raft_command::Cmd::Custom(vec![1, 2, 3])),
-        };
-        let cmd = super::proto_raft_command_to_internal(proto_cmd);
-        assert!(matches!(cmd, rekha_raft::state::RaftCommand::NoOp));
-    }
-
-    #[test]
-    fn test_proto_raft_command_default() {
-        let proto_cmd = crate::proto::RaftCommand { cmd: None };
-        let cmd = super::proto_raft_command_to_internal(proto_cmd);
-        assert!(matches!(cmd, rekha_raft::state::RaftCommand::NoOp));
-    }
-
-    #[test]
-    fn test_proto_raft_command_insert_empty_payload() {
-        let insert = crate::proto::InsertRequest {
-            id: 1,
-            vector: vec![0.5],
-            payload: Some(crate::proto::Payload {
-                content_type: "raw".into(),
-                data: vec![], // empty payload should become None
-            }),
-            collection_name: String::new(),
-        };
-        let proto_cmd = crate::proto::RaftCommand {
-            cmd: Some(crate::proto::raft_command::Cmd::Insert(insert)),
-        };
-        let cmd = super::proto_raft_command_to_internal(proto_cmd);
-        match cmd {
-            rekha_raft::state::RaftCommand::Insert { payload, .. } => {
-                assert!(payload.is_none());
-            }
-            _ => panic!("expected Insert variant"),
-        }
-    }
-
-    #[test]
-    fn test_new_service() {
-        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/rekha_svc_test");
-        let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open("/tmp/rekha_svc_test_db").unwrap(),
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(RekhaStore::open(dir.path().to_str().unwrap()).unwrap());
+        let membership = Arc::new(RwLock::new(Membership::new("node1", 5000)));
+        let chord = Arc::new(ChordNode::new(
+            rekha_cluster::hash_to_chord_id(b"node1"),
+            "127.0.0.1:5001",
+        ));
+        let coord = Coordinator::new(
+            store,
+            membership,
+            1,
+            "node1".to_string(),
+            true,
+            3600,
+            rekha_core::ConsistencyLevel::Quorum,
+            3,
+            chord,
+            Arc::new(PeerPool::new()),
+            86400,
         );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
-        let service = RekhaService::new(coord);
-        // service is initialized; verify by checking it doesn't panic
-        let _ = service;
-    }
 
-    #[test]
-    fn test_map_error_consensus_non_leader() {
-        let err = RekhaError::Consensus(rekha_core::RaftError::LogCompaction {
-            detail: "test".into(),
-        });
-        let status = RekhaService::map_error(err);
-        assert_eq!(status.code(), tonic::Code::Internal);
-    }
-
-    #[tokio::test]
-    async fn test_insert_payload_content_types() {
-        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/svc_ct_test");
-        let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open("/tmp/svc_ct_test_db").unwrap(),
-        );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
-        let service = RekhaService::new(coord);
-
-        // Test "json" content type
-        let req = tonic::Request::new(InsertRequest {
-            id: 0,
-            vector: vec![0.1],
-            payload: Some(crate::proto::Payload {
-                content_type: "json".into(),
-                data: br#"{"key":"value"}"#.to_vec(),
-            }),
-            collection_name: "default".into(),
-        });
-        let resp = service.insert(req).await.unwrap();
-        assert!(resp.into_inner().success);
-
-        // Test "text" content type
-        let req = tonic::Request::new(InsertRequest {
-            id: 0,
-            vector: vec![0.2],
-            payload: Some(crate::proto::Payload {
-                content_type: "text".into(),
-                data: b"hello".to_vec(),
-            }),
-            collection_name: "default".into(),
-        });
-        let resp = service.insert(req).await.unwrap();
-        assert!(resp.into_inner().success);
-
-        // Test unknown content type (maps to Raw)
-        let req = tonic::Request::new(InsertRequest {
-            id: 0,
-            vector: vec![0.3],
-            payload: Some(crate::proto::Payload {
-                content_type: "protobuf".into(),
-                data: vec![0, 1, 2],
-            }),
-            collection_name: "default".into(),
-        });
-        let resp = service.insert(req).await.unwrap();
-        assert!(resp.into_inner().success);
-
-        // Test no payload (None path)
-        let req = tonic::Request::new(InsertRequest {
-            id: 0,
-            vector: vec![0.4],
-            payload: None,
-            collection_name: "default".into(),
-        });
-        let resp = service.insert(req).await.unwrap();
-        assert!(resp.into_inner().success);
-    }
-
-    #[tokio::test]
-    async fn test_search_before_init_returns_error() {
-        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/svc_search_err");
-        let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open("/tmp/svc_search_err_db").unwrap(),
-        );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
-        let service = RekhaService::new(coord);
-
-        let req = tonic::Request::new(SearchRequest {
-            query_vector: vec![0.0; 8],
-            top_k: 5,
-            collection_name: "default".into(),
-            local_only: false,
-            params: None,
-        });
-        let result = service.search(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
-    }
-
-    #[tokio::test]
-    async fn test_delete_with_empty_ids() {
-        let config = crate::config::ServerConfig::dev_default("test-node", "/tmp/svc_del_test");
-        let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open("/tmp/svc_del_test_db").unwrap(),
-        );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
-        let service = RekhaService::new(coord);
-
-        let req = tonic::Request::new(DeleteRequest {
-            ids: vec![],
-            collection_name: "default".into(),
-        });
-        let resp = service.delete(req).await.unwrap();
-        assert_eq!(resp.into_inner().deleted_count, 0);
-    }
-
-    static NEXT_SVC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    fn svc_dir(id: u64) -> String {
-        format!("/tmp/rekha_svc_{pid}_{id}", pid = std::process::id())
-    }
-
-    fn make_service() -> RekhaService {
-        let id = NEXT_SVC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = svc_dir(id);
-        let config =
-            crate::config::ServerConfig::dev_default("test-node", &format!("{dir}/config"));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = std::sync::Arc::new(
-            rekha_storage::RocksVectorStore::open(format!("{dir}/db")).unwrap(),
-        );
-        let pm = std::sync::Arc::new(tokio::sync::RwLock::new(
-            rekha_partition::PartitionManager::new(std::collections::HashMap::new(), 4, 768),
-        ));
-        let coord = std::sync::Arc::new(crate::coordinator::Coordinator::new(config, store, pm));
-        RekhaService::new(coord)
-    }
-
-    #[tokio::test]
-    async fn test_handshake_handler() {
-        let service = make_service();
-        let req = tonic::Request::new(HandshakeRequest {
-            node_id: "peer-1".into(),
-            address: "10.0.0.2:50051".into(),
-        });
-        let resp = service.handshake(req).await.unwrap();
-        let inner = resp.into_inner();
-        assert_eq!(inner.cluster_id, "rekha-dev");
-        // The requester should be excluded from peers list
-        assert!(inner.peers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_handshake_with_known_peers() {
-        let service = make_service();
-        // Register a peer first
-        let peer = tonic::Request::new(HandshakeRequest {
-            node_id: "peer-1".into(),
-            address: "10.0.0.2:50051".into(),
-        });
-        service.handshake(peer).await.unwrap();
-
-        // Now a second node handshakes — should see peer-1 in the response
-        let req = tonic::Request::new(HandshakeRequest {
-            node_id: "peer-2".into(),
-            address: "10.0.0.3:50051".into(),
-        });
-        let resp = service.handshake(req).await.unwrap();
-        let peers = resp.into_inner().peers;
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].node_id, "peer-1");
-    }
-
-    #[tokio::test]
-    async fn test_heartbeat_handler() {
-        let service = make_service();
-        let req = tonic::Request::new(HeartbeatRequest {
-            node_id: "heartbeat-node".into(),
-            address: "10.0.0.5:50051".into(),
-            raft_term: 3,
-            commit_index: 10,
-            storage_bytes: 1024,
-        });
-        let resp = service.heartbeat(req).await.unwrap();
-        let inner = resp.into_inner();
-        assert!(inner.success);
-    }
-
-    #[tokio::test]
-    async fn test_fetch_handler() {
-        let service = make_service();
-        // Insert a vector into the service's store
-        service
-            .coordinator
-            .store()
-            .put_vector(1, &[1.0, 2.0, 3.0])
-            .unwrap();
-        service
-            .coordinator
-            .store()
-            .put_payload(1, b"fetch-payload")
-            .unwrap();
-
-        let req = tonic::Request::new(FetchRequest {
-            ids: vec![1],
-            collection_name: "default".into(),
-            include_payloads: true,
-        });
-        let resp = service.fetch(req).await.unwrap();
-        let inner = resp.into_inner();
-        assert_eq!(inner.vectors.len(), 1);
-        assert_eq!(inner.vectors[0].id, 1);
-        assert_eq!(inner.points.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_fetch_handler_missing_id() {
-        let service = make_service();
-        // Fetch a non-existent ID should succeed with empty vectors
-        let req = tonic::Request::new(FetchRequest {
-            ids: vec![999],
-            collection_name: "default".into(),
-            include_payloads: false,
-        });
-        let resp = service.fetch(req).await.unwrap();
-        let inner = resp.into_inner();
-        assert!(inner.vectors.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_create_collection_stub() {
-        let service = make_service();
-        let req = tonic::Request::new(CreateCollectionRequest {
-            name: "test".into(),
-            config: Some(crate::proto::CollectionConfig {
-                dim: 8,
-                num_vector_shards: 1,
-                replication_factor: 1,
-                num_dim_groups: 1,
-                dim_group_size: 8,
-                graph_degree: 32,
-                search_list_size: 100,
-                pq_num_sub_vectors: 4,
-                pq_num_centroids: 256,
-                re_rank_k: 200,
-            }),
-        });
-        let result = service.create_collection(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_drop_collection_stub() {
-        let service = make_service();
-        let req = tonic::Request::new(DropCollectionRequest {
-            name: "test".into(),
-        });
-        let result = service.drop_collection(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_list_collections_stub() {
-        let service = make_service();
-        let req = tonic::Request::new(ListCollectionsRequest {});
-        let result = service.list_collections(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_collection_exists_stub() {
-        let service = make_service();
-        let req = tonic::Request::new(CollectionExistsRequest {
-            name: "test".into(),
-        });
-        let result = service.collection_exists(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_transfer_shard_stub() {
-        let service = make_service();
-        let req = tonic::Request::new(TransferRequest {
-            partition_id: 0,
-            target_node: "".into(),
-            vector_ids: vec![],
-        });
-        let resp = service.transfer_shard(req).await.unwrap();
-        let inner = resp.into_inner();
-        assert!(!inner.success);
-    }
-
-    #[tokio::test]
-    async fn test_raft_append_entries_no_node() {
-        let service = make_service();
-        let req = tonic::Request::new(AppendEntriesRequest {
-            collection_name: "default".into(),
-            partition_id: 0,
-            leader_term: 1,
-            leader_id: "leader".into(),
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![],
-            leader_commit: 0,
-        });
-        let result = service.raft_append_entries(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn test_raft_request_vote_no_node() {
-        let service = make_service();
-        let req = tonic::Request::new(RaftVoteRequest {
-            collection_name: "default".into(),
-            term: 1,
-            candidate_id: "candidate".into(),
-            last_log_index: 0,
-            last_log_term: 0,
-            partition_id: 0,
-        });
-        let result = service.raft_request_vote(req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn test_raft_append_entries_with_node() {
-        let service = make_service();
-        // Register a Raft node on the coordinator
-        use rekha_raft::{RaftNode, ReplicatedState};
-        let state = ReplicatedState::new(0);
-        let raft_log_store = service.coordinator.raft_log_store();
-        let node = std::sync::Arc::new(RaftNode::with_store(
-            "test-node".into(),
-            0,
-            vec![],
-            state,
-            Some(raft_log_store),
-            None,
-        ));
-        node.start_election().await.unwrap();
-        service.coordinator.register_raft_node(0, node);
-
-        let req = tonic::Request::new(AppendEntriesRequest {
-            collection_name: "default".into(),
-            partition_id: 0,
-            leader_term: 2,
-            leader_id: "new-leader".into(),
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![crate::proto::RaftEntry {
-                term: 2,
-                index: 1,
-                command: Some(crate::proto::RaftCommand {
-                    cmd: Some(crate::proto::raft_command::Cmd::Insert(
-                        crate::proto::InsertRequest {
-                            id: 0,
-                            vector: vec![1.0],
-                            payload: None,
-                            collection_name: "default".into(),
-                        },
-                    )),
-                }),
-            }],
-            leader_commit: 1,
-        });
-        let resp = service.raft_append_entries(req).await.unwrap();
-        let ack = resp.into_inner();
-        assert!(ack.success);
-    }
-
-    #[tokio::test]
-    async fn test_raft_request_vote_with_node() {
-        let service = make_service();
-        use rekha_raft::{RaftNode, ReplicatedState};
-        let state = ReplicatedState::new(0);
-        let raft_log_store = service.coordinator.raft_log_store();
-        let node = std::sync::Arc::new(RaftNode::with_store(
-            "test-node".into(),
-            0,
-            vec![],
-            state,
-            Some(raft_log_store),
-            None,
-        ));
-        service.coordinator.register_raft_node(0, node);
-
-        let req = tonic::Request::new(RaftVoteRequest {
-            collection_name: "default".into(),
-            term: 1,
-            candidate_id: "candidate".into(),
-            last_log_index: 0,
-            last_log_term: 0,
-            partition_id: 0,
-        });
-        let resp = service.raft_request_vote(req).await.unwrap();
-        let vote_resp = resp.into_inner();
-        // Follower should grant vote to candidate with higher term
-        assert!(vote_resp.vote_granted);
+        let service = RekhaService::new(Arc::new(coord));
+        let _ = &service.coordinator;
     }
 }

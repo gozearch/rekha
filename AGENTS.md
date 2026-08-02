@@ -1,71 +1,119 @@
 # Rekha — Agent Instructions
 
-High-performance distributed vector database (Vamana + PQ, Raft, gRPC) in Rust.
+Distributed vector database (IVF + PQ, Dynamo-style replication, consistent hashing, gRPC) in Rust.
+
+## Build prerequisite
+
+`protoc` **27.5** must be on PATH (CI pins `PROTOC_VERSION: "27.5"`). Without it, `rekha-proto`'s `tonic-build` codegen fails.
 
 ## Workspace
 
-9 crates in a Cargo workspace. `rekha-bench` (Criterion) is excluded from default-members — most workspace commands must explicitly exclude it.
+12 workspace crates. `rekha-python/` is **not** a workspace member — it has its own `pyproject.toml` and generated stubs.
 
-**Dependency flow**: `rekha-core` (zero deps) → `rekha-storage`, `rekha-partition` → `rekha-index`, `rekha-raft` → `rekha-server`, `rekha-client`, `rekha-cli`
+`rekha-bench` is in `default-members` but excluded from every test/lint/check command (Criterion suite is slow). Always include `--exclude rekha-bench`.
 
-**Only binary crate**: `rekha-cli` (CLI tool). The server is a library crate — it's wired to the CLI binary via the `server` subcommand.
+**Crates**:
+- `rekha-core` — types, traits, distance metrics, errors, `ConsistencyLevel`, `CollectionConfig`.
+- `rekha-proto` — **single** proto source. `build.rs` runs `tonic-build`; `src/proto` re-exports generated types; `src/conversions.rs` holds shared proto↔core converters. Server, client, coordinator reuse `rekha_proto::proto` — do **not** field-by-field convert across "different proto types" (that pattern was removed).
+- `rekha-storage` — RocksDB. 4 CFs: `vectors`, `payloads`, `metadata`, `hints`. Hint storage lives in `hint_store.rs` (`HintStore`); reach via `store.hint_store()`.
+- `rekha-index` — `RekhaIndex` (collection registry → `IvfIndex` each), `ivf.rs`.
+- `rekha-quant` — Product quantization + K-Means clustering.
+- `rekha-replication` — LWW timestamps (`lww.rs`), consistency gate ONE/QUORUM/ALL (`consistency_gate.rs`), hinted handoff (`hinted_handoff.rs`).
+- `rekha-cluster` — membership, peer-state, consistent hash ring (`ring.rs`: 128 vnodes, SipHash, `BTreeMap`-backed `replicas_for`).
+- `rekha-coordinator` — write/read path orchestration, collection DDL, peer pool. Split into `coordinator.rs`, `write_path.rs`, `read_path.rs`, `collection.rs`, `peer_pool.rs`, `membership.rs`.
+- `rekha-server` — gRPC server + config. Re-exports `rekha_proto::proto` and `rekha_coordinator::Coordinator`.
+- `rekha-client` — Rust SDK (gRPC client, retries, cluster mgmt).
+- `rekha-cli` — **only binary crate**; server runs via `server` subcommand.
+
+**Dependency flow**: `rekha-core` → `rekha-proto` / `rekha-storage` / `rekha-index` / `rekha-quant` / `rekha-replication` / `rekha-cluster` → `rekha-coordinator` → `rekha-server` → `rekha-client` → `rekha-cli`.
 
 **Entrypoints**:
-- `rekha-cli/src/main.rs` — CLI binary entry
-- `rekha-server/src/server.rs` — `ServerInstance` (loads config, opens RocksDB, starts gRPC)
-- `rekha-server/src/service.rs` — gRPC service handlers
-- `rekha-server/src/coordinator.rs` — query coordinator (search fan-out + merge)
-- `rekha-server/src/config.rs` — `ServerConfig` (loads YAML)
-- `proto/rekha.proto` — all protobuf definitions; codegen via `tonic-build` in build.rs
+- `rekha-cli/src/main.rs` — CLI binary
+- `rekha-server/src/server.rs` — `ServerInstance` (opens RocksDB, starts gRPC)
+- `rekha-coordinator/src/coordinator.rs` — `Coordinator` (write/read/query router; *not* `rekha-server/src/coordinator.rs` — that file no longer exists)
+- `rekha-server/src/service.rs` — gRPC handlers
+- `rekha-server/src/config.rs` — `ServerConfig`
+- `proto/rekha.proto` — proto source of truth
+- `rekha-index/src/index.rs` — `RekhaIndex` collection registry
 
 ## Developer Commands
 
-All via `justfile` (requires `cargo install just`):
+All cargo commands exclude `rekha-bench`:
 
-| Command | What it runs |
-|---|---|
-| `just test` | `cargo test --workspace --exclude rekha-bench` |
-| `just lint` | `cargo fmt --all --check && cargo clippy -- -- -D warnings` (same exclude) |
-| `just fix` | `cargo fmt --all` |
-| `just check` | `cargo check --workspace --exclude rekha-bench` |
-| `just build` | `cargo build ...` (same exclude) |
-| `just release-build` | `cargo build --release ...` (same exclude) |
-| `just test-name <name>` | `cargo test <name> --workspace --exclude rekha-bench` |
-| `just coverage` | `cargo llvm-cov ...` (requires nightly + cargo-llvm-cov) |
-| `just coverage-html` | generates HTML report, opens in browser |
+```bash
+cargo test --workspace --exclude rekha-bench
+cargo clippy --workspace --exclude rekha-bench -- -D warnings
+cargo fmt --all --check
+cargo fmt --all
+cargo check --workspace --exclude rekha-bench
+cargo build --workspace --exclude rekha-bench
+```
 
-**CI order** (`.github/workflows/ci.yml`): `lint → test (ubuntu + macos) → coverage (nightly, ubuntu-only)`
+`just` aliases: `just test`, `just lint`, `just check`, `just build`, `just fix`, `just coverage`, `just test-name <name>`, `just coverage-html` (needs nightly + `cargo-llvm-cov`).
 
-## Testing Conventions
+Run one test:
+```bash
+cargo test -p rekha-coordinator -- coordinator::tests::test_coordinator_insert
+```
 
-- Unit tests are inline next to code (`#[cfg(test)] mod tests`).
-- Tests requiring real gRPC server are marked `#[ignore]` — run with `cargo test -- --ignored`.
-- RocksDB tests use unique temp directories via `AtomicU64` counters to avoid collisions.
-- Test utilities: `tempfile`, `proptest`, `approx` (0.5), `rand`.
-- Benchmark: `rekha-bench` uses Criterion with async Tokio support.
+## CI
+
+- `test.yml` — `cargo test` on every push.
+- `ci.yml` — lint + test + coverage, on push **and** PR to `master`. Pins protoc 27.5.
+- `docker.yml` / `opencode.yml` — image build and agent infra.
 
 ## Architecture Notes
 
-- **Error handling**: Layered error types (`StorageError`, `IndexError`, `PartitionError`, `RaftError`) all funnel through `RekhaError` via `From` impls. All errors are `Clone` (not just `Debug`) for async propagation.
-- **Storage**: RocksDB with 4 column families: `vectors` (f32 LE bytes), `payloads` (arbitrary bytes), `metadata` (JSON), `raft_log` (protobuf). Vector IDs encoded as u64 big-endian keys.
-- **Search flow**: coordinator fans out query to dimension groups → partial distance with early-stop → merge → re-rank with full-precision vectors.
-- **Raft**: custom implementation (not `openraft`/`raft-rs`). Per-shard Raft groups.
-- **Config**: YAML, loaded by `ServerConfig::from_file()`, env var `REKHA_CONFIG`. Dev defaults via `ServerConfig::dev_default()`.
-- **TLS**: optional, via `rustls` (pure Rust). `TlsConfig` is part of `ServerConfig`.
+
+IVF inverted-file index (`IvfIndex`). Do not reintroduce `RaftError`, planner, or dimension-pipeline concepts.
+
+**Storage**: RocksDB, 4 CFs: `vectors`, `payloads`, `metadata`, `hints`. Vector keys: `{collection}\0{u64 BE id}`. `metadata` CF stores collection configs at `collection:{name}` as `CollectionMeta` JSON. Open path auto-discovers existing CFs.
+
+**Collection management**: runtime via `rekha create-collection -c NAME --rf N --config '{"dim":256,...}'`. Each collection gets its own `IvfIndex`. `Coordinator::initialize()` auto-creates a default `dim=8` collection if none exists.
+
+**Replication (Dynamo-style)**: local write → consistency gate (ONE/QUORUM/ALL) → forward to RF peers via `replicas_for(shard, rf)` → LWW timestamp reconcile. Receiver sets `is_replication = true` on the forwarded proto request to prevent re-replication loops. Hinted handoff stores writes for unreachable peers (`hinted_handoff_enabled`, `max_hint_window_secs`). Default write consistency is **QUORUM**; `--rf` defaults to 1.
+
+**Consistent hashing**: `rekha-cluster::Membership` wraps the ring. `replicas_for(shard, rf)` skips unhealthy nodes. Covers ~1/N shards per new/departed node.
+
+**Error handling**: `StorageError` / `IndexError` / `PartitionError` → `RekhaError` via `From`. All `Clone`. No `RaftError`.
+
+**Config**: YAML, `ServerConfig::from_file()`. Sections: `cluster` (`default_write_consistency`, `hinted_handoff_enabled`, `max_hint_window_secs`), `tls`, `observability`, `storage` (`max_payload_size`, `max_inline_size`, `gc_grace_seconds`). Run `rekha server --config config.yaml`.
+
+## Testing
+
+- Inline `#[cfg(test)] mod tests`. Integration tests at `rekha-server/tests/integration.rs`.
+- RocksDB tests use unique temp dirs via `AtomicU64` counter to avoid collisions.
+- `Coordinator` will fail on insert/search unless `coord.initialize(index).await` is called first.
+- Test utilities: `tempfile`, `proptest`, `approx` (0.5), `rand`.
+- `rekha-bench` uses Criterion — reason for `--exclude rekha-bench`.
+
+## Docker + E2E
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+./scripts/e2e_prod.sh
+./scripts/e2e_test.sh
+```
 
 ## CLI Usage
 
 ```
-rekha server --config config.yaml    # start server
-echo "0.1 0.2 0.3" | rekha insert 42  # insert, vector from stdin
-rekha insert 42 --payload '{"k":"v"}'  # with payload
-echo "0.1 0.2 0.3" | rekha search -k 10
+rekha server --config config.yaml
+rekha create-collection -c images --rf 3 --config '{"dim":256,"nlist":4096,"nprobe":32}'
+rekha list-collections
+rekha collection-exists -c images
+echo "0.1 0.2 ..." | rekha insert -c images
+echo "0.5 0.5 ..." | rekha search -c images -k 10
 rekha delete 42 43 44
+rekha health
 ```
+
+Vector input is space-separated floats from stdin.
 
 ## Code Style
 
 - No comments in production code.
 - `Serialize`/`Deserialize` derive on all data types.
-- `async-trait` for async trait methods.
-- Manual `Display` + `Error` impls (not `thiserror` derive).
+- Manual `Display` + `Error` impls (not `thiserror`).
+- `#[allow(clippy::too_many_arguments)]` on functions with 7+ args.

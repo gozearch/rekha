@@ -1,153 +1,207 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use rekha_core::ConsistencyLevel;
+use serde::{Deserialize, Deserializer, Serialize};
 
-/// Top-level server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
-    pub cluster: ClusterConfig,
-    pub partition: PartitionConfig,
-    pub index: IndexConfig,
-    pub raft: RaftConfig,
-    pub tls: TlsConfig,
-    pub observability: ObservabilityConfig,
-    pub storage: StorageConfig,
+fn deserialize_consistency<'de, D>(deserializer: D) -> Result<ConsistencyLevel, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(match s.to_lowercase().as_str() {
+        "one" => ConsistencyLevel::One,
+        "all" => ConsistencyLevel::All,
+        _ => ConsistencyLevel::Quorum,
+    })
 }
 
-impl ServerConfig {
-    /// Load configuration from a YAML file.
-    pub fn from_file(path: impl Into<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
-        let path = path.into();
-        let contents = std::fs::read_to_string(&path)?;
-        let config: Self = serde_yaml::from_str(&contents)?;
-        Ok(config)
-    }
-
-    /// Default configuration for a single-node development setup.
-    pub fn dev_default(node_id: &str, data_dir: &str) -> Self {
-        Self {
-            cluster: ClusterConfig {
-                node_id: node_id.to_string(),
-                seed_nodes: vec![format!("127.0.0.1:50051")],
-                bind_addr: "0.0.0.0:50051".into(),
-                data_dir: data_dir.into(),
-            },
-            partition: PartitionConfig {
-                num_vector_shards: 1,
-                replication_factor: 1,
-                num_dim_groups: 4,
-                dim_group_size: 64,
-            },
-            index: IndexConfig {
-                index_type: "vamana".into(),
-                graph_degree: 64,
-                search_list_size: 128,
-                pq_num_sub_vectors: 64,
-                pq_num_centroids: 256,
-                re_rank_k: 256,
-                insert_buffer_capacity: 10_000,
-                insert_buffer_flush_interval_ms: 1000,
-            },
-            raft: RaftConfig {
-                heartbeat_interval_ms: 100,
-                election_timeout_min_ms: 300,
-                election_timeout_max_ms: 500,
-                snapshot_interval: 10_000,
-            },
-            tls: TlsConfig::default(),
-            observability: ObservabilityConfig {
-                metrics: "prometheus".into(),
-                tracing: "none".into(),
-                logging: "structured".into(),
-            },
-            storage: StorageConfig {
-                max_payload_size: 1_048_576,
-                max_inline_size: 1_048_576,
-            },
-        }
-    }
-}
-
-/// TLS configuration for encrypted gRPC communication.
-///
-/// Supports server-side TLS (encryption) and optional mutual TLS (mTLS)
-/// for node identity verification.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TlsConfig {
-    /// Set to `true` to enable TLS on the gRPC server and client.
-    /// When disabled, all communication is plaintext HTTP/2.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path to the server TLS certificate (PEM format).
-    /// Required when `enabled` is true.
-    pub cert_path: Option<String>,
-    /// Path to the server TLS private key (PEM format).
-    /// Required when `enabled` is true.
-    pub key_path: Option<String>,
-    /// Optional CA certificate for verifying client certificates (mTLS).
-    /// When set, the server will request and verify client certificates.
-    pub ca_cert_path: Option<String>,
+fn default_consistency() -> ConsistencyLevel {
+    ConsistencyLevel::Quorum
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
-    pub node_id: String,
+    #[serde(
+        default = "default_consistency",
+        deserialize_with = "deserialize_consistency"
+    )]
+    pub default_write_consistency: ConsistencyLevel,
+    #[serde(default = "default_true")]
+    pub hinted_handoff_enabled: bool,
+    #[serde(default = "default_max_hint_window")]
+    pub max_hint_window_secs: i64,
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_ms: u64,
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout_ms: u64,
+    #[serde(default)]
     pub seed_nodes: Vec<String>,
-    pub bind_addr: String,
-    pub data_dir: String,
+    #[serde(default = "default_rf")]
+    pub default_rf: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionConfig {
-    pub num_vector_shards: u64,
-    pub replication_factor: usize,
-    pub num_dim_groups: u32,
-    pub dim_group_size: usize,
+fn default_rf() -> u32 {
+    3
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexConfig {
-    #[serde(rename = "type")]
-    pub index_type: String,
-    pub graph_degree: usize,
-    pub search_list_size: usize,
-    pub pq_num_sub_vectors: usize,
-    pub pq_num_centroids: usize,
-    pub re_rank_k: usize,
-    /// Max vectors in the insert buffer before forced flush.
-    #[serde(default = "default_buffer_capacity")]
-    pub insert_buffer_capacity: usize,
-    /// How often to flush the insert buffer (milliseconds).
-    #[serde(default = "default_flush_interval_ms")]
-    pub insert_buffer_flush_interval_ms: u64,
+fn default_true() -> bool {
+    true
 }
 
-fn default_buffer_capacity() -> usize {
-    10_000
+fn default_max_hint_window() -> i64 {
+    3600
 }
 
-fn default_flush_interval_ms() -> u64 {
+fn default_heartbeat_interval() -> u64 {
     1000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RaftConfig {
-    pub heartbeat_interval_ms: u64,
-    pub election_timeout_min_ms: u64,
-    pub election_timeout_max_ms: u64,
-    pub snapshot_interval: u64,
+fn default_heartbeat_timeout() -> u64 {
+    5000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObservabilityConfig {
-    pub metrics: String,
-    pub tracing: String,
-    pub logging: String,
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        ClusterConfig {
+            default_write_consistency: default_consistency(),
+            hinted_handoff_enabled: true,
+            max_hint_window_secs: default_max_hint_window(),
+            heartbeat_interval_ms: default_heartbeat_interval(),
+            heartbeat_timeout_ms: default_heartbeat_timeout(),
+            seed_nodes: Vec::new(),
+            default_rf: default_rf(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
+    #[serde(default = "default_max_payload_size")]
     pub max_payload_size: usize,
+    #[serde(default = "default_max_inline_size")]
     pub max_inline_size: usize,
+    #[serde(default = "default_gc_grace")]
+    pub gc_grace_seconds: i64, // Tombstone retention before compaction
+    #[serde(default = "default_gc_interval")]
+    pub gc_interval_secs: u64,
+}
+
+fn default_max_payload_size() -> usize {
+    4 * 1024 * 1024
+}
+
+fn default_max_inline_size() -> usize {
+    1024
+}
+
+fn default_gc_grace() -> i64 {
+    86400
+}
+
+fn default_gc_interval() -> u64 {
+    3600
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        StorageConfig {
+            max_payload_size: default_max_payload_size(),
+            max_inline_size: default_max_inline_size(),
+            gc_grace_seconds: default_gc_grace(),
+            gc_interval_secs: default_gc_interval(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TlsConfig {
+    pub enabled: bool,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    #[serde(default)]
+    pub client_ca_cert_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub enable_tracing: bool,
+    #[serde(default)]
+    pub enable_metrics: bool,
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        ObservabilityConfig {
+            enable_tracing: false,
+            enable_metrics: false,
+            metrics_port: default_metrics_port(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_listen")]
+    pub listen: String,
+    pub advertise_address: Option<String>,
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+impl ServerConfig {
+    pub fn advertise(&self) -> &str {
+        self.advertise_address.as_deref().unwrap_or(&self.listen)
+    }
+}
+
+fn default_listen() -> String {
+    "0.0.0.0:50051".to_string()
+}
+
+fn default_data_dir() -> String {
+    "/tmp/rekha-data".to_string()
+}
+
+fn default_node_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            listen: default_listen(),
+            advertise_address: None,
+            data_dir: default_data_dir(),
+            node_id: default_node_id(),
+            cluster: ClusterConfig::default(),
+            storage: StorageConfig::default(),
+            tls: TlsConfig::default(),
+            observability: ObservabilityConfig::default(),
+        }
+    }
+}
+
+impl ServerConfig {
+    pub fn from_file(path: &str) -> Result<Self, anyhow::Error> {
+        let content = std::fs::read_to_string(path)?;
+        let config: ServerConfig = serde_yaml::from_str(&content)?;
+        Ok(config)
+    }
 }
 
 #[cfg(test)]
@@ -155,81 +209,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dev_default() {
-        let config = ServerConfig::dev_default("node-1", "/tmp/rekha");
-        assert_eq!(config.cluster.node_id, "node-1");
-        assert_eq!(config.cluster.bind_addr, "0.0.0.0:50051");
-        assert_eq!(config.partition.num_vector_shards, 1);
-        assert_eq!(config.partition.replication_factor, 1);
-        assert_eq!(config.partition.num_dim_groups, 4);
-        assert_eq!(config.index.graph_degree, 64);
-        assert_eq!(config.index.pq_num_sub_vectors, 64);
-        assert_eq!(config.raft.heartbeat_interval_ms, 100);
+    fn test_default_config() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.listen, "0.0.0.0:50051");
+        assert!(cfg.cluster.hinted_handoff_enabled);
+        assert_eq!(cfg.cluster.max_hint_window_secs, 3600);
     }
 
     #[test]
-    fn test_config_from_file_not_found() {
-        let result = ServerConfig::from_file("/nonexistent/path.yaml");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_config_roundtrip() {
-        let config = ServerConfig::dev_default("test-node", "/data");
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let config2: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(config.cluster.node_id, config2.cluster.node_id);
+    fn test_config_serde() {
+        let cfg = ServerConfig::default();
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.listen, cfg.listen);
         assert_eq!(
-            config.partition.num_vector_shards,
-            config2.partition.num_vector_shards
-        );
-        assert_eq!(
-            config.index.pq_num_sub_vectors,
-            config2.index.pq_num_sub_vectors
+            parsed.cluster.max_hint_window_secs,
+            cfg.cluster.max_hint_window_secs
         );
     }
 
     #[test]
-    fn test_tls_config_default_disabled() {
-        let tls = TlsConfig::default();
-        assert!(!tls.enabled);
-        assert!(tls.cert_path.is_none());
-        assert!(tls.key_path.is_none());
-        assert!(tls.ca_cert_path.is_none());
+    fn test_tls_default_disabled() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.tls.enabled);
+        assert!(cfg.tls.cert_path.is_none());
     }
 
     #[test]
-    fn test_tls_config_enabled() {
-        let tls = TlsConfig {
-            enabled: true,
-            cert_path: Some("/etc/certs/server.pem".into()),
-            key_path: Some("/etc/certs/server.key".into()),
-            ca_cert_path: None,
-        };
-        assert!(tls.enabled);
-        assert_eq!(tls.cert_path.as_deref(), Some("/etc/certs/server.pem"));
-        assert_eq!(tls.key_path.as_deref(), Some("/etc/certs/server.key"));
+    fn test_config_yaml_parses_listen_and_seed_nodes() {
+        let yaml = r#"
+listen: "0.0.0.0:50051"
+data_dir: "/data"
+node_id: "node-1"
+cluster:
+  seed_nodes:
+    - "node-1:50051"
+    - "node-2:50051"
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:50051");
+        assert_eq!(cfg.data_dir, "/data");
+        assert_eq!(cfg.node_id, "node-1");
+        assert_eq!(cfg.cluster.seed_nodes.len(), 2);
+        assert!(cfg.cluster.seed_nodes.contains(&"node-1:50051".to_string()));
+        assert!(cfg.cluster.seed_nodes.contains(&"node-2:50051".to_string()));
     }
 
     #[test]
-    fn test_dev_default_tls_disabled() {
-        let config = ServerConfig::dev_default("n1", "/tmp");
-        assert!(!config.tls.enabled);
+    fn test_advertise_address_fallback() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.advertise(), cfg.listen);
     }
 
     #[test]
-    fn test_tls_config_serde_roundtrip() {
-        let tls = TlsConfig {
-            enabled: true,
-            cert_path: Some("/certs/cert.pem".into()),
-            key_path: Some("/certs/key.pem".into()),
-            ca_cert_path: Some("/certs/ca.pem".into()),
-        };
-        let yaml = serde_yaml::to_string(&tls).unwrap();
-        let tls2: TlsConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert!(tls2.enabled);
-        assert_eq!(tls2.cert_path, tls.cert_path);
-        assert_eq!(tls2.key_path, tls.key_path);
-        assert_eq!(tls2.ca_cert_path, tls.ca_cert_path);
+    fn test_advertise_address_override() {
+        let yaml = r#"
+listen: "0.0.0.0:50051"
+advertise_address: "node-2:50051"
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.advertise(), "node-2:50051");
+        assert_eq!(cfg.listen, "0.0.0.0:50051");
     }
 }

@@ -1,40 +1,20 @@
+listen: "0.0.0.0:50051"
+advertise_address: "node-3:50051"
+data_dir: "/data"
+node_id: "node-3"
+
 cluster:
-  node_id: "node-3"
   seed_nodes:
     - "node-1:50051"
     - "node-2:50051"
     - "node-3:50051"
-  bind_addr: "0.0.0.0:50051"
-  data_dir: "/data"
-
-partition:
-  num_vector_shards: 6
-  replication_factor: 3
-  num_dim_groups: 4
-  dim_group_size: 1
-
-index:
-  type: "vamana"
-  graph_degree: 4
-  search_list_size: 8
-  pq_num_sub_vectors: 2
-  pq_num_centroids: 16
-  re_rank_k: 4
-
-raft:
-  heartbeat_interval_ms: 100
-  election_timeout_min_ms: 300
-  election_timeout_max_ms: 500
-  snapshot_interval: 10000
 
 storage:
   max_payload_size: 1048576
-  max_inline_size: 1048576
 
 tls:
   enabled: false
 
 observability:
-  metrics: "prometheus"
-  tracing: "none"
-  logging: "structured"
+  enable_tracing: false
+  enable_metrics: false

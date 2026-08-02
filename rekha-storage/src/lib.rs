@@ -1,5 +1,7 @@
-pub mod batch;
+#![allow(clippy::type_complexity)]
+
+pub mod hint_store;
 pub mod store;
 
-pub use batch::WriteBatch;
-pub use store::RocksVectorStore;
+pub use hint_store::HintStore;
+pub use store::RekhaStore;

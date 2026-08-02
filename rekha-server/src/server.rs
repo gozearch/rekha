@@ -1,518 +1,317 @@
-use rekha_index::RekhaIndex;
-use rekha_partition::PartitionManager;
-use rekha_storage::RocksVectorStore;
-
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use rekha_cluster::chord::{hash_to_chord_id, ChordNode};
+use rekha_cluster::Membership;
+use rekha_coordinator::{Coordinator, PeerPool};
+use rekha_proto::proto::rekha_server::RekhaServer;
+use rekha_storage::RekhaStore;
 use tokio::sync::RwLock;
-use tonic::transport::server::ServerTlsConfig;
-use tonic::transport::{Identity, Server};
+use tonic::transport::{Certificate, Identity};
 use tracing::{info, warn};
 
 use crate::config::ServerConfig;
-use crate::coordinator::Coordinator;
-use crate::proto::rekha_server::RekhaServer as RekhaGrpcServer;
-use crate::proto::{HeartbeatRequest, RaftVoteRequest};
 use crate::service::RekhaService;
 
-/// The Rekha distributed vector database server.
-///
-/// Orchestrates:
-/// - gRPC service for client RPCs
-/// - Coordinator for query routing
-/// - Local index for vector search
-/// - Raft consensus for replication
-/// - Partition management for topology
 pub struct ServerInstance {
-    config: ServerConfig,
-    coordinator: Arc<Coordinator>,
+    pub config: ServerConfig,
+    pub store: Arc<RekhaStore>,
+    pub coordinator: Arc<Coordinator>,
+    pub chord: Arc<ChordNode>,
+    pub shutdown_flag: Arc<AtomicBool>,
 }
 
 impl ServerInstance {
-    /// Create and initialize a new Rekha server from a configuration file.
-    pub async fn from_config_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = ServerConfig::from_file(path)?;
-        Self::from_config(config).await
-    }
+    pub async fn new(config: ServerConfig) -> anyhow::Result<Self> {
+        let store = Arc::new(RekhaStore::open(&config.data_dir)?);
 
-    /// Create and initialize a new Rekha server from a config struct.
-    pub async fn from_config(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        // Initialize tracing/logging (ignore errors if already initialized).
-        let _ = tracing_subscriber::fmt().with_target(false).try_init();
-
-        info!(
-            "Starting Rekha server: node={}, bind={}",
-            config.cluster.node_id, config.cluster.bind_addr
-        );
-
-        // Open storage.
-        let store = Arc::new(
-            RocksVectorStore::open(&config.cluster.data_dir)
-                .map_err(|e| format!("failed to open storage: {e}"))?,
-        );
-        info!("Storage opened at {}", config.cluster.data_dir);
-
-        // Create partition manager.
-        let partition_manager = Arc::new(RwLock::new(PartitionManager::new(
-            HashMap::new(),
-            config.partition.num_dim_groups,
-            config.partition.dim_group_size * config.partition.num_dim_groups as usize,
+        let node_id = config.node_id.clone();
+        let membership = Arc::new(RwLock::new(Membership::new(
+            &node_id,
+            config.cluster.heartbeat_timeout_ms,
         )));
 
-        // Create coordinator.
+        let node_id_num: u64 = farmhash(&node_id);
+        let consistency = config.cluster.default_write_consistency;
+
+        let chord_id = hash_to_chord_id(format!("{}:{}", node_id, config.advertise()).as_bytes());
+        let chord = Arc::new(ChordNode::new(chord_id, config.advertise()));
+        chord.set_successor(&node_id, config.advertise());
+
+        for seed in &config.cluster.seed_nodes {
+            if seed != config.advertise() {
+                let mut sl = chord.successor_list.write().await;
+                if !sl.contains(seed) {
+                    sl.push(seed.clone());
+                    chord.successor_addresses.write().await.push(seed.clone());
+                }
+            }
+        }
+
+        let peer_pool = Arc::new(PeerPool::new());
+
         let coordinator = Arc::new(Coordinator::new(
-            config.clone(),
             store.clone(),
-            partition_manager,
+            membership,
+            node_id_num,
+            node_id.clone(),
+            config.cluster.hinted_handoff_enabled,
+            config.cluster.max_hint_window_secs,
+            consistency,
+            config.cluster.default_rf,
+            chord.clone(),
+            peer_pool.clone(),
+            config.storage.gc_grace_seconds,
         ));
 
-        // Create Raft nodes for each vector shard.
-        let raft_log_store = coordinator.raft_log_store();
-        let num_shards = config.partition.num_vector_shards;
-        for shard in 0..num_shards {
-            let state = rekha_raft::ReplicatedState::new(shard);
-            let node_id = &config.cluster.node_id;
-            let peers: Vec<String> = config
-                .cluster
-                .seed_nodes
-                .iter()
-                .filter(|s| {
-                    // Filter self: seed addresses use {node_id}:port convention (Docker).
-                    // For dev/local setups, seed may use IP — if it differs from bind_addr
-                    // we still include it (harmless — vote request connects to same server).
-                    !s.starts_with(node_id)
-                })
-                .cloned()
-                .collect();
-            let raft_node = Arc::new(rekha_raft::RaftNode::with_store(
-                config.cluster.node_id.clone(),
-                shard,
-                peers,
-                state,
-                Some(raft_log_store.clone()),
-                Some(coordinator.clone() as Arc<dyn rekha_core::IndexBufferHandle>),
-            ));
-            coordinator.register_raft_node(shard, raft_node);
-        }
-        info!("Created {} Raft nodes for partitions", num_shards);
+        coordinator.initialize().await?;
 
-        // Create an empty (unbuilt) index and initialize the coordinator.
-        let dim = config.partition.dim_group_size * config.partition.num_dim_groups as usize;
-        let index = RekhaIndex::new(
-            dim,
-            config.index.pq_num_sub_vectors,
-            config.index.pq_num_centroids,
-            config.index.graph_degree,
-            (*store).clone(),
-            rekha_core::DistanceMetric::L2,
-        )?;
-        coordinator.initialize(index).await;
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-        Ok(Self {
+        Ok(ServerInstance {
             config,
+            store,
             coordinator,
+            chord,
+            shutdown_flag,
         })
     }
 
-    /// Set the index on the coordinator.
-    pub async fn with_index(self, index: RekhaIndex) -> Self {
-        self.coordinator.initialize(index).await;
-        self
-    }
-
-    /// Spawn a background task that periodically sends heartbeats to seed nodes
-    /// and checks peer health.
-    fn spawn_heartbeat_loop(&self) {
-        let coordinator = self.coordinator.clone();
-        let heartbeat_ms = self.config.raft.heartbeat_interval_ms;
-        let node_id = self.config.cluster.node_id.clone();
-        let seed_nodes = self.config.cluster.seed_nodes.clone();
-        let bind_addr = self.config.cluster.bind_addr.clone();
-
-        // Derive this node's externally-reachable address: look for a seed
-        // that starts with our node_id (Docker convention node-X:port).
-        // Fall back to bind_addr if none found.
-        let my_addr = seed_nodes
-            .iter()
-            .find(|s| s.starts_with(&node_id))
-            .cloned()
-            .unwrap_or_else(|| bind_addr.clone());
-
-        tokio::spawn(async move {
-            let mut health_tick = 0u64;
-            loop {
-                tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
-
-                // Send heartbeat to each seed node.
-                for seed in &seed_nodes {
-                    if seed.starts_with(&node_id) {
-                        continue; // skip self
-                    }
-                    let endpoint = format!("http://{}", seed);
-                    match tonic::transport::Channel::from_shared(endpoint) {
-                        Ok(ch) => match ch.connect().await {
-                            Ok(ch) => {
-                                let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
-                                // Get raft status for this node.
-                                let (raft_term, commit_idx) =
-                                    if let Some(raft_node) = coordinator.raft_node(0) {
-                                        (
-                                            raft_node.current_term().await,
-                                            raft_node.commit_index().await,
-                                        )
-                                    } else {
-                                        (0, 0)
-                                    };
-                                let req = tonic::Request::new(HeartbeatRequest {
-                                    node_id: node_id.clone(),
-                                    address: my_addr.clone(),
-                                    raft_term,
-                                    commit_index: commit_idx,
-                                    storage_bytes: 0,
-                                });
-                                match client.heartbeat(req).await {
-                                    Ok(resp) => {
-                                        let _resp = resp.into_inner();
-                                    }
-                                    Err(e) => {
-                                        warn!("Heartbeat to {} failed: {}", seed, e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Cannot connect to seed node {}: {}", seed, e);
-                            }
-                        },
-                        Err(e) => {
-                            warn!("Invalid seed URI {}: {}", seed, e);
-                        }
-                    }
-                }
-
-                // Check peer health every 10 heartbeats.
-                health_tick += 1;
-                if health_tick >= 10 {
-                    health_tick = 0;
-                    coordinator.check_peer_health().await;
-                }
-            }
-        });
-    }
-
-    /// Spawn background timers for all Raft nodes (election timeout checks)
-    /// and handle multi-node vote collection after elections start.
-    fn spawn_raft_timers(&self) {
-        let coordinator = self.coordinator.clone();
-        let election_check_ms = std::cmp::min(self.config.raft.election_timeout_min_ms, 100);
-        let node_id = self.config.cluster.node_id.clone();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(election_check_ms)).await;
-
-                // Check election timeout for every Raft node.
-                let partition_ids: Vec<u64> = coordinator
-                    .raft_nodes
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .collect();
-                for pid in partition_ids {
-                    if let Some(node) = coordinator.raft_node(pid) {
-                        if node.check_election_timeout().await {
-                            info!(
-                                "Election triggered for partition {} on node {}",
-                                pid,
-                                node.node_id()
-                            );
-
-                            let term = node.current_term().await;
-                            let last_log_idx = node.last_log_index().await;
-                            let last_log_term = node.last_log_term().await;
-                            let peers = node.peers().to_vec();
-                            let candidate_id = node_id.clone();
-                            let n = node.clone();
-
-                            // If no peers, the node self-elected in start_election.
-                            if peers.is_empty() {
-                                continue;
-                            }
-
-                            // Spawn vote collection task — sends RequestVote to each peer.
-                            tokio::spawn(async move {
-                                let mut votes = 1u64; // self vote
-                                let group_size = peers.len() as u64 + 1;
-                                let majority = group_size / 2 + 1;
-
-                                for peer_addr in &peers {
-                                    let endpoint = format!("http://{}", peer_addr);
-                                    let ch = match tonic::transport::Channel::from_shared(endpoint)
-                                    {
-                                        Ok(e) => {
-                                            match e
-                                                .connect_timeout(Duration::from_secs(2))
-                                                .connect()
-                                                .await
-                                            {
-                                                Ok(ch) => ch,
-                                                Err(_) => continue,
-                                            }
-                                        }
-                                        Err(_) => continue,
-                                    };
-                                    let mut client =
-                                        crate::proto::rekha_client::RekhaClient::new(ch);
-                                    let req = tonic::Request::new(RaftVoteRequest {
-                                        term,
-                                        candidate_id: candidate_id.clone(),
-                                        last_log_index: last_log_idx,
-                                        last_log_term,
-                                        partition_id: pid,
-                                        collection_name: "default".to_string(),
-                                    });
-                                    if let Ok(resp) = client.raft_request_vote(req).await {
-                                        if resp.into_inner().vote_granted {
-                                            votes += 1;
-                                        }
-                                    }
-                                }
-
-                                if votes >= majority {
-                                    n.become_leader().await;
-                                } else {
-                                    info!(
-                                        "Election lost for partition {} (got {votes}/{majority} votes)",
-                                        pid
-                                    );
-                                }
-                            });
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    /// Spawn a background loop that sends Raft AppendEntries heartbeats
-    /// from leaders to their followers (prevents follower election timeouts).
-    fn spawn_raft_heartbeat_loop(&self) {
-        let coordinator = self.coordinator.clone();
-        let heartbeat_ms = self.config.raft.heartbeat_interval_ms;
-
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(heartbeat_ms)).await;
-
-                let partition_ids: Vec<u64> = coordinator
-                    .raft_nodes
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .collect();
-
-                for pid in partition_ids {
-                    if let Some(node) = coordinator.raft_node(pid) {
-                        if !node.is_leader().await {
-                            continue;
-                        }
-
-                        let term = node.current_term().await;
-                        let commit_idx = node.commit_index().await;
-                        let last_log_idx = node.last_log_index().await;
-                        let last_log_term = node.last_log_term().await;
-                        let leader_id = node.node_id().to_string();
-                        let peers = node.peers().to_vec();
-
-                        for peer_addr in &peers {
-                            let endpoint = format!("http://{}", peer_addr);
-                            let ch = match tonic::transport::Channel::from_shared(endpoint) {
-                                Ok(e) => {
-                                    match e.connect_timeout(Duration::from_secs(2)).connect().await
-                                    {
-                                        Ok(ch) => ch,
-                                        Err(_) => continue,
-                                    }
-                                }
-                                Err(_) => continue,
-                            };
-                            let mut client = crate::proto::rekha_client::RekhaClient::new(ch);
-                            let req = tonic::Request::new(crate::proto::AppendEntriesRequest {
-                                partition_id: pid,
-                                leader_term: term,
-                                leader_id: leader_id.clone(),
-                                prev_log_index: last_log_idx,
-                                prev_log_term: last_log_term,
-                                entries: vec![], // heartbeat — empty entries
-                                leader_commit: commit_idx,
-                                collection_name: "default".to_string(),
-                            });
-                            let _ = client.raft_append_entries(req).await;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    /// Run the server (blocking). Handles SIGTERM/SIGINT for graceful shutdown.
-    /// Spawns a background heartbeat loop for cluster discovery and health monitoring.
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let addr = self.config.cluster.bind_addr.parse()?;
-        let service = RekhaService::new(self.coordinator.clone());
-
-        // Spawn background loops.
-        self.spawn_heartbeat_loop();
-        self.spawn_raft_timers();
-        self.spawn_raft_heartbeat_loop();
-
-        let shutdown = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to listen for ctrl-c");
-            info!("Shutdown signal received, draining connections...");
-        };
-
-        if self.config.tls.enabled {
-            let cert_path = self
-                .config
-                .tls
-                .cert_path
-                .as_ref()
-                .ok_or_else(|| "TLS enabled but cert_path not configured".to_string())?;
-            let key_path = self
-                .config
-                .tls
-                .key_path
-                .as_ref()
-                .ok_or_else(|| "TLS enabled but key_path not configured".to_string())?;
-
-            let cert = std::fs::read(cert_path).map_err(|e| format!("failed to read cert: {e}"))?;
-            let key = std::fs::read(key_path).map_err(|e| format!("failed to read key: {e}"))?;
-            let identity = Identity::from_pem(cert, key);
-
-            let mut tls_config = ServerTlsConfig::new().identity(identity);
-            if let Some(ca_path) = &self.config.tls.ca_cert_path {
-                let ca_cert =
-                    std::fs::read(ca_path).map_err(|e| format!("failed to read CA cert: {e}"))?;
-                tls_config =
-                    tls_config.client_ca_root(tonic::transport::Certificate::from_pem(ca_cert));
-            }
-
-            info!("gRPC server listening on {addr} with TLS");
-
-            Server::builder()
-                .tls_config(tls_config)?
-                .add_service(RekhaGrpcServer::new(service))
-                .serve_with_shutdown(addr, shutdown)
-                .await?;
-        } else {
-            info!("gRPC server listening on {addr} (plaintext)");
-
-            Server::builder()
-                .add_service(RekhaGrpcServer::new(service))
-                .serve_with_shutdown(addr, shutdown)
-                .await?;
+    pub async fn run(self) -> anyhow::Result<()> {
+        if self.config.observability.enable_tracing {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::builder()
+                        .with_default_directive("rekha=info".parse().unwrap())
+                        .from_env_lossy(),
+                )
+                .init();
+            info!("tracing initialized");
         }
 
-        info!("Server shut down gracefully");
+        let addr = self.config.listen.parse()?;
+        let service = RekhaService::new(self.coordinator.clone());
+
+        let hb_coordinator = self.coordinator.clone();
+        let hb_seeds = self.config.cluster.seed_nodes.clone();
+        let hb_interval = self.config.cluster.heartbeat_interval_ms;
+        let hb_self_id = self.config.node_id.clone();
+        let hb_advertise = self.config.advertise().to_string();
+        tokio::spawn(async move {
+            heartbeat_loop(
+                hb_coordinator,
+                &hb_seeds,
+                hb_interval,
+                &hb_self_id,
+                &hb_advertise,
+            )
+            .await;
+        });
+
+        let gc_coordinator = self.coordinator.clone();
+        let gc_interval = self.config.storage.gc_interval_secs;
+        tokio::spawn(async move {
+            gc_loop(gc_coordinator, gc_interval).await;
+        });
+
+        let hr_coordinator = self.coordinator.clone();
+        tokio::spawn(async move {
+            hint_replay_loop(hr_coordinator).await;
+        });
+
+        let chord_stab = self.chord.clone();
+        let shutdown_stab = self.shutdown_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if shutdown_stab.load(Ordering::Relaxed) {
+                    break;
+                }
+                // stabilize: ask successor for predecessor, update if needed
+                if let Some((succ_id, succ_addr)) = chord_stab.successor() {
+                    chord_stab.stabilize_with(&succ_id, &succ_addr);
+                }
+            }
+        });
+
+        let chord_fix = self.chord.clone();
+        let shutdown_fix = self.shutdown_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if shutdown_fix.load(Ordering::Relaxed) {
+                    break;
+                }
+                chord_fix.fix_next_finger(|_start| None);
+            }
+        });
+
+        let chord_check = self.chord.clone();
+        let shutdown_check = self.shutdown_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if shutdown_check.load(Ordering::Relaxed) {
+                    break;
+                }
+                chord_check.check_predecessor(false);
+            }
+        });
+
+        let reaper_membership = self.coordinator.membership.clone();
+        let reaper_timeout = self.config.cluster.heartbeat_timeout_ms;
+        let shutdown_rap = self.shutdown_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if shutdown_rap.load(Ordering::Relaxed) {
+                    break;
+                }
+                let memb = reaper_membership.read().await;
+                memb.check_timeouts(reaper_timeout);
+            }
+        });
+
+        let mut builder = tonic::transport::Server::builder();
+
+        if self.config.tls.enabled {
+            if let (Some(cert_path), Some(key_path)) =
+                (&self.config.tls.cert_path, &self.config.tls.key_path)
+            {
+                let cert = tokio::fs::read(cert_path).await?;
+                let key = tokio::fs::read(key_path).await?;
+                let identity = Identity::from_pem(cert, key);
+                let mut tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+
+                if let Some(ca_path) = &self.config.tls.client_ca_cert_path {
+                    let ca_cert = tokio::fs::read(ca_path).await?;
+                    tls = tls.client_ca_root(Certificate::from_pem(ca_cert));
+                    info!("mTLS enabled with client CA verification");
+                } else {
+                    info!("TLS enabled (no client cert verification)");
+                }
+
+                builder = builder.tls_config(tls)?;
+            } else {
+                warn!("TLS enabled but cert_path or key_path missing, skipping TLS");
+            }
+        }
+
+        if self.config.observability.enable_metrics {
+            let addr = format!("0.0.0.0:{}", self.config.observability.metrics_port);
+            if let Ok(_exporter) = metrics_exporter_prometheus::PrometheusBuilder::new()
+                .with_http_listener(addr.parse::<std::net::SocketAddr>().unwrap())
+                .install()
+            {
+                info!("Prometheus metrics endpoint on {}", addr);
+            } else {
+                warn!("metrics already installed");
+            }
+        }
+
+        info!("Rekha server listening on {}", addr);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("shutdown signal received, stopping server...");
+            let _ = tx.send(());
+        });
+
+        builder
+            .add_service(RekhaServer::new(service))
+            .serve_with_shutdown(addr, async {
+                rx.await.ok();
+            })
+            .await?;
+
+        info!("flushing RocksDB...");
+        self.store.flush()?;
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        info!("shutdown complete");
+
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+async fn heartbeat_loop(
+    coordinator: Arc<Coordinator>,
+    seed_nodes: &[String],
+    interval_ms: u64,
+    self_id: &str,
+    listen_addr: &str,
+) {
+    let interval = Duration::from_millis(interval_ms.max(100));
+    let mut tick = 0u64;
+    loop {
+        tick += 1;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> String {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("/tmp/rekha_server_test_{}", n)
-    }
-
-    #[tokio::test]
-    async fn test_server_from_config() {
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let result = ServerInstance::from_config(config).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_server_from_config_file_not_found() {
-        let result = ServerInstance::from_config_file("/nonexistent/config.yaml").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_with_index() {
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        let store = rekha_storage::RocksVectorStore::open(temp_dir()).unwrap();
-        let mut index =
-            rekha_index::RekhaIndex::new(8, 4, 16, 4, store, rekha_core::DistanceMetric::L2)
-                .unwrap();
-        for i in 0..5 {
-            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
-            index.add_vector_for_test(i, v);
+        for seed in seed_nodes {
+            match rekha_client::Client::connect(seed).await {
+                Ok(mut client) => {
+                    if let Err(e) = client.send_heartbeat(self_id, listen_addr).await {
+                        warn!("heartbeat to {} failed: {}", seed, e);
+                    } else {
+                        let peer_parsed = seed.trim_start_matches("http://");
+                        let mut sl = coordinator.chord.successor_list.write().await;
+                        if !sl.contains(&peer_parsed.to_string()) {
+                            sl.push(peer_parsed.to_string());
+                            coordinator
+                                .chord
+                                .successor_addresses
+                                .write()
+                                .await
+                                .push(peer_parsed.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("cannot connect to seed {}: {}", seed, e);
+                }
+            }
         }
-        index.build().unwrap();
-        let server = server.with_index(index).await;
-        assert!(server.coordinator.is_initialized().await);
-    }
 
-    #[tokio::test]
-    async fn test_raft_nodes_created_at_startup() {
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        // With num_vector_shards=1, exactly 1 raft node should exist
-        let node = server.coordinator.raft_node(0);
-        assert!(node.is_some());
-        assert_eq!(node.unwrap().node_id(), "test-node");
-    }
+        if tick.is_multiple_of(10) {
+            coordinator.membership.write().await.rebuild_ring().await;
+        }
 
-    #[tokio::test]
-    async fn test_spawn_heartbeat_loop() {
-        // Just verify spawn_heartbeat_loop doesn't panic
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        // The method is private, called by run(). We verify via run() that it spawns without panic.
-        // For unit testing, just verify the server was created successfully.
-        assert!(server.coordinator.raft_node(0).is_some());
+        tokio::time::sleep(interval).await;
     }
+}
 
-    #[tokio::test]
-    async fn test_spawn_raft_timers() {
-        // Verify the raft timers can be spawned without panic
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        // spawn_raft_timers is called by run(). Verify the coordinator has raft nodes.
-        assert!(!server.coordinator.raft_nodes.is_empty());
+async fn gc_loop(coordinator: Arc<Coordinator>, interval_secs: u64) {
+    let interval = Duration::from_secs(interval_secs.max(60));
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Ok(collections) = coordinator.list_collections().await {
+            for name in &collections {
+                if let Ok(count) = coordinator.gc_collection(name).await {
+                    if count > 0 {
+                        info!("GC'd {} tombstones from {}", count, name);
+                    }
+                }
+            }
+        }
     }
+}
 
-    #[tokio::test]
-    async fn test_server_with_tls_config() {
-        // TLS path should fail gracefully when cert/key files don't exist
-        let mut config = ServerConfig::dev_default("test-node", &temp_dir());
-        config.tls.enabled = true;
-        config.tls.cert_path = Some("/nonexistent/cert.pem".into());
-        config.tls.key_path = Some("/nonexistent/key.pem".into());
-        let result = ServerInstance::from_config(config).await;
-        assert!(result.is_ok()); // Server config is valid; TLS error only happens on run()
+async fn hint_replay_loop(coordinator: Arc<Coordinator>) {
+    let interval = Duration::from_secs(300);
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Ok(count) = coordinator.replay_hints() {
+            if count > 0 {
+                info!("replayed {} hints", count);
+            }
+        }
     }
+}
 
-    #[tokio::test]
-    async fn test_server_config_refs() {
-        let config = ServerConfig::dev_default("test-node", &temp_dir());
-        let server = ServerInstance::from_config(config).await.unwrap();
-        assert_eq!(server.config.cluster.node_id, "test-node");
-        assert_eq!(server.config.partition.num_dim_groups, 4);
-    }
-
-    #[tokio::test]
-    async fn test_from_config_invalid_path() {
-        // Using a path in a nonexistent directory should cause an error.
-        let config = ServerConfig::dev_default("test-node", "/nonexistent_dir_xyz/data");
-        let result = ServerInstance::from_config(config).await;
-        assert!(result.is_err());
-    }
+fn farmhash(data: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
 }

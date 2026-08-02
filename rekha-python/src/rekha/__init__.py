@@ -1,23 +1,23 @@
 from .client import RekhaClient
-from .errors import RekhaError, RekhaConnectError, RekhaRequestError
+from .collection import Collection
+from .errors import RekhaConnectError, RekhaError, RekhaRequestError
 from .types import (
-    ScoredPoint,
-    SearchParams,
-    SearchStats,
-    Payload,
-    NodeInfo,
-    ClusterTopology,
+    CollectionConfig,
+    CollectionInfo,
+    ConsistencyLevel,
+    GetResult,
+    QueryResult,
 )
 
 __all__ = [
     "RekhaClient",
+    "Collection",
     "RekhaError",
     "RekhaConnectError",
     "RekhaRequestError",
-    "ScoredPoint",
-    "SearchParams",
-    "SearchStats",
-    "Payload",
-    "NodeInfo",
-    "ClusterTopology",
+    "CollectionConfig",
+    "CollectionInfo",
+    "ConsistencyLevel",
+    "GetResult",
+    "QueryResult",
 ]

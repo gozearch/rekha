@@ -84,6 +84,11 @@ class RekhaStub:
                 request_serializer=rekha__pb2.SearchRequest.SerializeToString,
                 response_deserializer=rekha__pb2.ScoredPoint.FromString,
                 _registered_method=True)
+        self.SearchDimRange = channel.unary_unary(
+                '/rekha.Rekha/SearchDimRange',
+                request_serializer=rekha__pb2.SearchDimRangeRequest.SerializeToString,
+                response_deserializer=rekha__pb2.SearchDimRangeResponse.FromString,
+                _registered_method=True)
         self.Handshake = channel.unary_unary(
                 '/rekha.Rekha/Handshake',
                 request_serializer=rekha__pb2.HandshakeRequest.SerializeToString,
@@ -94,25 +99,15 @@ class RekhaStub:
                 request_serializer=rekha__pb2.HeartbeatRequest.SerializeToString,
                 response_deserializer=rekha__pb2.HeartbeatResponse.FromString,
                 _registered_method=True)
-        self.TransferShard = channel.unary_unary(
+        self.TransferShard = channel.unary_stream(
                 '/rekha.Rekha/TransferShard',
-                request_serializer=rekha__pb2.TransferRequest.SerializeToString,
-                response_deserializer=rekha__pb2.TransferResponse.FromString,
+                request_serializer=rekha__pb2.TransferShardRequest.SerializeToString,
+                response_deserializer=rekha__pb2.TransferShardChunk.FromString,
                 _registered_method=True)
-        self.RaftAppendEntries = channel.unary_unary(
-                '/rekha.Rekha/RaftAppendEntries',
-                request_serializer=rekha__pb2.AppendEntriesRequest.SerializeToString,
-                response_deserializer=rekha__pb2.RaftAck.FromString,
-                _registered_method=True)
-        self.RaftRequestVote = channel.unary_unary(
-                '/rekha.Rekha/RaftRequestVote',
-                request_serializer=rekha__pb2.RaftVoteRequest.SerializeToString,
-                response_deserializer=rekha__pb2.RaftVoteResponse.FromString,
-                _registered_method=True)
-        self.RaftInstallSnapshot = channel.stream_unary(
-                '/rekha.Rekha/RaftInstallSnapshot',
-                request_serializer=rekha__pb2.RaftSnapshotChunk.SerializeToString,
-                response_deserializer=rekha__pb2.RaftAck.FromString,
+        self.RepairCollection = channel.unary_stream(
+                '/rekha.Rekha/RepairCollection',
+                request_serializer=rekha__pb2.RepairCollectionRequest.SerializeToString,
+                response_deserializer=rekha__pb2.RepairProgress.FromString,
                 _registered_method=True)
 
 
@@ -120,8 +115,7 @@ class RekhaServicer:
     """Missing associated documentation comment in .proto file."""
 
     def CreateCollection(self, request, context):
-        """── Collection management ────────────────────────────────
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -145,8 +139,7 @@ class RekhaServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Insert(self, request, context):
-        """── Data operations ──────────────────────────────────────
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -170,8 +163,7 @@ class RekhaServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Search(self, request, context):
-        """── Search ───────────────────────────────────────────────
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -182,9 +174,14 @@ class RekhaServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SearchDimRange(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Handshake(self, request, context):
-        """── Cluster management (internal) ────────────────────────
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -201,20 +198,7 @@ class RekhaServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def RaftAppendEntries(self, request, context):
-        """── Raft replication (internal) ──────────────────────────
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def RaftRequestVote(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def RaftInstallSnapshot(self, request_iterator, context):
+    def RepairCollection(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -273,6 +257,11 @@ def add_RekhaServicer_to_server(servicer, server):
                     request_deserializer=rekha__pb2.SearchRequest.FromString,
                     response_serializer=rekha__pb2.ScoredPoint.SerializeToString,
             ),
+            'SearchDimRange': grpc.unary_unary_rpc_method_handler(
+                    servicer.SearchDimRange,
+                    request_deserializer=rekha__pb2.SearchDimRangeRequest.FromString,
+                    response_serializer=rekha__pb2.SearchDimRangeResponse.SerializeToString,
+            ),
             'Handshake': grpc.unary_unary_rpc_method_handler(
                     servicer.Handshake,
                     request_deserializer=rekha__pb2.HandshakeRequest.FromString,
@@ -283,25 +272,15 @@ def add_RekhaServicer_to_server(servicer, server):
                     request_deserializer=rekha__pb2.HeartbeatRequest.FromString,
                     response_serializer=rekha__pb2.HeartbeatResponse.SerializeToString,
             ),
-            'TransferShard': grpc.unary_unary_rpc_method_handler(
+            'TransferShard': grpc.unary_stream_rpc_method_handler(
                     servicer.TransferShard,
-                    request_deserializer=rekha__pb2.TransferRequest.FromString,
-                    response_serializer=rekha__pb2.TransferResponse.SerializeToString,
+                    request_deserializer=rekha__pb2.TransferShardRequest.FromString,
+                    response_serializer=rekha__pb2.TransferShardChunk.SerializeToString,
             ),
-            'RaftAppendEntries': grpc.unary_unary_rpc_method_handler(
-                    servicer.RaftAppendEntries,
-                    request_deserializer=rekha__pb2.AppendEntriesRequest.FromString,
-                    response_serializer=rekha__pb2.RaftAck.SerializeToString,
-            ),
-            'RaftRequestVote': grpc.unary_unary_rpc_method_handler(
-                    servicer.RaftRequestVote,
-                    request_deserializer=rekha__pb2.RaftVoteRequest.FromString,
-                    response_serializer=rekha__pb2.RaftVoteResponse.SerializeToString,
-            ),
-            'RaftInstallSnapshot': grpc.stream_unary_rpc_method_handler(
-                    servicer.RaftInstallSnapshot,
-                    request_deserializer=rekha__pb2.RaftSnapshotChunk.FromString,
-                    response_serializer=rekha__pb2.RaftAck.SerializeToString,
+            'RepairCollection': grpc.unary_stream_rpc_method_handler(
+                    servicer.RepairCollection,
+                    request_deserializer=rekha__pb2.RepairCollectionRequest.FromString,
+                    response_serializer=rekha__pb2.RepairProgress.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -585,6 +564,33 @@ class Rekha:
             _registered_method=True)
 
     @staticmethod
+    def SearchDimRange(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rekha.Rekha/SearchDimRange',
+            rekha__pb2.SearchDimRangeRequest.SerializeToString,
+            rekha__pb2.SearchDimRangeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def Handshake(request,
             target,
             options=(),
@@ -649,12 +655,12 @@ class Rekha:
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_unary(
+        return grpc.experimental.unary_stream(
             request,
             target,
             '/rekha.Rekha/TransferShard',
-            rekha__pb2.TransferRequest.SerializeToString,
-            rekha__pb2.TransferResponse.FromString,
+            rekha__pb2.TransferShardRequest.SerializeToString,
+            rekha__pb2.TransferShardChunk.FromString,
             options,
             channel_credentials,
             insecure,
@@ -666,7 +672,7 @@ class Rekha:
             _registered_method=True)
 
     @staticmethod
-    def RaftAppendEntries(request,
+    def RepairCollection(request,
             target,
             options=(),
             channel_credentials=None,
@@ -676,66 +682,12 @@ class Rekha:
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_unary(
+        return grpc.experimental.unary_stream(
             request,
             target,
-            '/rekha.Rekha/RaftAppendEntries',
-            rekha__pb2.AppendEntriesRequest.SerializeToString,
-            rekha__pb2.RaftAck.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def RaftRequestVote(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/rekha.Rekha/RaftRequestVote',
-            rekha__pb2.RaftVoteRequest.SerializeToString,
-            rekha__pb2.RaftVoteResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def RaftInstallSnapshot(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_unary(
-            request_iterator,
-            target,
-            '/rekha.Rekha/RaftInstallSnapshot',
-            rekha__pb2.RaftSnapshotChunk.SerializeToString,
-            rekha__pb2.RaftAck.FromString,
+            '/rekha.Rekha/RepairCollection',
+            rekha__pb2.RepairCollectionRequest.SerializeToString,
+            rekha__pb2.RepairProgress.FromString,
             options,
             channel_credentials,
             insecure,

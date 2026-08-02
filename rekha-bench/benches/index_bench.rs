@@ -1,13 +1,12 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::Rng;
-use rekha_core::SearchParams;
-use rekha_index::{ProductQuantizer, VamanaGraph};
+use rekha_index::IvfIndex;
+use rekha_quant::ProductQuantizer;
 
 fn bench_pq_encode(c: &mut Criterion) {
     let dim = 768;
     let mut pq = ProductQuantizer::new(64, 256, dim).unwrap();
 
-    // Generate training data.
     let mut rng = rand::thread_rng();
     let vectors: Vec<Vec<f32>> = (0..1000)
         .map(|_| (0..dim).map(|_| rng.gen::<f32>()).collect())
@@ -30,37 +29,33 @@ fn bench_pq_encode(c: &mut Criterion) {
     });
 }
 
-fn bench_vamana_graph(c: &mut Criterion) {
+fn bench_ivf_search(c: &mut Criterion) {
     let dim = 128;
     let mut rng = rand::thread_rng();
-    let n = 1000;
+    let n = 5000;
 
-    let vectors: Vec<Vec<f32>> = (0..n)
-        .map(|_| (0..dim).map(|_| rng.gen::<f32>()).collect())
+    let vectors: Vec<(u64, Vec<f32>)> = (0..n)
+        .map(|i| {
+            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            (i as u64, v)
+        })
         .collect();
 
-    let refs: Vec<(u64, &[f32])> = vectors
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v.as_slice()))
-        .collect();
-
-    let mut graph = VamanaGraph::new(32);
-    graph.build(&refs).unwrap();
-
+    let ivf = IvfIndex::build(&vectors, 32, 8, 4, 16, dim).unwrap();
     let query: Vec<f32> = (0..dim).map(|_| rng.gen()).collect();
-    let vec_owned: Vec<(u64, Vec<f32>)> = vectors
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v.clone()))
-        .collect();
 
-    c.bench_function("vamana_search_k10", |b| {
+    c.bench_function("ivf_search_k10", |b| {
         b.iter(|| {
-            graph.search(&query, &vec_owned, 10, 64).unwrap();
+            ivf.search(&query, 10, Some(4)).unwrap();
+        });
+    });
+
+    c.bench_function("ivf_search_k10_nprobe8", |b| {
+        b.iter(|| {
+            ivf.search(&query, 10, Some(8)).unwrap();
         });
     });
 }
 
-criterion_group!(benches, bench_pq_encode, bench_vamana_graph);
+criterion_group!(benches, bench_pq_encode, bench_ivf_search);
 criterion_main!(benches);

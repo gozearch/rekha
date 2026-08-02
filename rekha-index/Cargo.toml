@@ -2,17 +2,19 @@
 name = "rekha-index"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Disk-based IVF+PQ index for the Rekha vector database"
+keywords = ["vector-database", "ann", "indexing", "ivf", "pq", "nearest-neighbor"]
+categories = ["database", "data-structures"]
 
 [dependencies]
 rekha-core = { path = "../rekha-core" }
 rekha-storage = { path = "../rekha-storage" }
+rekha-quant = { path = "../rekha-quant" }
 serde = { version = "1", features = ["derive"] }
-rand = "0.8"
-thiserror = "2"
-log = "0.4"
-fnv = "1"
+rocksdb = "0.22"
 
 [dev-dependencies]
-approx = "0.5"
 tempfile = "3"
-proptest = "1"

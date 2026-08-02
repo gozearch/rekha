@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import json
 import random
 import time
-from typing import Any, Generator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import grpc
 
 import rekha.proto.rekha_pb2 as pb
 import rekha.proto.rekha_pb2_grpc as pb_grpc
+from .collection import Collection
 from .errors import RekhaConnectError, RekhaError, RekhaRequestError
-from .types import ClusterTopology, NodeInfo, Payload, ScoredPoint, SearchParams, SearchStats
+from .types import CollectionConfig, CollectionInfo, ConsistencyLevel
 
 
 class RekhaClient:
@@ -48,7 +50,7 @@ class RekhaClient:
 
     def _connect(
         self, seeds: List[str]
-    ) -> Tuple[grpc.Channel, pb_grpc.RekhaStub]:
+    ) -> tuple[grpc.Channel, pb_grpc.RekhaStub]:
         if not seeds:
             raise RekhaError("at least one seed node required")
 
@@ -100,163 +102,121 @@ class RekhaClient:
                 jitter = random.randint(0, base_ms // 4)
                 time.sleep((base_ms + jitter) / 1000.0)
 
-    def insert(
+    def _pb_config(self, **kwargs) -> pb.CollectionConfig:
+        return pb.CollectionConfig(
+            dim=kwargs.get("dim", 0),
+            num_vector_shards=kwargs.get("num_vector_shards", 1),
+            replication_factor=kwargs.get("replication_factor", 1),
+            num_dim_groups=kwargs.get("num_dim_groups", 1),
+            dim_group_size=kwargs.get("dim_group_size", 0),
+            nlist=kwargs.get("nlist", 4096),
+            nprobe=kwargs.get("nprobe", 32),
+            pq_num_sub_vectors=kwargs.get("pq_num_sub_vectors", 0),
+            pq_num_centroids=kwargs.get("pq_num_centroids", 0),
+            re_rank_k=kwargs.get("re_rank_k", 0),
+        )
+
+    def _collection_info_from_pb(self, info_pb) -> CollectionInfo:
+        cfg = info_pb.config
+        return CollectionInfo(
+            name=info_pb.name,
+            config=CollectionConfig(
+                dim=cfg.dim,
+                num_vector_shards=cfg.num_vector_shards,
+                replication_factor=cfg.replication_factor,
+                num_dim_groups=cfg.num_dim_groups,
+                dim_group_size=cfg.dim_group_size,
+                nlist=cfg.nlist,
+                nprobe=cfg.nprobe,
+                pq_num_sub_vectors=cfg.pq_num_sub_vectors,
+                pq_num_centroids=cfg.pq_num_centroids,
+                re_rank_k=cfg.re_rank_k,
+            ) if cfg else None,
+            vector_count=info_pb.vector_count,
+            index_ready=info_pb.index_ready,
+            config_timestamp=getattr(info_pb, 'config_timestamp', 0),
+        )
+
+    def create_collection(
         self,
-        vector: List[float],
-        collection_name: str,
-        id: int = 0,
-        payload: Optional[bytes] = None,
-    ) -> int:
-        pb_payload = None
-        if payload is not None:
-            pb_payload = pb.Payload(content_type="raw", data=payload)
-
-        request = pb.InsertRequest(id=id, vector=vector, collection_name=collection_name, payload=pb_payload)
-
-        def call():
-            response = self._stub.Insert(request, timeout=self._config["request_timeout"])
-            if not response.success:
-                raise grpc.RpcError(
-                    grpc.StatusCode.INTERNAL,
-                    response.error if response.error else "insert failed",
+        name: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        get_or_create: bool = False,
+        consistency: ConsistencyLevel | None = None,
+        **config: Any,
+    ) -> Collection:
+        if get_or_create:
+            try:
+                exists = self._with_retry(
+                    "collection_exists",
+                    lambda: self._stub.CollectionExists(
+                        pb.CollectionExistsRequest(name=name),
+                        timeout=self._config["request_timeout"],
+                    ),
                 )
-            return response.id
+                if exists.exists:
+                    info_pb = self._with_retry(
+                        "list_collections",
+                        lambda: self._stub.ListCollections(
+                            pb.ListCollectionsRequest(), timeout=self._config["request_timeout"]
+                        ),
+                    )
+                    for ci in info_pb.collections:
+                        if ci.name == name:
+                            return Collection(self, name, info=self._collection_info_from_pb(ci))
+            except RekhaError:
+                pass
 
-        return self._with_retry("insert", call)
-
-    def search(
-        self, query: List[float], top_k: int, collection_name: str
-    ) -> List[ScoredPoint]:
-        results, _ = self.search_with_params(query, top_k, collection_name, SearchParams())
-        return results
-
-    def search_with_params(
-        self,
-        query: List[float],
-        top_k: int,
-        collection_name: str,
-        params: SearchParams,
-        local_only: bool = False,
-    ) -> Tuple[List[ScoredPoint], SearchStats]:
-        pb_params = pb.SearchParams(
-            ef_search=params.ef_search,
-            beam_width=params.beam_width,
-            include_payloads=params.include_payloads,
-            partition_hint=params.partition_hint,
+        pb_cfg = self._pb_config(**config)
+        cl_val = consistency.value if consistency else 0
+        request = pb.CreateCollectionRequest(name=name, config=pb_cfg, timestamp=0, consistency=cl_val)
+        self._with_retry(
+            "create_collection",
+            lambda: self._stub.CreateCollection(
+                request, timeout=self._config["request_timeout"]
+            ),
         )
-        request = pb.SearchRequest(
-            query_vector=query,
-            top_k=top_k,
-            params=pb_params,
-            local_only=local_only,
-            collection_name=collection_name,
+        info_pb = self._with_retry(
+            "list_collections",
+            lambda: self._stub.ListCollections(
+                pb.ListCollectionsRequest(), timeout=self._config["request_timeout"]
+            ),
         )
+        coll_info = None
+        for ci in info_pb.collections:
+            if ci.name == name:
+                coll_info = self._collection_info_from_pb(ci)
+                break
+        return Collection(self, name, info=coll_info)
 
-        def call():
-            response = self._stub.Search(request, timeout=self._config["request_timeout"])
-            results = [
-                ScoredPoint(
-                    id=p.id,
-                    score=p.score,
-                    payload=Payload(content_type=p.payload.content_type, data=p.payload.data)
-                    if p.payload
-                    else None,
-                )
-                for p in response.results
-            ]
-            stats = SearchStats(
-                total_ms=response.stats.total_ms,
-                nodes_contacted=response.stats.nodes_contacted,
-                vectors_scanned=response.stats.vectors_scanned,
-                warnings=list(response.stats.warnings),
-            )
-            return results, stats
-
-        return self._with_retry("search", call)
-
-    def delete(self, ids: List[int], collection_name: str) -> int:
-        request = pb.DeleteRequest(ids=ids, collection_name=collection_name)
-
-        def call():
-            response = self._stub.Delete(request, timeout=self._config["request_timeout"])
-            return response.deleted_count
-
-        return self._with_retry("delete", call)
-
-    def fetch(
-        self, ids: List[int], collection_name: str, include_payloads: bool = False
-    ) -> List[ScoredPoint]:
-        request = pb.FetchRequest(ids=ids, collection_name=collection_name, include_payloads=include_payloads)
-
-        def call():
-            response = self._stub.Fetch(request, timeout=self._config["request_timeout"])
-            return [
-                ScoredPoint(
-                    id=p.id,
-                    score=p.score,
-                    payload=Payload(content_type=p.payload.content_type, data=p.payload.data)
-                    if p.payload
-                    else None,
-                )
-                for p in response.points
-            ]
-
-        return self._with_retry("fetch", call)
-
-    def cluster_info(self) -> ClusterTopology:
-        request = pb.HandshakeRequest(node_id="", address="")
-
-        def call():
-            response = self._stub.Handshake(request, timeout=self._config["request_timeout"])
-            peers = [
-                NodeInfo(
-                    node_id=n.node_id,
-                    address=n.address,
-                    partition_id=n.partition_id,
-                    dim_groups=list(n.dim_groups),
-                    is_leader=n.is_leader,
-                    raft_term=n.raft_term,
-                    commit_index=n.commit_index,
-                    storage_bytes=n.storage_bytes,
-                    status=n.status,
-                )
-                for n in response.peers
-            ]
-            return ClusterTopology(cluster_id=response.cluster_id, peers=peers)
-
-        return self._with_retry("cluster_info", call)
-
-    def search_stream(
-        self,
-        query: List[float],
-        top_k: int,
-        collection_name: str,
-        params: Optional[SearchParams] = None,
-        local_only: bool = False,
-    ) -> Generator[ScoredPoint, None, None]:
-        params = params or SearchParams()
-        pb_params = pb.SearchParams(
-            ef_search=params.ef_search,
-            beam_width=params.beam_width,
-            include_payloads=params.include_payloads,
-            partition_hint=params.partition_hint,
-        )
-        request = pb.SearchRequest(
-            query_vector=query,
-            top_k=top_k,
-            params=pb_params,
-            local_only=local_only,
-            collection_name=collection_name,
+    def drop_collection(self, name: str, consistency: ConsistencyLevel | None = None) -> None:
+        cl_val = consistency.value if consistency else 0
+        self._with_retry(
+            "drop_collection",
+            lambda: self._stub.DropCollection(
+                pb.DropCollectionRequest(name=name, timestamp=0, consistency=cl_val),
+                timeout=self._config["request_timeout"],
+            ),
         )
 
-        for p in self._stub.SearchStream(request, timeout=self._config["request_timeout"]):
-            yield ScoredPoint(
-                id=p.id,
-                score=p.score,
-                payload=Payload(content_type=p.payload.content_type, data=p.payload.data)
-                if p.payload
-                else None,
-            )
+    def list_collections(
+        self, limit: Optional[int] = None, offset: Optional[int] = None
+    ) -> List[Collection]:
+        response = self._with_retry(
+            "list_collections",
+            lambda: self._stub.ListCollections(
+                pb.ListCollectionsRequest(), timeout=self._config["request_timeout"]
+            ),
+        )
+        collections = [
+            Collection(self, ci.name, info=self._collection_info_from_pb(ci))
+            for ci in response.collections
+        ]
+        if offset is not None:
+            collections = collections[offset:]
+        if limit is not None:
+            collections = collections[:limit]
+        return collections
 
     def close(self) -> None:
         try:

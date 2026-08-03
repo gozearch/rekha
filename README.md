@@ -32,13 +32,13 @@ Rekha is a distributed vector database designed for billion-scale Approximate Ne
 - **Tunable Consistency**: ONE/QUORUM/ALL consistency levels with LWW timestamp conflict resolution and hinted handoff replication.
 - **Payload Support**: Store and fetch arbitrary metadata alongside vectors with lazy loading during search.
 - **gRPC Native**: Robust communication layer built with Tonic, featuring built-in TLS and auto-discovery.
+- **Shard Transfer**: Stream vectors between replicas with centroid migration for rebalancing.
+- **Collection Repair**: Automatic reconciliation of inconsistent replicas.
 
 ## 🗺 Roadmap
 
 These features are planned but not yet implemented:
 
-- **Shard transfer**: Full implementation with centroid migration and receiver-side index rebuild.
-- **Collection repair**: Automatic repair of inconsistent replicas.
 - **Live checkpointing**: RocksDB snapshot-based backup without node shutdown.
 - **Connection pooling**: Multi-channel client with load balancing across seeds.
 
@@ -47,7 +47,7 @@ These features are planned but not yet implemented:
 Rekha is organized into a modular workspace:
 
 | Crate | Responsibility |
-|---|---|---|
+|---|---|
 | `rekha-core` | Core types, traits, distance metrics, and error handling. |
 | `rekha-storage` | RocksDB-backed persistent storage (4 column families). |
 | `rekha-index` | IVF index and Product Quantization implementation. |

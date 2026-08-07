@@ -1,0 +1,56 @@
+services:
+  node1:
+    build: .
+    ports:
+      - "8001:8000"
+    volumes:
+      - node1-data:/data
+    environment:
+      - REKHA_DATA_DIR=/data
+      - REKHA_PORT=8000
+      - REKHA_NODE_ID=1
+      - REKHA_PEERS=node1:8000,node2:8000,node3:8000
+      - REKHA_API_KEY=test-key
+    command: ["serve"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  node2:
+    build: .
+    ports:
+      - "8002:8000"
+    volumes:
+      - node2-data:/data
+    environment:
+      - REKHA_DATA_DIR=/data
+      - REKHA_PORT=8000
+      - REKHA_NODE_ID=2
+      - REKHA_PEERS=node1:8000,node2:8000,node3:8000
+      - REKHA_API_KEY=test-key
+    command: ["serve"]
+    restart: unless-stopped
+
+  node3:
+    build: .
+    ports:
+      - "8003:8000"
+    volumes:
+      - node3-data:/data
+    environment:
+      - REKHA_DATA_DIR=/data
+      - REKHA_PORT=8000
+      - REKHA_NODE_ID=3
+      - REKHA_PEERS=node1:8000,node2:8000,node3:8000
+      - REKHA_API_KEY=test-key
+    command: ["serve"]
+    restart: unless-stopped
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

@@ -1,0 +1,9 @@
+[package]
+name = "rekha-objectstore"
+description = "RekhaDB rekha-objectstore crate (stub — implemented in a later phase)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

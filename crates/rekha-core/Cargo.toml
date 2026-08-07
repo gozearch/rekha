@@ -1,0 +1,15 @@
+[package]
+name = "rekha-core"
+description = "Core types for RekhaDB: embeddings, ids, metadata, filters, config, cluster primitives, and WAL operations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

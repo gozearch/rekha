@@ -1,0 +1,30 @@
+[package]
+name = "rekha-engine"
+description = "RekhaDB engine: single-node collection lifecycle, WAL-to-buffer-to-HNSW write pipeline, and query."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-distance = { path = "../rekha-distance" }
+rekha-index = { path = "../rekha-index" }
+rekha-cluster = { path = "../rekha-cluster" }
+rekha-storage = { path = "../rekha-storage" }
+rekha-wal = { path = "../rekha-wal" }
+bincode = "1"
+ordered-float = "4"
+roaring = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+memmap2.workspace = true
+bytemuck.workspace = true
+crc32fast.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+target/
+.git/
+.gitignore
+*.md
+outputs/
+docs/
+*.rs.bk
+.DS_Store
+rekha-data/

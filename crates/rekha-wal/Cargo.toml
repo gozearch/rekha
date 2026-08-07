@@ -1,0 +1,20 @@
+[package]
+name = "rekha-wal"
+description = "Durable per-collection write-ahead log for RekhaDB: the source of truth, replicated via log shipping."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+bincode = "1"
+crc32fast = "1"
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "rekha-bench"
+description = "RekhaDB rekha-bench crate (stub — implemented in a later phase)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

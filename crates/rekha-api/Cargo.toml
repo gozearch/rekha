@@ -1,0 +1,26 @@
+[package]
+name = "rekha-api"
+description = "RekhaDB HTTP API — Chroma-compatible REST server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-engine = { path = "../rekha-engine" }
+rekha-storage = { path = "../rekha-storage" }
+rekha-cluster = { path = "../rekha-cluster" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+metrics.workspace = true
+axum-server.workspace = true
+
+[lints]
+workspace = true

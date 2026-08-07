@@ -1,0 +1,13 @@
+[package]
+name = "rekha-distance"
+description = "SIMD distance kernels (L2, inner product, cosine) with Chroma-exact semantics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+wide.workspace = true
+
+[lints]
+workspace = true

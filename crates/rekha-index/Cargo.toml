@@ -1,0 +1,20 @@
+[package]
+name = "rekha-index"
+description = "RekhaDB vector index trait + usearch-backed HNSW implementation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+usearch = "2"
+bincode = "1"
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rekha-distance = { path = "../rekha-distance" }
+tempfile = "3"
+
+[lints]
+workspace = true

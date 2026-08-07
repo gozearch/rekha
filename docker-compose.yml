@@ -1,0 +1,14 @@
+services:
+  rekha:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - rekha-data:/data
+    environment:
+      - REKHA_DATA_DIR=/data
+      - REKHA_PORT=8000
+    restart: unless-stopped
+
+volumes:
+  rekha-data:

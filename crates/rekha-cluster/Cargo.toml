@@ -1,0 +1,26 @@
+[package]
+name = "rekha-cluster"
+description = "RekhaDB cluster types — ClockMap, WAL shipping, replica management."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-wal = { path = "../rekha-wal" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+bincode = "1"
+openraft = { version = "0.9", features = ["storage-v2", "serde", "generic-snapshot-data"] }
+redb = "4"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["sync", "rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

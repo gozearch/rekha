@@ -1,0 +1,33 @@
+[package]
+name = "rekha-cli"
+description = "RekhaDB CLI — serve the API and interact with collections."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rekha"
+path = "src/main.rs"
+
+[dependencies]
+rekha-api = { path = "../rekha-api" }
+rekha-cluster = { path = "../rekha-cluster" }
+rekha-engine = { path = "../rekha-engine" }
+rekha-core = { path = "../rekha-core" }
+rekha-storage = { path = "../rekha-storage" }
+bincode = "1"
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.8"
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+axum-server.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing-subscriber = "0.3"
+
+[lints]
+workspace = true

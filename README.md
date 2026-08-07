@@ -6,8 +6,8 @@
 
 **A scalable, resource-efficient distributed vector database in Rust**
 
-[![CI](https://github.com/gozearch/rekha-db/actions/workflows/ci.yml/badge.svg)](https://github.com/gozearch/rekha-db/actions/workflows/ci.yml)
-[![Docker](https://github.com/gozearch/rekha-db/actions/workflows/docker.yml/badge.svg)](https://github.com/gozearch/rekha-db/actions/workflows/docker.yml)
+[![CI](https://github.com/gozearch/rekha/actions/workflows/ci.yml/badge.svg)](https://github.com/gozearch/rekha-db/actions/workflows/ci.yml)
+[![Docker](https://github.com/gozearch/rekha/actions/workflows/docker.yml/badge.svg)](https://github.com/gozearch/rekha-db/actions/workflows/docker.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 </div>

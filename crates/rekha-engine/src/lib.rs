@@ -391,6 +391,7 @@ impl Engine {
         // ChromaDB compatibility: infer dimension from first embedding if unset.
         if coll.config.dimension == 0 && !embeddings.is_empty() {
             coll.config.dimension = embeddings[0].len();
+            // TODO: persist inferred dimension to catalog
         }
         coll.validate_add(ids, embeddings, metadatas, documents)?;
         let ops = add_ops(ids, embeddings, metadatas, documents);
@@ -412,6 +413,10 @@ impl Engine {
     ) -> EngineResult<()> {
         let coll = self.collection(collection_id)?;
         let mut coll = coll.lock().unwrap();
+        // ChromaDB compatibility: infer dimension from first embedding if unset.
+        if coll.config.dimension == 0 && !embeddings.is_empty() {
+            coll.config.dimension = embeddings[0].len();
+        }
         coll.validate_upsert(ids, embeddings, metadatas, documents)?;
         let ops = upsert_ops(ids, embeddings, metadatas, documents);
         coll.write_ops(&ops)?;

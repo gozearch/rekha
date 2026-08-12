@@ -50,11 +50,6 @@ pub struct ChromaCollectionResponse {
 }
 
 #[derive(Serialize)]
-pub struct ChromaCountResponse {
-    pub count: u64,
-}
-
-#[derive(Serialize)]
 pub struct ChromaQueryResponse {
     pub ids: Vec<Vec<String>>,
     pub distances: Option<Vec<Vec<f32>>>,
@@ -126,6 +121,7 @@ fn flatten_metadata(meta: &Option<Metadata>) -> Option<serde_json::Value> {
 pub struct ChromaCreateCollectionRequest {
     pub name: String,
     pub metadata: Option<ChromaMetadata>,
+    pub dimension: Option<usize>,
     #[serde(default)]
     pub get_or_create: bool,
 }
@@ -194,7 +190,11 @@ fn chroma_response(record: &rekha_storage::CollectionRecord) -> ChromaCollection
         id: record.config.id.to_string(),
         name: record.config.name.clone(),
         collection_type: "collection".into(),
-        dimension: Some(record.config.dimension),
+        dimension: if record.config.dimension == 0 {
+            None
+        } else {
+            Some(record.config.dimension)
+        },
         metadata: record.config.metadata.as_ref().map(|m| {
             let flat: serde_json::Map<String, serde_json::Value> = m
                 .iter()
@@ -279,13 +279,15 @@ pub(crate) async fn create_collection_chroma(
     Path((tenant, database)): Path<(String, String)>,
     Json(req): Json<ChromaCreateCollectionRequest>,
 ) -> Result<(StatusCode, Json<ChromaCollectionResponse>), ChromaError> {
+    let dimension = req.dimension.unwrap_or(0);
+
     if req.get_or_create {
         if let Some(record) = state.engine.get_collection(&tenant, &database, &req.name)? {
             return Ok((StatusCode::OK, Json(chroma_response(&record))));
         }
     }
 
-    let mut config = CollectionConfig::new(req.name, 0, Distance::L2);
+    let mut config = CollectionConfig::new(req.name, dimension, Distance::L2);
     config.tenant = tenant;
     config.database = database;
     config.metadata = convert_metadata(req.metadata);
@@ -533,13 +535,15 @@ pub(crate) async fn get_records_chroma(
 }
 
 /// GET .../collections/{name}/count
+///
+/// Returns a plain integer (the count), matching the ChromaDB API spec.
 pub(crate) async fn count_records_chroma(
     State(state): State<Arc<AppState>>,
     Path((tenant, database, name)): Path<(String, String, String)>,
-) -> Result<Json<ChromaCountResponse>, ChromaError> {
+) -> Result<Json<u64>, ChromaError> {
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
     let count = state.engine.count(&id)?;
-    Ok(Json(ChromaCountResponse { count }))
+    Ok(Json(count))
 }
 
 // ---------------------------------------------------------------------------
@@ -547,32 +551,52 @@ pub(crate) async fn count_records_chroma(
 // ---------------------------------------------------------------------------
 
 /// Build the ChromaDB-compatible router.
+///
+/// All routes are fully prefixed with `/api/v2` so they can be merged alongside
+/// the public router without a nested prefix conflict.
 pub(crate) fn chroma_router() -> Router<Arc<AppState>> {
     let meta = Router::new()
-        .route("/heartbeat", get(heartbeat))
-        .route("/version", get(version))
-        .route("/pre-flight-checks", get(pre_flight_checks));
+        .route("/api/v2/heartbeat", get(heartbeat))
+        .route("/api/v2/version", get(version))
+        .route("/api/v2/pre-flight-checks", get(pre_flight_checks));
 
     let collections = Router::new()
         .route(
-            "/collections",
+            "/api/v2/tenants/{tenant}/databases/{database}/collections",
             post(create_collection_chroma).get(list_collections_chroma),
         )
         .route(
-            "/collections/{name}",
+            "/api/v2/tenants/{tenant}/databases/{database}/collections/{name}",
             get(get_collection_chroma).delete(delete_collection_chroma),
         )
-        .route("/collections/{name}/add", post(add_records_chroma))
-        .route("/collections/{name}/upsert", post(upsert_records_chroma))
-        .route("/collections/{name}/update", post(update_records_chroma))
-        .route("/collections/{name}/delete", post(delete_records_chroma))
-        .route("/collections/{name}/query", post(query_records_chroma))
-        .route("/collections/{name}/get", post(get_records_chroma))
-        .route("/collections/{name}/count", get(count_records_chroma));
+        .route(
+            "/api/v2/tenants/{tenant}/databases/{database}/collections/{name}/add",
+            post(add_records_chroma),
+        )
+        .route(
+            "/api/v2/tenants/{tenant}/databases/{database}/collections/{name}/upsert",
+            post(upsert_records_chroma),
+        )
+        .route(
+            "/api/v2/tenants/{tenant}/databases/{database}/collections/{name}/update",
+            post(update_records_chroma),
+        )
+        .route(
+            "/api/v2/tenants/{tenant}/databases/{database}/collections/{name}/delete",
+            post(delete_records_chroma),
+        )
+        .route(
+            "/api/v2/tenants/{tenant}/databases/{database}/collections/{name}/query",
+            post(query_records_chroma),
+        )
+        .route(
+            "/api/v2/tenants/{tenant}/databases/{database}/collections/{name}/get",
+            post(get_records_chroma),
+        )
+        .route(
+            "/api/v2/tenants/{tenant}/databases/{database}/collections/{name}/count",
+            get(count_records_chroma),
+        );
 
-    let tenant_db = Router::new().nest("/tenants/{tenant}/databases/{database}", collections);
-
-    let api_v2 = meta.merge(tenant_db);
-
-    Router::new().nest("/api/v2", api_v2)
+    meta.merge(collections)
 }

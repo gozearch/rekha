@@ -725,7 +725,7 @@ impl Collection {
     ) -> EngineResult<Vec<ScoredPoint>> {
         use std::cmp::Ordering;
 
-        if query.len() != self.config.dimension {
+        if self.config.dimension != 0 && query.len() != self.config.dimension {
             return Err(EngineError::Validation(format!(
                 "query: embedding dimension {} != collection dimension {}",
                 query.len(),

@@ -673,11 +673,11 @@ impl Engine {
                 continue;
             }
 
-            if let Ok(coll_arc) = self.collection(&id) {
-                if let Ok(mut coll) = coll_arc.lock() {
-                    for record in records {
-                        coll.records.insert(record.id.clone(), record.clone());
-                    }
+            if let Ok(coll_arc) = self.collection(&id)
+                && let Ok(mut coll) = coll_arc.lock()
+            {
+                for record in records {
+                    coll.records.insert(record.id.clone(), record.clone());
                 }
             }
         }

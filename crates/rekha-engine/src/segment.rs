@@ -214,6 +214,11 @@ impl SegmentWriter {
         self.count
     }
 
+    /// Returns `true` if no vectors have been accumulated.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// Write the segment to `path` atomically (temp file + rename).
     /// Returns the number of bytes written.
     pub fn write(self, path: impl AsRef<Path>) -> EngineResult<u64> {
@@ -239,7 +244,7 @@ impl SegmentWriter {
         buf.extend_from_slice(&header.encode());
         buf.extend_from_slice(bytemuck::cast_slice(&self.vectors));
 
-        std::fs::write(&tmp, &buf)?;
+        std::fs::write(&tmp, buf)?;
         std::fs::rename(&tmp, path)?;
 
         Ok(total as u64)
@@ -320,7 +325,7 @@ mod tests {
         // Write 32 bytes with wrong magic so header decode runs but rejects.
         let mut buf = [0u8; 32];
         buf[0..4].copy_from_slice(b"XXXX");
-        std::fs::write(&path, &buf).unwrap();
+        std::fs::write(&path, buf).unwrap();
         let err = Segment::open(&path).unwrap_err();
         assert!(format!("{err}").contains("bad magic"));
     }

@@ -73,7 +73,7 @@ pub struct ChromaGetResponse {
 /// `true`) and converts them to our tagged `MetadataValue` format.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum ChromaMetadataValue {
+pub enum ChromaMetadataValue {
     Str(String),
     Bool(bool),
     Int(i64),
@@ -91,7 +91,7 @@ impl From<ChromaMetadataValue> for rekha_core::types::MetadataValue {
     }
 }
 
-type ChromaMetadata = std::collections::HashMap<String, ChromaMetadataValue>;
+pub type ChromaMetadata = std::collections::HashMap<String, ChromaMetadataValue>;
 
 fn convert_metadata(m: Option<ChromaMetadata>) -> Option<Metadata> {
     m.map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect())
@@ -281,10 +281,10 @@ pub(crate) async fn create_collection_chroma(
 ) -> Result<(StatusCode, Json<ChromaCollectionResponse>), ChromaError> {
     let dimension = req.dimension.unwrap_or(0);
 
-    if req.get_or_create {
-        if let Some(record) = state.engine.get_collection(&tenant, &database, &req.name)? {
-            return Ok((StatusCode::OK, Json(chroma_response(&record))));
-        }
+    if req.get_or_create
+        && let Some(record) = state.engine.get_collection(&tenant, &database, &req.name)?
+    {
+        return Ok((StatusCode::OK, Json(chroma_response(&record))));
     }
 
     let mut config = CollectionConfig::new(req.name, dimension, Distance::L2);

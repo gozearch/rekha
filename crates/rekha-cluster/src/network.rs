@@ -28,6 +28,7 @@ impl RaftNetworkImpl {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     async fn send_rpc<Req, Resp>(
         &self,
         path: &str,
@@ -187,6 +188,7 @@ pub mod channel {
 
     /// Message variants sent through the channel hub.
     #[derive(Debug)]
+    #[allow(clippy::type_complexity)]
     pub enum ChannelMessage {
         AppendEntries {
             req: AppendEntriesRequest<RC>,

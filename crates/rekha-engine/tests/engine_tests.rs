@@ -1,6 +1,11 @@
 //! Integration tests for `rekha-engine`. The correctness oracle is
 //! `rekha_distance`, which implements Chroma-exact distance semantics.
 
+#![allow(clippy::unreadable_literal)]
+#![allow(clippy::unusual_byte_groupings)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

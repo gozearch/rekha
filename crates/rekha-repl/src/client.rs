@@ -81,10 +81,10 @@ impl RekhaClient {
 
     fn headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(ref key) = self.api_key {
-            if let Ok(val) = key.parse() {
-                headers.insert("x-chroma-token", val);
-            }
+        if let Some(ref key) = self.api_key
+            && let Ok(val) = key.parse()
+        {
+            headers.insert("x-chroma-token", val);
         }
         headers
     }

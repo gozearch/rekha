@@ -241,10 +241,10 @@ impl Collection {
             coll.segments = segments;
         }
         // Load segment index if present.
-        if let Ok(idx_bytes) = std::fs::read(dir.join("segment_index.bin")) {
-            if let Ok(idx) = bincode::deserialize::<HashMap<Id, usize>>(&idx_bytes) {
-                coll.segment_index = idx;
-            }
+        if let Ok(idx_bytes) = std::fs::read(dir.join("segment_index.bin"))
+            && let Ok(idx) = bincode::deserialize::<HashMap<Id, usize>>(&idx_bytes)
+        {
+            coll.segment_index = idx;
         }
 
         // Strip embeddings from loaded records — segments are the
@@ -314,7 +314,7 @@ impl Collection {
         atomic_write(&self.checkpoint_dir.join("records.bin"), &records_bytes)?;
         // 2. HNSW graph + id maps, only if there are vectors to save. `save`
         //    writes both `index.bin` and `index.meta`.
-        if self.index.len() > 0 {
+        if !self.index.is_empty() {
             self.index.save(&self.checkpoint_dir.join("index.bin"))?;
         } else {
             // Ensure stale index files from an older checkpoint don't survive a
@@ -325,10 +325,10 @@ impl Collection {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(_) => {
-                        return Err(EngineError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("removing stale checkpoint file `{}`", p.display()),
-                        )));
+                        return Err(EngineError::Io(std::io::Error::other(format!(
+                            "removing stale checkpoint file `{}`",
+                            p.display()
+                        ))));
                     }
                 }
             }
@@ -924,14 +924,14 @@ fn check_slice_lengths<T>(
     opt: Option<&[Option<T>]>,
     what: &str,
 ) -> EngineResult<()> {
-    if let Some(slice) = opt {
-        if slice.len() != ids.len() {
-            return Err(EngineError::Validation(format!(
-                "{op}: {} ids but {} {what}",
-                ids.len(),
-                slice.len()
-            )));
-        }
+    if let Some(slice) = opt
+        && slice.len() != ids.len()
+    {
+        return Err(EngineError::Validation(format!(
+            "{op}: {} ids but {} {what}",
+            ids.len(),
+            slice.len()
+        )));
     }
     Ok(())
 }

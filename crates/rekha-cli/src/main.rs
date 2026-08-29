@@ -201,12 +201,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 RedbLogStore::open(std::path::PathBuf::from(&data_dir).join("raft_log.redb"))?;
             let sm = ClusterStateMachine::new();
             let network = RaftNetworkFactoryImpl::new(peer_map.clone());
-            let mut raft_config = openraft::Config::default();
-            raft_config.heartbeat_interval = 500;
-            raft_config.election_timeout_min = 1500;
-            raft_config.election_timeout_max = 3000;
-            raft_config.replication_lag_threshold = 10000;
-            let raft_config = Arc::new(raft_config);
+            let raft_config = Arc::new(openraft::Config {
+                heartbeat_interval: 500,
+                election_timeout_min: 1500,
+                election_timeout_max: 3000,
+                replication_lag_threshold: 10000,
+                ..Default::default()
+            });
 
             let raft = openraft::Raft::<rekha_cluster::RaftTypeConfig>::new(
                 node_id,
@@ -274,14 +275,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 bincode::deserialize::<rekha_core::op::Operation>(
                                                     &entry.payload,
                                                 )
-                                            {
-                                                if let Err(e) = engine_clone
+                                                && let Err(e) = engine_clone
                                                     .apply_remote_ops(&cid, vec![(entry.seq, op)])
-                                                {
-                                                    eprintln!(
-                                                        "Failed to apply remote op for {cid}: {e}"
-                                                    );
-                                                }
+                                            {
+                                                eprintln!(
+                                                    "Failed to apply remote op for {cid}: {e}"
+                                                );
                                             }
                                             replication.mark_applied(cid, entry.seq);
                                         }

@@ -173,6 +173,7 @@ impl Wal {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&file_path)?;
 
         let file_len = file.metadata()?.len();
@@ -278,6 +279,11 @@ impl Wal {
         self.len
     }
 
+    /// Returns `true` if the WAL contains no records.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Read all records with `seq` in `[from, to]` inclusive, in seq order —
     /// the delta-transfer primitive for replication. Empty if `from > to`.
     pub fn read_range(&self, from: u64, to: u64) -> WalResult<Vec<WalRecord>> {
@@ -311,10 +317,10 @@ impl Wal {
                     self.header_epoch
                 )));
             }
-            if let Some(prev) = prev_seq {
-                if seq <= prev {
-                    return Err(WalError::Corrupt("non-monotonic seq during read".into()));
-                }
+            if let Some(prev) = prev_seq
+                && seq <= prev
+            {
+                return Err(WalError::Corrupt("non-monotonic seq during read".into()));
             }
             prev_seq = Some(seq);
 
@@ -497,10 +503,10 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<(u64, u6
         if rec_epoch < header_epoch {
             break;
         }
-        if let Some(prev) = prev_seq {
-            if seq <= prev {
-                break;
-            }
+        if let Some(prev) = prev_seq
+            && seq <= prev
+        {
+            break;
         }
 
         let payload_len = (record_len - RECORD_HEADER_LEN as u64) as usize;

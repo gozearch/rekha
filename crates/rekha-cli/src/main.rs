@@ -336,18 +336,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let public_addr = format!("{host}:{port}");
                 let internal_addr = format!("{ihost}:{internal_port}");
 
-                if tls_cert.is_some() && tls_key.is_some() {
+                if let (Some(cert), Some(key)) = (&tls_cert, &tls_key) {
                     // TLS path: serve both listeners via axum-server.
-                    let cert = tls_cert.unwrap();
-                    let key = tls_key.unwrap();
                     let config =
-                        axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
-                            .await?;
+                        axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
                     // Clone config for the second listener (RustlsConfig is not Clone
                     // in older versions — reload from the same files).
                     let config2 =
-                        axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
-                            .await?;
+                        axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
                     let handle = axum_server::Handle::<std::net::SocketAddr>::new();
                     let handle_clone = handle.clone();
                     let handle2 = handle.clone();
@@ -387,8 +383,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::signal::ctrl_c().await.ok();
                         let _ = tx.send(());
                     });
-                    let int_serve = axum::serve(int_listener, internal_app)
-                        .with_graceful_shutdown(async { rx.await.ok(); });
+                    let int_serve =
+                        axum::serve(int_listener, internal_app).with_graceful_shutdown(async {
+                            rx.await.ok();
+                        });
                     tokio::try_join!(pub_serve, int_serve)?;
                 }
             } else {

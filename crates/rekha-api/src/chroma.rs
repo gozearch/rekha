@@ -17,7 +17,7 @@ use rekha_engine::EngineError;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{engine_error_status, validation_err, AppState};
+use crate::{AppState, engine_error_status, validation_err};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -369,23 +369,23 @@ fn validate_chroma_add(req: &ChromaAddRequest) -> Result<(), EngineError> {
             )));
         }
     }
-    if let Some(ref v) = req.metadatas {
-        if v.len() != req.ids.len() {
-            return Err(validation_err(format!(
-                "metadatas len {} != ids len {}",
-                v.len(),
-                req.ids.len()
-            )));
-        }
+    if let Some(ref v) = req.metadatas
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "metadatas len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
     }
-    if let Some(ref v) = req.documents {
-        if v.len() != req.ids.len() {
-            return Err(validation_err(format!(
-                "documents len {} != ids len {}",
-                v.len(),
-                req.ids.len()
-            )));
-        }
+    if let Some(ref v) = req.documents
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "documents len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
     }
     Ok(())
 }

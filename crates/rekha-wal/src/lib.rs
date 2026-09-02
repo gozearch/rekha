@@ -58,7 +58,6 @@ fn le_u16(b: &[u8]) -> u16 {
     u16::from_le_bytes([b[0], b[1]])
 }
 
-
 /// Magic bytes identifying a RekhaDB WAL file: `"RKW1"`.
 const MAGIC: [u8; 4] = *b"RKW1";
 /// On-disk format version.

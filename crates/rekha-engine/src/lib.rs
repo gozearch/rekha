@@ -430,10 +430,10 @@ impl Engine {
             None
         };
         coll.validate_upsert(ids, embeddings, metadatas, documents)?;
-        if let Some(dim) = inferred {
-            if let Err(e) = self.catalog.update_collection_dimension(collection_id, dim) {
-                tracing::warn!("Failed to persist inferred dimension {dim}: {e}");
-            }
+        if let Some(dim) = inferred
+            && let Err(e) = self.catalog.update_collection_dimension(collection_id, dim)
+        {
+            tracing::warn!("Failed to persist inferred dimension {dim}: {e}");
         }
         let ops = upsert_ops(ids, embeddings, metadatas, documents);
         coll.write_ops(&ops)?;

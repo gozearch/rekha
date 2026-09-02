@@ -167,23 +167,23 @@ pub(crate) fn validate_add_request(req: &AddRequest) -> Result<(), EngineError> 
             req.embeddings.len()
         )));
     }
-    if let Some(ref v) = req.metadatas {
-        if v.len() != req.ids.len() {
-            return Err(validation_err(format!(
-                "metadatas len {} != ids len {}",
-                v.len(),
-                req.ids.len()
-            )));
-        }
+    if let Some(ref v) = req.metadatas
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "metadatas len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
     }
-    if let Some(ref v) = req.documents {
-        if v.len() != req.ids.len() {
-            return Err(validation_err(format!(
-                "documents len {} != ids len {}",
-                v.len(),
-                req.ids.len()
-            )));
-        }
+    if let Some(ref v) = req.documents
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "documents len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
     }
     Ok(())
 }
@@ -198,23 +198,23 @@ pub(crate) fn validate_upsert_request(req: &UpsertRequest) -> Result<(), EngineE
             req.embeddings.len()
         )));
     }
-    if let Some(ref v) = req.metadatas {
-        if v.len() != req.ids.len() {
-            return Err(validation_err(format!(
-                "metadatas len {} != ids len {}",
-                v.len(),
-                req.ids.len()
-            )));
-        }
+    if let Some(ref v) = req.metadatas
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "metadatas len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
     }
-    if let Some(ref v) = req.documents {
-        if v.len() != req.ids.len() {
-            return Err(validation_err(format!(
-                "documents len {} != ids len {}",
-                v.len(),
-                req.ids.len()
-            )));
-        }
+    if let Some(ref v) = req.documents
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "documents len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
     }
     Ok(())
 }
@@ -258,23 +258,23 @@ pub(crate) fn validate_delete_request(req: &DeleteRequest) -> Result<(), EngineE
 
 pub(crate) fn validate_update_request(req: &UpdateRequest) -> Result<(), EngineError> {
     validate_ids(&req.ids)?;
-    if let Some(ref v) = req.metadatas {
-        if v.len() != req.ids.len() {
-            return Err(validation_err(format!(
-                "metadatas len {} != ids len {}",
-                v.len(),
-                req.ids.len()
-            )));
-        }
+    if let Some(ref v) = req.metadatas
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "metadatas len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
     }
-    if let Some(ref v) = req.documents {
-        if v.len() != req.ids.len() {
-            return Err(validation_err(format!(
-                "documents len {} != ids len {}",
-                v.len(),
-                req.ids.len()
-            )));
-        }
+    if let Some(ref v) = req.documents
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "documents len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
     }
     Ok(())
 }
@@ -832,7 +832,10 @@ async fn health_handler() -> Result<StatusCode, StatusCode> {
 /// Readiness check — returns 200 if engine is accessible, 503 otherwise.
 async fn ready_handler(State(state): State<Arc<AppState>>) -> Result<StatusCode, StatusCode> {
     // Verify engine catalog is reachable by listing collections.
-    match state.engine.list_collections(&state.tenant, &state.database) {
+    match state
+        .engine
+        .list_collections(&state.tenant, &state.database)
+    {
         Ok(_) => Ok(StatusCode::OK),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
@@ -939,7 +942,9 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .merge(internal_routes())
         .layer(axum::middleware::from_fn(middleware::auth))
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(32 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            32 * 1024 * 1024,
+        ))
         .layer(axum::Extension(app_state.clone()))
         .with_state(app_state)
 }
@@ -950,7 +955,9 @@ pub fn public_router(app_state: Arc<AppState>) -> Router {
     public_routes()
         .layer(axum::middleware::from_fn(middleware::auth))
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(32 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            32 * 1024 * 1024,
+        ))
         .layer(axum::Extension(app_state.clone()))
         .with_state(app_state)
 }
@@ -962,7 +969,9 @@ pub fn internal_router(app_state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         .layer(axum::middleware::from_fn(middleware::auth))
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(32 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            32 * 1024 * 1024,
+        ))
         .layer(axum::Extension(app_state.clone()))
         .with_state(app_state)
 }

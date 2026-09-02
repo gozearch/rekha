@@ -1,22 +1,19 @@
 use std::sync::Arc;
 
 use axum_test::TestServer;
-use rekha_api::{router, AppState};
+use rekha_api::{AppState, router};
 use rekha_engine::{Engine, EngineConfig};
 use rekha_storage::{LocalStorage, RedbCatalog};
 use tempfile::TempDir;
 
 fn test_app(api_key: Option<String>) -> (TempDir, TestServer) {
     let dir = TempDir::new().unwrap();
-    let catalog = Arc::new(
-        RedbCatalog::open(dir.path().join("catalog.redb")).unwrap(),
-    );
+    let catalog = Arc::new(RedbCatalog::open(dir.path().join("catalog.redb")).unwrap());
     let storage = Arc::new(LocalStorage::new(dir.path().join("objects")));
     let wal_dir = dir.path().join("wal");
     std::fs::create_dir_all(&wal_dir).unwrap();
-    let engine = Arc::new(
-        Engine::open(catalog, storage, &wal_dir, EngineConfig::default()).unwrap(),
-    );
+    let engine =
+        Arc::new(Engine::open(catalog, storage, &wal_dir, EngineConfig::default()).unwrap());
     let state = Arc::new(AppState {
         engine,
         tenant: "default_tenant".into(),
@@ -509,7 +506,9 @@ async fn chroma_create_and_query() {
     assert!(resp.status_code() == 200 || resp.status_code() == 201);
 
     let resp = server
-        .post("/api/v2/tenants/default_tenant/databases/default_database/collections/chroma_coll/add")
+        .post(
+            "/api/v2/tenants/default_tenant/databases/default_database/collections/chroma_coll/add",
+        )
         .json(&serde_json::json!({
             "ids": ["c1"],
             "embeddings": [[1.0, 0.0]]

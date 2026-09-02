@@ -185,15 +185,12 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         if data.len() < 4 {
             return Ok(());
         }
-        let cluster_len = u32::from_le_bytes(
-            data[0..4]
-                .try_into()
-                .map_err(|_| StorageError::IO {
-                    source: openraft::StorageIOError::read(&std::io::Error::other(
-                        "snapshot header too short",
-                    )),
-                })?,
-        ) as usize;
+        let cluster_len =
+            u32::from_le_bytes(data[0..4].try_into().map_err(|_| StorageError::IO {
+                source: openraft::StorageIOError::read(&std::io::Error::other(
+                    "snapshot header too short",
+                )),
+            })?) as usize;
 
         if data.len() >= 4 + cluster_len {
             let cluster_data = &data[4..4 + cluster_len];
@@ -213,11 +210,13 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         if data.len() > 4 + cluster_len {
             let engine_data = &data[4 + cluster_len..];
             if let Some(ref engine) = self.engine {
-                engine.restore_snapshot(engine_data).map_err(|e| StorageError::IO {
-                    source: openraft::StorageIOError::read(&std::io::Error::other(format!(
-                        "engine restore failed: {e}"
-                    ))),
-                })?;
+                engine
+                    .restore_snapshot(engine_data)
+                    .map_err(|e| StorageError::IO {
+                        source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                            "engine restore failed: {e}"
+                        ))),
+                    })?;
             }
         }
 

@@ -63,8 +63,7 @@ impl WalDelta {
             .map(|r| WalDeltaRecord {
                 seq: r.seq,
                 epoch: r.epoch,
-                payload: bincode::serialize(&r.op)
-                    .expect("Operation serialization is infallible"),
+                payload: bincode::serialize(&r.op).expect("Operation serialization is infallible"),
             })
             .collect();
         Self {

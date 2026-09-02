@@ -138,18 +138,18 @@ impl Postings {
                     self.eq.remove(key);
                 }
             }
-            if let Some(n) = value.as_f64() {
-                if let Some(key_map) = self.num.get_mut(key) {
-                    let of = OrderedFloat(n);
-                    if let Some(bm) = key_map.get_mut(&of) {
-                        bm.remove(offset);
-                        if bm.is_empty() {
-                            key_map.remove(&of);
-                        }
+            if let Some(n) = value.as_f64()
+                && let Some(key_map) = self.num.get_mut(key)
+            {
+                let of = OrderedFloat(n);
+                if let Some(bm) = key_map.get_mut(&of) {
+                    bm.remove(offset);
+                    if bm.is_empty() {
+                        key_map.remove(&of);
                     }
-                    if key_map.is_empty() {
-                        self.num.remove(key);
-                    }
+                }
+                if key_map.is_empty() {
+                    self.num.remove(key);
                 }
             }
         }

@@ -206,6 +206,7 @@ async fn raft_vote(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[allow(clippy::type_complexity)]
 async fn raft_install_snapshot(
     State(state): State<Arc<AppState>>,
     Json(req): Json<(
@@ -255,7 +256,7 @@ async fn create_collection(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCollectionRequest>,
 ) -> Result<Json<CollectionResponse>, ApiError> {
-    let mut config = CollectionConfig::new(req.name.clone(), req.dimension, req.distance.clone());
+    let mut config = CollectionConfig::new(req.name.clone(), req.dimension, req.distance);
     config.tenant = state.tenant.clone();
     config.database = state.database.clone();
     let record = state.engine.create_collection(&config)?;

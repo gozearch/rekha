@@ -6,18 +6,13 @@ pub mod vertical;
 
 use crate::client::QueryResult;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum OutputFormat {
+    #[default]
     Table,
     Json,
     Csv,
     Vertical,
-}
-
-impl Default for OutputFormat {
-    fn default() -> Self {
-        Self::Table
-    }
 }
 
 impl std::fmt::Display for OutputFormat {
@@ -66,32 +61,29 @@ fn format_csv(result: &QueryResult) -> String {
     output.push('\n');
 
     for i in 0..row_count {
-        if let Some(ids) = result.ids.first() {
-            if let Some(id) = ids.get(i) {
-                output.push_str(id);
-            }
+        if let Some(ids) = result.ids.first()
+            && let Some(id) = ids.get(i)
+        {
+            output.push_str(id);
         }
-        if let Some(ref dists) = result.distances {
-            if let Some(row) = dists.first() {
-                if let Some(d) = row.get(i) {
-                    output.push_str(&format!(",{d:.4}"));
-                }
-            }
+        if let Some(ref dists) = result.distances
+            && let Some(row) = dists.first()
+            && let Some(d) = row.get(i)
+        {
+            output.push_str(&format!(",{d:.4}"));
         }
-        if let Some(ref docs) = result.documents {
-            if let Some(row) = docs.first() {
-                if let Some(Some(doc)) = row.get(i) {
-                    output.push_str(&format!(",\"{}\"", doc.replace('"', "\"\"")));
-                }
-            }
+        if let Some(ref docs) = result.documents
+            && let Some(row) = docs.first()
+            && let Some(Some(doc)) = row.get(i)
+        {
+            output.push_str(&format!(",\"{}\"", doc.replace('"', "\"\"")));
         }
-        if let Some(ref metas) = result.metadatas {
-            if let Some(row) = metas.first() {
-                if let Some(Some(meta)) = row.get(i) {
-                    let s = serde_json::to_string(meta).unwrap_or_default();
-                    output.push_str(&format!(",\"{}\"", s.replace('"', "\"\"")));
-                }
-            }
+        if let Some(ref metas) = result.metadatas
+            && let Some(row) = metas.first()
+            && let Some(Some(meta)) = row.get(i)
+        {
+            let s = serde_json::to_string(meta).unwrap_or_default();
+            output.push_str(&format!(",\"{}\"", s.replace('"', "\"\"")));
         }
         output.push('\n');
     }

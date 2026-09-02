@@ -1,5 +1,7 @@
 //! Disk-backed Raft log storage using redb.
 
+#![allow(clippy::result_large_err)]
+
 use std::fmt::Debug;
 use std::ops::RangeBounds;
 use std::path::Path;
@@ -37,10 +39,7 @@ impl SerializedState {
 
 fn io_error(msg: impl ToString) -> StorageError<u64> {
     StorageError::IO {
-        source: openraft::StorageIOError::read(&std::io::Error::new(
-            std::io::ErrorKind::Other,
-            msg.to_string(),
-        )),
+        source: openraft::StorageIOError::read(&std::io::Error::other(msg.to_string())),
     }
 }
 
@@ -73,10 +72,10 @@ fn read_log_entries(
     let mut entries = Vec::new();
     for idx in start..end {
         let key = idx.to_string();
-        if let Ok(Some(val)) = table.get(key.as_str()) {
-            if let Ok(entry) = bincode::deserialize::<Entry<RaftTypeConfig>>(val.value()) {
-                entries.push(entry);
-            }
+        if let Ok(Some(val)) = table.get(key.as_str())
+            && let Ok(entry) = bincode::deserialize::<Entry<RaftTypeConfig>>(val.value())
+        {
+            entries.push(entry);
         }
     }
     Ok(entries)
@@ -91,10 +90,10 @@ fn find_last_log_id(db: &Database) -> Result<Option<LogId<u64>>, StorageError<u6
 
     for idx in (0..1_000_000u64).rev() {
         let key = idx.to_string();
-        if let Ok(Some(val)) = table.get(key.as_str()) {
-            if let Ok(entry) = bincode::deserialize::<Entry<RaftTypeConfig>>(val.value()) {
-                return Ok(Some(entry.log_id));
-            }
+        if let Ok(Some(val)) = table.get(key.as_str())
+            && let Ok(entry) = bincode::deserialize::<Entry<RaftTypeConfig>>(val.value())
+        {
+            return Ok(Some(entry.log_id));
         }
     }
     Ok(None)

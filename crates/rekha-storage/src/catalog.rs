@@ -155,4 +155,8 @@ pub trait Catalog: Send + Sync {
     /// The stored value is the max of the current value and `seq`, so a
     /// duplicate compaction register can never move the watermark backwards.
     fn advance_log_offset(&self, id: &Uuid, seq: u64) -> Result<(), CatalogError>;
+
+    /// Persist an inferred dimension (used when a collection was created with
+    /// `dimension = 0` for Chroma compatibility).
+    fn update_collection_dimension(&self, id: &Uuid, dimension: usize) -> Result<(), CatalogError>;
 }

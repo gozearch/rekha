@@ -17,7 +17,7 @@ use rekha_engine::EngineError;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{engine_error_status, validation_err, AppState};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -195,23 +195,7 @@ fn chroma_response(record: &rekha_storage::CollectionRecord) -> ChromaCollection
         } else {
             Some(record.config.dimension)
         },
-        metadata: record.config.metadata.as_ref().map(|m| {
-            let flat: serde_json::Map<String, serde_json::Value> = m
-                .iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        rekha_core::types::MetadataValue::Str(s) => {
-                            serde_json::Value::String(s.clone())
-                        }
-                        rekha_core::types::MetadataValue::Bool(b) => serde_json::Value::Bool(*b),
-                        rekha_core::types::MetadataValue::Int(i) => serde_json::json!(i),
-                        rekha_core::types::MetadataValue::Float(f) => serde_json::json!(f),
-                    };
-                    (k.clone(), val)
-                })
-                .collect();
-            serde_json::Value::Object(flat)
-        }),
+        metadata: flatten_metadata(&record.config.metadata),
         tenant: record.config.tenant.clone(),
         database: record.config.database.clone(),
         configuration_json: Some(serde_json::json!({})),
@@ -222,15 +206,12 @@ fn chroma_response(record: &rekha_storage::CollectionRecord) -> ChromaCollection
 // Error mapping
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ChromaError(EngineError);
+pub(crate) struct ChromaError(pub(crate) EngineError);
 
 impl IntoResponse for ChromaError {
     fn into_response(self) -> axum::response::Response {
-        let (status, message) = match &self.0 {
-            EngineError::CollectionNotFound(_) => (StatusCode::NOT_FOUND, self.0.to_string()),
-            EngineError::Validation(_) => (StatusCode::BAD_REQUEST, self.0.to_string()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()),
-        };
+        let status = engine_error_status(&self.0);
+        let message = self.0.to_string();
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
 }
@@ -280,6 +261,14 @@ pub(crate) async fn create_collection_chroma(
     Json(req): Json<ChromaCreateCollectionRequest>,
 ) -> Result<(StatusCode, Json<ChromaCollectionResponse>), ChromaError> {
     let dimension = req.dimension.unwrap_or(0);
+    crate::validate_name(&req.name).map_err(ChromaError)?;
+    if dimension > crate::MAX_DIMENSION {
+        return Err(ChromaError(validation_err(format!(
+            "dimension {} exceeds max {}",
+            dimension,
+            crate::MAX_DIMENSION
+        ))));
+    }
 
     if req.get_or_create
         && let Some(record) = state.engine.get_collection(&tenant, &database, &req.name)?
@@ -333,7 +322,12 @@ pub(crate) async fn delete_collection_chroma(
         let op = rekha_cluster::ClusterOperation::RemoveCollection {
             collection_id: record.config.id,
         };
-        let _ = raft.client_write(op).await;
+        if let Err(e) = raft.client_write(op).await {
+            tracing::error!("Raft client_write failed for RemoveCollection: {e}");
+            return Err(ChromaError(validation_err(format!(
+                "failed to replicate collection deletion: {e}"
+            ))));
+        }
     }
 
     Ok(Json(chroma_response(&record)))
@@ -343,12 +337,66 @@ pub(crate) async fn delete_collection_chroma(
 // Handlers — Record operations
 // ---------------------------------------------------------------------------
 
+fn validate_chroma_add(req: &ChromaAddRequest) -> Result<(), EngineError> {
+    if req.ids.is_empty() {
+        return Err(validation_err("ids must not be empty"));
+    }
+    if req.ids.len() > crate::MAX_BATCH_SIZE {
+        return Err(validation_err(format!(
+            "batch size {} exceeds max {}",
+            req.ids.len(),
+            crate::MAX_BATCH_SIZE
+        )));
+    }
+    if req.ids.len() != req.embeddings.len() {
+        return Err(validation_err(format!(
+            "ids len {} != embeddings len {}",
+            req.ids.len(),
+            req.embeddings.len()
+        )));
+    }
+    for id in &req.ids {
+        if id.is_empty() || id.len() > crate::MAX_ID_LENGTH {
+            return Err(validation_err(format!("invalid id length: {id}")));
+        }
+    }
+    for emb in &req.embeddings {
+        if emb.is_empty() || emb.len() > crate::MAX_DIMENSION {
+            return Err(validation_err(format!(
+                "embedding dimension {} invalid (max {})",
+                emb.len(),
+                crate::MAX_DIMENSION
+            )));
+        }
+    }
+    if let Some(ref v) = req.metadatas {
+        if v.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "metadatas len {} != ids len {}",
+                v.len(),
+                req.ids.len()
+            )));
+        }
+    }
+    if let Some(ref v) = req.documents {
+        if v.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "documents len {} != ids len {}",
+                v.len(),
+                req.ids.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// POST .../collections/{name}/add
 pub(crate) async fn add_records_chroma(
     State(state): State<Arc<AppState>>,
     Path((tenant, database, name)): Path<(String, String, String)>,
     Json(req): Json<ChromaAddRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ChromaError> {
+    validate_chroma_add(&req).map_err(ChromaError)?;
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
     let embeddings: Vec<Embedding> = req.embeddings.into_iter().map(|e| e.into()).collect();
     let metadatas: Option<Vec<Option<Metadata>>> = req.metadatas.map(|m| {
@@ -372,6 +420,7 @@ pub(crate) async fn upsert_records_chroma(
     Path((tenant, database, name)): Path<(String, String, String)>,
     Json(req): Json<ChromaAddRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ChromaError> {
+    validate_chroma_add(&req).map_err(ChromaError)?;
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
     let embeddings: Vec<Embedding> = req.embeddings.into_iter().map(|e| e.into()).collect();
     let metadatas: Option<Vec<Option<Metadata>>> = req.metadatas.map(|m| {
@@ -395,6 +444,16 @@ pub(crate) async fn update_records_chroma(
     Path((tenant, database, name)): Path<(String, String, String)>,
     Json(req): Json<ChromaAddRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ChromaError> {
+    if req.ids.is_empty() {
+        return Err(ChromaError(validation_err("ids must not be empty")));
+    }
+    if req.ids.len() > crate::MAX_BATCH_SIZE {
+        return Err(ChromaError(validation_err(format!(
+            "batch size {} exceeds max {}",
+            req.ids.len(),
+            crate::MAX_BATCH_SIZE
+        ))));
+    }
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
     let metadatas: Option<Vec<Option<Metadata>>> = req.metadatas.map(|m| {
         m.into_iter()
@@ -416,6 +475,16 @@ pub(crate) async fn delete_records_chroma(
     Path((tenant, database, name)): Path<(String, String, String)>,
     Json(req): Json<ChromaDeleteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ChromaError> {
+    if req.ids.is_empty() {
+        return Err(ChromaError(validation_err("ids must not be empty")));
+    }
+    if req.ids.len() > crate::MAX_BATCH_SIZE {
+        return Err(ChromaError(validation_err(format!(
+            "batch size {} exceeds max {}",
+            req.ids.len(),
+            crate::MAX_BATCH_SIZE
+        ))));
+    }
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
     state.engine.delete(&id, &req.ids)?;
     Ok((StatusCode::OK, Json(serde_json::json!({}))))
@@ -427,6 +496,25 @@ pub(crate) async fn query_records_chroma(
     Path((tenant, database, name)): Path<(String, String, String)>,
     Json(req): Json<ChromaQueryRequest>,
 ) -> Result<Json<ChromaQueryResponse>, ChromaError> {
+    if req.query_embeddings.is_empty() {
+        return Err(ChromaError(validation_err(
+            "query_embeddings must not be empty",
+        )));
+    }
+    if req.query_embeddings.len() > crate::MAX_QUERY_EMBEDDINGS {
+        return Err(ChromaError(validation_err(format!(
+            "query_embeddings len {} exceeds max {}",
+            req.query_embeddings.len(),
+            crate::MAX_QUERY_EMBEDDINGS
+        ))));
+    }
+    if req.n_results == 0 || req.n_results > crate::MAX_N_RESULTS {
+        return Err(ChromaError(validation_err(format!(
+            "n_results {} out of range 1..={}",
+            req.n_results,
+            crate::MAX_N_RESULTS
+        ))));
+    }
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
 
     let mut all_results = Vec::new();

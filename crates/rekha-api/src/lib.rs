@@ -23,6 +23,7 @@ pub mod middleware {
     use axum::http::{HeaderMap, Request, StatusCode};
     use axum::middleware::Next;
     use axum::response::Response;
+    use subtle::ConstantTimeEq;
 
     pub async fn auth(
         request: Request<axum::body::Body>,
@@ -41,7 +42,14 @@ pub mod middleware {
                 .or_else(|| headers.get("x-api-key"))
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            if provided.as_ref() != Some(expected) {
+            let authorized = match provided {
+                Some(ref token) => {
+                    // Constant-time comparison to avoid timing side-channel.
+                    token.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1
+                }
+                None => false,
+            };
+            if !authorized {
                 return Err(StatusCode::UNAUTHORIZED);
             }
         }
@@ -69,11 +77,8 @@ struct ApiError(EngineError);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, message) = match &self.0 {
-            EngineError::CollectionNotFound(_) => (StatusCode::NOT_FOUND, self.0.to_string()),
-            EngineError::Validation(_) => (StatusCode::BAD_REQUEST, self.0.to_string()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()),
-        };
+        let status = engine_error_status(&self.0);
+        let message = self.0.to_string();
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
 }
@@ -81,6 +86,205 @@ impl IntoResponse for ApiError {
 impl From<EngineError> for ApiError {
     fn from(e: EngineError) -> Self {
         ApiError(e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) const MAX_BATCH_SIZE: usize = 10_000;
+pub(crate) const MAX_QUERY_EMBEDDINGS: usize = 100;
+pub(crate) const MAX_N_RESULTS: usize = 1_000;
+pub(crate) const MAX_ID_LENGTH: usize = 512;
+pub(crate) const MAX_NAME_LENGTH: usize = 512;
+pub(crate) const MAX_DIMENSION: usize = 65_536;
+
+pub(crate) fn validation_err(msg: impl Into<String>) -> EngineError {
+    EngineError::Validation(msg.into())
+}
+
+pub(crate) fn validate_name(name: &str) -> Result<(), EngineError> {
+    if name.is_empty() {
+        return Err(validation_err("name must not be empty"));
+    }
+    if name.len() > MAX_NAME_LENGTH {
+        return Err(validation_err(format!(
+            "name exceeds max length {MAX_NAME_LENGTH}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_ids(ids: &[Id]) -> Result<(), EngineError> {
+    if ids.is_empty() {
+        return Err(validation_err("ids must not be empty"));
+    }
+    if ids.len() > MAX_BATCH_SIZE {
+        return Err(validation_err(format!(
+            "batch size {} exceeds max {MAX_BATCH_SIZE}",
+            ids.len()
+        )));
+    }
+    for id in ids {
+        if id.is_empty() {
+            return Err(validation_err("id must not be empty"));
+        }
+        if id.len() > MAX_ID_LENGTH {
+            return Err(validation_err(format!(
+                "id exceeds max length {MAX_ID_LENGTH}: {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_embeddings(embeddings: &[Vec<f32>]) -> Result<(), EngineError> {
+    if embeddings.is_empty() {
+        return Err(validation_err("embeddings must not be empty"));
+    }
+    for emb in embeddings {
+        if emb.is_empty() {
+            return Err(validation_err("embedding must not be empty"));
+        }
+        if emb.len() > MAX_DIMENSION {
+            return Err(validation_err(format!(
+                "embedding dimension {} exceeds max {MAX_DIMENSION}",
+                emb.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_add_request(req: &AddRequest) -> Result<(), EngineError> {
+    validate_ids(&req.ids)?;
+    validate_embeddings(&req.embeddings)?;
+    if req.ids.len() != req.embeddings.len() {
+        return Err(validation_err(format!(
+            "ids len {} != embeddings len {}",
+            req.ids.len(),
+            req.embeddings.len()
+        )));
+    }
+    if let Some(ref v) = req.metadatas {
+        if v.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "metadatas len {} != ids len {}",
+                v.len(),
+                req.ids.len()
+            )));
+        }
+    }
+    if let Some(ref v) = req.documents {
+        if v.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "documents len {} != ids len {}",
+                v.len(),
+                req.ids.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_upsert_request(req: &UpsertRequest) -> Result<(), EngineError> {
+    validate_ids(&req.ids)?;
+    validate_embeddings(&req.embeddings)?;
+    if req.ids.len() != req.embeddings.len() {
+        return Err(validation_err(format!(
+            "ids len {} != embeddings len {}",
+            req.ids.len(),
+            req.embeddings.len()
+        )));
+    }
+    if let Some(ref v) = req.metadatas {
+        if v.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "metadatas len {} != ids len {}",
+                v.len(),
+                req.ids.len()
+            )));
+        }
+    }
+    if let Some(ref v) = req.documents {
+        if v.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "documents len {} != ids len {}",
+                v.len(),
+                req.ids.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_query_request(req: &QueryRequest) -> Result<(), EngineError> {
+    if req.query_embeddings.is_empty() {
+        return Err(validation_err("query_embeddings must not be empty"));
+    }
+    if req.query_embeddings.len() > MAX_QUERY_EMBEDDINGS {
+        return Err(validation_err(format!(
+            "query_embeddings len {} exceeds max {MAX_QUERY_EMBEDDINGS}",
+            req.query_embeddings.len()
+        )));
+    }
+    if req.n_results == 0 {
+        return Err(validation_err("n_results must be >= 1"));
+    }
+    if req.n_results > MAX_N_RESULTS {
+        return Err(validation_err(format!(
+            "n_results {} exceeds max {MAX_N_RESULTS}",
+            req.n_results
+        )));
+    }
+    for emb in &req.query_embeddings {
+        if emb.is_empty() {
+            return Err(validation_err("query embedding must not be empty"));
+        }
+        if emb.len() > MAX_DIMENSION {
+            return Err(validation_err(format!(
+                "query embedding dimension {} exceeds max {MAX_DIMENSION}",
+                emb.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_delete_request(req: &DeleteRequest) -> Result<(), EngineError> {
+    validate_ids(&req.ids)
+}
+
+pub(crate) fn validate_update_request(req: &UpdateRequest) -> Result<(), EngineError> {
+    validate_ids(&req.ids)?;
+    if let Some(ref v) = req.metadatas {
+        if v.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "metadatas len {} != ids len {}",
+                v.len(),
+                req.ids.len()
+            )));
+        }
+    }
+    if let Some(ref v) = req.documents {
+        if v.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "documents len {} != ids len {}",
+                v.len(),
+                req.ids.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Shared helper: map EngineError variants to HTTP status.
+pub(crate) fn engine_error_status(err: &EngineError) -> StatusCode {
+    match err {
+        EngineError::CollectionNotFound(_) => StatusCode::NOT_FOUND,
+        EngineError::Validation(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -256,6 +460,13 @@ async fn create_collection(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCollectionRequest>,
 ) -> Result<Json<CollectionResponse>, ApiError> {
+    validate_name(&req.name)?;
+    if req.dimension > MAX_DIMENSION {
+        return Err(ApiError(validation_err(format!(
+            "dimension {} exceeds max {MAX_DIMENSION}",
+            req.dimension
+        ))));
+    }
     let mut config = CollectionConfig::new(req.name.clone(), req.dimension, req.distance);
     config.tenant = state.tenant.clone();
     config.database = state.database.clone();
@@ -273,7 +484,12 @@ async fn create_collection(
             database: state.database.clone(),
             owner_nodes: vec![1],
         };
-        let _ = raft.client_write(op).await;
+        if let Err(e) = raft.client_write(op).await {
+            tracing::error!("Raft client_write failed for AddCollection: {e}");
+            return Err(ApiError(EngineError::Validation(format!(
+                "failed to replicate collection creation: {e}"
+            ))));
+        }
     }
 
     Ok(Json(CollectionResponse {
@@ -311,7 +527,7 @@ async fn get_collection(
 ) -> Result<Json<CollectionResponse>, ApiError> {
     let record = state
         .engine
-        .get_collection(&state.tenant, &state.database, &id.to_string())?
+        .get_collection_by_id(&id)?
         .ok_or_else(|| EngineError::CollectionNotFound(id.to_string()))?;
     let count = state.engine.count(&id)?;
     Ok(Json(CollectionResponse {
@@ -332,7 +548,12 @@ async fn delete_collection(
     // Propagate through Raft if available.
     if let Some(ref raft) = state.raft {
         let op = ClusterOperation::RemoveCollection { collection_id: id };
-        let _ = raft.client_write(op).await;
+        if let Err(e) = raft.client_write(op).await {
+            tracing::error!("Raft client_write failed for RemoveCollection: {e}");
+            return Err(ApiError(EngineError::Validation(format!(
+                "failed to replicate collection deletion: {e}"
+            ))));
+        }
     }
 
     Ok(StatusCode::OK)
@@ -343,6 +564,7 @@ async fn add_records(
     Path(id): Path<Uuid>,
     Json(req): Json<AddRequest>,
 ) -> Result<StatusCode, ApiError> {
+    validate_add_request(&req)?;
     let embeddings: Vec<Embedding> = req.embeddings.into_iter().map(|e| e.into()).collect();
     state.engine.add(
         &id,
@@ -359,6 +581,7 @@ async fn upsert_records(
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertRequest>,
 ) -> Result<StatusCode, ApiError> {
+    validate_upsert_request(&req)?;
     let embeddings: Vec<Embedding> = req.embeddings.into_iter().map(|e| e.into()).collect();
     state.engine.upsert(
         &id,
@@ -375,6 +598,7 @@ async fn update_records(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateRequest>,
 ) -> Result<StatusCode, ApiError> {
+    validate_update_request(&req)?;
     state.engine.update(
         &id,
         &req.ids,
@@ -389,6 +613,7 @@ async fn delete_records(
     Path(id): Path<Uuid>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<StatusCode, ApiError> {
+    validate_delete_request(&req)?;
     state.engine.delete(&id, &req.ids)?;
     Ok(StatusCode::OK)
 }
@@ -398,6 +623,7 @@ async fn query_records(
     Path(id): Path<Uuid>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
+    validate_query_request(&req)?;
     let include_metadatas = req.include.iter().any(|s| s == "metadatas");
     let include_documents = req.include.iter().any(|s| s == "documents");
     let include_distances = req.include.iter().any(|s| s == "distances");
@@ -603,11 +829,13 @@ async fn health_handler() -> Result<StatusCode, StatusCode> {
     Ok(StatusCode::OK)
 }
 
-/// Readiness check — returns 200 if engine is accessible.
+/// Readiness check — returns 200 if engine is accessible, 503 otherwise.
 async fn ready_handler(State(state): State<Arc<AppState>>) -> Result<StatusCode, StatusCode> {
-    // Quick check: can we access the engine?
-    let _ = state.engine.count(&uuid::Uuid::nil()).is_err();
-    Ok(StatusCode::OK)
+    // Verify engine catalog is reachable by listing collections.
+    match state.engine.list_collections(&state.tenant, &state.database) {
+        Ok(_) => Ok(StatusCode::OK),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 /// ChromaDB auth identity stub.
@@ -655,22 +883,8 @@ async fn create_database(
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the axum router with all Chroma-compatible endpoints.
-pub fn router(app_state: Arc<AppState>) -> Router {
-    let internal = Router::new()
-        .route("/internal/raft/append_entries", post(raft_append_entries))
-        .route("/internal/raft/vote", post(raft_vote))
-        .route(
-            "/internal/raft/install_snapshot",
-            post(raft_install_snapshot),
-        )
-        .route("/internal/raft/membership", get(raft_membership))
-        .route("/internal/raft/add_learner", post(raft_add_learner))
-        .route("/internal/raft/remove_member", post(raft_remove_member))
-        .route("/internal/wal/{id}/delta", get(wal_delta_handler))
-        .route("/internal/wal/{id}/status", get(wal_status_handler));
-
-    let public = Router::new()
+fn public_routes() -> Router<Arc<AppState>> {
+    let public: Router<Arc<AppState>> = Router::new()
         .route(
             "/api/v2/collections",
             post(create_collection).get(list_collections),
@@ -699,13 +913,56 @@ pub fn router(app_state: Arc<AppState>) -> Router {
             "/api/v2/tenants/{tenant}/databases/{name}",
             get(get_database),
         );
+    public.merge(chroma::chroma_router())
+}
 
-    let chroma = chroma::chroma_router();
+fn internal_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/internal/raft/append_entries", post(raft_append_entries))
+        .route("/internal/raft/vote", post(raft_vote))
+        .route(
+            "/internal/raft/install_snapshot",
+            post(raft_install_snapshot),
+        )
+        .route("/internal/raft/membership", get(raft_membership))
+        .route("/internal/raft/add_learner", post(raft_add_learner))
+        .route("/internal/raft/remove_member", post(raft_remove_member))
+        .route("/internal/wal/{id}/delta", get(wal_delta_handler))
+        .route("/internal/wal/{id}/status", get(wal_status_handler))
+}
 
-    public
-        .merge(internal)
-        .merge(chroma)
+/// Build the full router (public + internal + Chroma) on a single listener.
+/// For production, prefer separate listeners via [`public_router`] and
+/// [`internal_router`] so internal endpoints are not exposed publicly.
+pub fn router(app_state: Arc<AppState>) -> Router {
+    public_routes()
+        .merge(internal_routes())
         .layer(axum::middleware::from_fn(middleware::auth))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(32 * 1024 * 1024))
+        .layer(axum::Extension(app_state.clone()))
+        .with_state(app_state)
+}
+
+/// Public API router (collections, health, tenants, Chroma compat).
+/// Intended for the public listener.
+pub fn public_router(app_state: Arc<AppState>) -> Router {
+    public_routes()
+        .layer(axum::middleware::from_fn(middleware::auth))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(32 * 1024 * 1024))
+        .layer(axum::Extension(app_state.clone()))
+        .with_state(app_state)
+}
+
+/// Internal cluster router (Raft RPCs + WAL shipping).
+/// Intended for a separate, network-isolated listener.
+pub fn internal_router(app_state: Arc<AppState>) -> Router {
+    internal_routes()
+        .route("/health", get(health_handler))
+        .layer(axum::middleware::from_fn(middleware::auth))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(32 * 1024 * 1024))
         .layer(axum::Extension(app_state.clone()))
         .with_state(app_state)
 }

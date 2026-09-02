@@ -80,12 +80,85 @@ pub type Document = String;
 
 /// A single metadata value, mirroring the JSON-compatible types Chroma stores
 /// (`str`, `bool`, `int`, `float`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MetadataValue {
     Str(String),
     Bool(bool),
     Int(i64),
     Float(f64),
+}
+
+impl serde::Serialize for MetadataValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            match self {
+                MetadataValue::Str(s) => serializer.serialize_str(s),
+                MetadataValue::Bool(b) => serializer.serialize_bool(*b),
+                MetadataValue::Int(i) => serializer.serialize_i64(*i),
+                MetadataValue::Float(f) => serializer.serialize_f64(*f),
+            }
+        } else {
+            match self {
+                MetadataValue::Str(s) => {
+                    serializer.serialize_newtype_variant("MetadataValue", 0, "Str", s)
+                }
+                MetadataValue::Bool(b) => {
+                    serializer.serialize_newtype_variant("MetadataValue", 1, "Bool", b)
+                }
+                MetadataValue::Int(i) => {
+                    serializer.serialize_newtype_variant("MetadataValue", 2, "Int", i)
+                }
+                MetadataValue::Float(f) => {
+                    serializer.serialize_newtype_variant("MetadataValue", 3, "Float", f)
+                }
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MetadataValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let v = serde_json::Value::deserialize(deserializer)?;
+            match v {
+                serde_json::Value::String(s) => Ok(MetadataValue::Str(s)),
+                serde_json::Value::Bool(b) => Ok(MetadataValue::Bool(b)),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        Ok(MetadataValue::Int(i))
+                    } else if let Some(f) = n.as_f64() {
+                        Ok(MetadataValue::Float(f))
+                    } else {
+                        Err(serde::de::Error::custom("invalid number for MetadataValue"))
+                    }
+                }
+                _ => Err(serde::de::Error::custom(
+                    "invalid metadata value: expected string, bool, or number",
+                )),
+            }
+        } else {
+            #[derive(serde::Deserialize)]
+            enum Helper {
+                Str(String),
+                Bool(bool),
+                Int(i64),
+                Float(f64),
+            }
+            let h = Helper::deserialize(deserializer)?;
+            Ok(match h {
+                Helper::Str(s) => MetadataValue::Str(s),
+                Helper::Bool(b) => MetadataValue::Bool(b),
+                Helper::Int(i) => MetadataValue::Int(i),
+                Helper::Float(f) => MetadataValue::Float(f),
+            })
+        }
+    }
 }
 
 impl MetadataValue {
@@ -106,6 +179,7 @@ pub type Metadata = HashMap<String, MetadataValue>;
 /// The distance space a collection is indexed and searched in. Matches the
 /// three Chroma `hnsw:space` options exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum Distance {
     /// Squared Euclidean distance (no square root).
     #[default]
@@ -137,11 +211,11 @@ impl FromStr for Distance {
     type Err = DistanceParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "l2" => Ok(Distance::L2),
             "cosine" => Ok(Distance::Cosine),
             "ip" => Ok(Distance::Ip),
-            other => Err(DistanceParseError(other.to_owned())),
+            _ => Err(DistanceParseError(s.to_owned())),
         }
     }
 }

@@ -42,13 +42,14 @@
 //! usearch 2.26 has no per-call `SearchOptions`; the search beam is the index's
 //! `expansion_search`. [`Index::search`] therefore calls
 //! `change_expansion_search(ef)` before every query (internally
-//! `expansion = max(ef, k)`). That mutates the C++ index through a shared
-//! reference, so concurrent `search` calls on one `UsearchIndex` must be
-//! externally synchronized (e.g. a `Mutex` held by the engine).
+//! `expansion = max(ef, k)`). That mutates the C++ index; `UsearchIndex`
+//! wraps the inner `usearch::Index` in a `Mutex` so `search(&self)` is safe
+//! to call concurrently.
 
 use std::collections::HashMap;
 use std::path::Path;
 
+use parking_lot::Mutex;
 use rekha_core::config::HnswConfig;
 use rekha_core::types::{Distance, Embedding, Id};
 use serde::{Deserialize, Serialize};
@@ -78,8 +79,12 @@ pub struct IndexMeta {
 
 /// An HNSW index over a single collection's vectors, backed by the usearch
 /// C++ library.
+///
+/// The underlying `usearch::Index` is wrapped in a `Mutex` so that
+/// `Index::search` (which mutates C++ expansion state via
+/// `change_expansion_search`) is safe to call concurrently from `&self`.
 pub struct UsearchIndex {
-    inner: usearch::Index,
+    inner: Mutex<usearch::Index>,
     space: Distance,
     dimension: usize,
     /// External id → internal `u64` label (Chroma's `id_to_label`).
@@ -120,7 +125,7 @@ impl UsearchIndex {
         let inner =
             usearch::Index::new(&options).map_err(|e| IndexError::Usearch(e.to_string()))?;
         Ok(Self {
-            inner,
+            inner: Mutex::new(inner),
             space,
             dimension,
             labels: HashMap::new(),
@@ -134,9 +139,10 @@ impl UsearchIndex {
     /// if `size` reaches `capacity`. We grow geometrically (at least 64 slots)
     /// to keep the per-add cost amortized O(1).
     fn ensure_capacity(&self) -> IndexResult<()> {
-        if self.inner.size() >= self.inner.capacity() {
-            let target = (self.inner.capacity() * 2).max(self.inner.size() + 64);
-            self.inner
+        let inner = self.inner.lock();
+        if inner.size() >= inner.capacity() {
+            let target = (inner.capacity() * 2).max(inner.size() + 64);
+            inner
                 .reserve(target)
                 .map_err(|e| IndexError::Usearch(e.to_string()))?;
         }
@@ -160,10 +166,11 @@ impl Index for UsearchIndex {
         self.next_label += 1;
         self.labels.insert(id.clone(), label);
         self.ids.insert(label, id.clone());
-        let result = self
-            .inner
+        let inner = self.inner.lock();
+        let result = inner
             .add(label, embedding.as_ref())
             .map_err(|e| IndexError::Usearch(e.to_string()));
+        drop(inner);
         if result.is_err() {
             self.labels.remove(id);
             self.ids.remove(&label);
@@ -178,7 +185,7 @@ impl Index for UsearchIndex {
         // Physical removal. The FFI result (count + errors) is intentionally
         // ignored: the maps are our bookkeeping source of truth, and any label
         // left behind in the graph is filtered out of search results below.
-        let _ = self.inner.remove(label);
+        let _ = self.inner.lock().remove(label);
         self.labels.remove(id);
         self.ids.remove(&label);
         Ok(())
@@ -191,12 +198,15 @@ impl Index for UsearchIndex {
                 got: query.len(),
             });
         }
-        self.inner.change_expansion_search(ef);
-        let matches = self
-            .inner
+        let inner = self.inner.lock();
+        inner.change_expansion_search(ef);
+        let matches = inner
             .search(query.as_ref(), k)
             .map_err(|e| IndexError::Usearch(e.to_string()))?;
-        Ok(matches
+        // `inner` lock must be held while filtering, but `self.ids` is separate.
+        // Clone the relevant ids while still holding the lock to avoid
+        // holding it across the filter_map (which borrows `self.ids`).
+        let hits: Vec<IndexHit> = matches
             .keys
             .into_iter()
             .zip(matches.distances)
@@ -206,11 +216,13 @@ impl Index for UsearchIndex {
                     distance,
                 })
             })
-            .collect())
+            .collect();
+        drop(inner);
+        Ok(hits)
     }
 
     fn len(&self) -> usize {
-        self.inner.size()
+        self.inner.lock().size()
     }
 
     fn contains(&self, id: &Id) -> bool {
@@ -229,9 +241,13 @@ impl Index for UsearchIndex {
         // Graph: usearch's own portable format, via temp + rename.
         let graph_tmp = tmp_sibling(path);
         self.inner
+            .lock()
             .save(&graph_tmp.to_string_lossy())
             .map_err(|e| IndexError::Usearch(e.to_string()))?;
         std::fs::rename(&graph_tmp, path)?;
+        if let Some(parent) = path.parent() {
+            let _ = sync_dir(parent);
+        }
 
         // Maps: bincode, via temp + rename.
         let meta = IndexMeta {
@@ -245,9 +261,17 @@ impl Index for UsearchIndex {
         let meta_path = path.with_extension("meta");
         let meta_tmp = tmp_sibling(&meta_path);
         std::fs::write(&meta_tmp, &bytes)?;
-        std::fs::rename(&meta_tmp, meta_path)?;
+        std::fs::rename(&meta_tmp, &meta_path)?;
+        if let Some(parent) = meta_path.parent() {
+            let _ = sync_dir(parent);
+        }
         Ok(())
     }
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    let f = std::fs::File::open(dir)?;
+    f.sync_all()
 }
 
 /// Temp-file sibling of `path` (appends `.tmp` to the file name), used for the
@@ -299,7 +323,7 @@ impl UsearchIndex {
         }
 
         Ok(Self {
-            inner,
+            inner: Mutex::new(inner),
             space,
             dimension,
             labels: meta.labels,

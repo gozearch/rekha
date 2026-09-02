@@ -389,11 +389,20 @@ impl Engine {
         let coll = self.collection(collection_id)?;
         let mut coll = coll.lock().unwrap();
         // ChromaDB compatibility: infer dimension from first embedding if unset.
-        if coll.config.dimension == 0 && !embeddings.is_empty() {
+        let inferred = if coll.config.dimension == 0 && !embeddings.is_empty() {
             coll.config.dimension = embeddings[0].len();
-            // TODO: persist inferred dimension to catalog
-        }
+            Some(embeddings[0].len())
+        } else {
+            None
+        };
         coll.validate_add(ids, embeddings, metadatas, documents)?;
+        if let Some(dim) = inferred {
+            // Persist inferred dimension so it survives restart.
+            // Failure to persist is not fatal — the WAL replay will re-infer.
+            if let Err(e) = self.catalog.update_collection_dimension(collection_id, dim) {
+                tracing::warn!("Failed to persist inferred dimension {dim}: {e}");
+            }
+        }
         let ops = add_ops(ids, embeddings, metadatas, documents);
         coll.write_ops(&ops)?;
         coll.flush_if_needed()?;
@@ -414,10 +423,18 @@ impl Engine {
         let coll = self.collection(collection_id)?;
         let mut coll = coll.lock().unwrap();
         // ChromaDB compatibility: infer dimension from first embedding if unset.
-        if coll.config.dimension == 0 && !embeddings.is_empty() {
+        let inferred = if coll.config.dimension == 0 && !embeddings.is_empty() {
             coll.config.dimension = embeddings[0].len();
-        }
+            Some(embeddings[0].len())
+        } else {
+            None
+        };
         coll.validate_upsert(ids, embeddings, metadatas, documents)?;
+        if let Some(dim) = inferred {
+            if let Err(e) = self.catalog.update_collection_dimension(collection_id, dim) {
+                tracing::warn!("Failed to persist inferred dimension {dim}: {e}");
+            }
+        }
         let ops = upsert_ops(ids, embeddings, metadatas, documents);
         coll.write_ops(&ops)?;
         coll.flush_if_needed()?;

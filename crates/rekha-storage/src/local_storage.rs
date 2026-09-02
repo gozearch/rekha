@@ -92,6 +92,11 @@ impl LocalStorage {
     }
 }
 
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    let f = fs::File::open(dir)?;
+    f.sync_all()
+}
+
 impl Storage for LocalStorage {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), StorageError> {
         let full = self.full_path(key)?;
@@ -113,6 +118,9 @@ impl Storage for LocalStorage {
             file.sync_all()?;
         }
         fs::rename(&tmp, &full)?;
+        if let Some(parent) = full.parent() {
+            let _ = sync_dir(parent);
+        }
         Ok(())
     }
 

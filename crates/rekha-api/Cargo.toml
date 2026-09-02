@@ -14,13 +14,19 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 metrics.workspace = true
 axum-server.workspace = true
+subtle.workspace = true
+tower = "0.5"
+
+[dev-dependencies]
+axum-test = "19"
+tempfile = "3"
 
 [lints]
 workspace = true

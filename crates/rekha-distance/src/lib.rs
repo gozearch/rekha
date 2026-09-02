@@ -242,4 +242,63 @@ mod tests {
     fn l2_squared_panics_on_dimension_mismatch() {
         let _ = l2_squared(&[1.0, 2.0], &[1.0]);
     }
+
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_vec(dim: usize) -> impl Strategy<Value = Vec<f32>> {
+            prop::collection::vec(
+                (-10.0f32..10.0f32).prop_filter("finite", |f| f.is_finite()),
+                dim,
+            )
+        }
+
+        proptest! {
+            #[test]
+            fn l2_symmetry(a in arb_vec(8), b in arb_vec(8)) {
+                prop_assert!((l2_squared(&a, &b) - l2_squared(&b, &a)).abs() < 1e-4);
+            }
+
+            #[test]
+            fn dot_symmetry(a in arb_vec(8), b in arb_vec(8)) {
+                prop_assert!((dot(&a, &b) - dot(&b, &a)).abs() < 1e-4);
+            }
+
+            #[test]
+            fn l2_self_is_zero(v in arb_vec(8)) {
+                prop_assert!(l2_squared(&v, &v).abs() < 1e-4);
+            }
+
+            #[test]
+            fn cosine_self_is_near_zero(v in arb_vec(4)) {
+                // Avoid zero vector which normalizes to itself
+                prop_assume!(v.iter().any(|&x| x != 0.0));
+                let d = distance(Distance::Cosine, &v, &v);
+                prop_assert!(d.abs() < 1e-4, "cosine self-distance {d} should be ~0");
+            }
+
+            #[test]
+            fn ip_consistent_with_dot(a in arb_vec(8), b in arb_vec(8)) {
+                let expected = 1.0 - dot(&a, &b);
+                let got = distance(Distance::Ip, &a, &b);
+                prop_assert!((got - expected).abs() < 1e-4);
+            }
+
+            #[test]
+            fn simd_matches_scalar_random(
+                dim in 1usize..32,
+                a in prop::collection::vec((-10.0f32..10.0f32).prop_filter("finite", |f| f.is_finite()), 1..32),
+                b in prop::collection::vec((-10.0f32..10.0f32).prop_filter("finite", |f| f.is_finite()), 1..32)
+            ) {
+                let dim = dim.min(a.len()).min(b.len());
+                if dim == 0 { return Ok(()); }
+                let a = &a[..dim];
+                let b = &b[..dim];
+                let rel = |x: f32, y: f32| (x - y).abs() / y.abs().max(1e-6);
+                prop_assert!(rel(dot(a, b), dot_scalar(a, b)) < 1e-4, "dot mismatch");
+                prop_assert!(rel(l2_squared(a, b), l2_squared_scalar(a, b)) < 1e-4, "l2 mismatch");
+            }
+        }
+    }
 }

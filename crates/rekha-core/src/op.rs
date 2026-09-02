@@ -120,4 +120,50 @@ mod tests {
         let back: Operation = serde_json::from_str(&json).unwrap();
         assert_eq!(op, back);
     }
+
+    mod proptest_ops {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn operation_json_roundtrip(
+                id in "[a-z0-9]{1,12}",
+                emb in prop::collection::vec(any::<f32>().prop_filter("finite", |f| f.is_finite()), 1..8)
+            ) {
+                let op = Operation::Add {
+                    id: id.clone(),
+                    embedding: emb.into(),
+                    metadata: None,
+                    document: None,
+                };
+                let json = serde_json::to_string(&op).unwrap();
+                let back: Operation = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(op, back);
+
+                let op2 = Operation::Delete { id };
+                let json2 = serde_json::to_string(&op2).unwrap();
+                let back2: Operation = serde_json::from_str(&json2).unwrap();
+                prop_assert_eq!(op2, back2);
+            }
+
+            #[test]
+            fn operation_bincode_roundtrip(
+                id in "[a-z0-9]{1,12}",
+                emb in prop::collection::vec(any::<f32>().prop_filter("finite", |f| f.is_finite()), 1..8)
+            ) {
+                // Bincode uses tagged enum for MetadataValue, so we test embedding-only
+                // roundtrip which covers the is_human_readable branching.
+                let op = Operation::Upsert {
+                    id: id.clone(),
+                    embedding: emb.into(),
+                    metadata: None,
+                    document: Some("doc".into()),
+                };
+                let bytes = bincode::serialize(&op).unwrap();
+                let back: Operation = bincode::deserialize(&bytes).unwrap();
+                prop_assert_eq!(op, back);
+            }
+        }
+    }
 }

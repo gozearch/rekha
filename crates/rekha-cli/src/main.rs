@@ -44,6 +44,14 @@ enum Command {
         /// Listen port.
         #[arg(long, default_value_t = 8000, env = "REKHA_PORT")]
         port: u16,
+        /// Internal listener host (for Raft/WAL). Defaults to `host`.
+        #[arg(long, env = "REKHA_INTERNAL_HOST")]
+        internal_host: Option<String>,
+        /// Internal listener port. If set, Raft/WAL routes are served on a
+        /// separate listener for network isolation. Otherwise they share the
+        /// public listener.
+        #[arg(long, env = "REKHA_INTERNAL_PORT")]
+        internal_port: Option<u16>,
         /// This node's unique id (must be unique across the cluster).
         #[arg(long, default_value_t = 1, env = "REKHA_NODE_ID")]
         node_id: u64,
@@ -153,6 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_dir,
             host,
             port,
+            internal_host,
+            internal_port,
             node_id,
             peers,
             tls_cert,
@@ -161,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             use std::collections::HashMap;
             use std::sync::Arc;
 
-            use rekha_api::{AppState, router};
+            use rekha_api::{AppState, internal_router, public_router, router};
             use rekha_cluster::{
                 ClusterStateMachine, RaftNetworkFactoryImpl, RedbLogStore, WalReplication,
             };
@@ -243,12 +253,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
+            let api_key = std::env::var("REKHA_API_KEY").ok();
+            if api_key.is_none() {
+                eprintln!(
+                    "WARN: REKHA_API_KEY is not set — API is running without authentication. \
+                     Set REKHA_API_KEY to enable token auth."
+                );
+            }
             let state = Arc::new(AppState {
                 engine: engine.clone(),
                 tenant: "default_tenant".into(),
                 database: "default_database".into(),
                 raft: Some(Arc::new(raft)),
-                api_key: std::env::var("REKHA_API_KEY").ok(),
+                api_key,
             });
 
             // Start follower replication if we have peers.
@@ -296,8 +313,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            let app = router(state);
-            let addr = format!("{host}:{port}");
             if !peers.is_empty() {
                 println!("Peers: {peers}");
             }
@@ -312,31 +327,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Metrics available at http://{metrics_addr}/metrics");
             }
 
-            if let (Some(cert), Some(key)) = (&tls_cert, &tls_key) {
-                let config =
-                    axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
-                println!("RekhaDB node {node_id} listening on {addr} (TLS)");
-                let handle = axum_server::Handle::<std::net::SocketAddr>::new();
-                let handle_clone = handle.clone();
-                tokio::spawn(async move {
-                    tokio::signal::ctrl_c().await.ok();
-                    println!("Shutting down...");
-                    handle_clone.graceful_shutdown(None);
-                });
-                axum_server::bind_rustls(addr.parse()?, config)
-                    .handle(handle)
-                    .serve(app.into_make_service())
-                    .await?;
+            // If --internal-port is set, run separate listeners for public and
+            // internal routes. Otherwise use a single combined router.
+            if let Some(internal_port) = internal_port {
+                let ihost = internal_host.unwrap_or_else(|| host.clone());
+                let public_app = public_router(state.clone());
+                let internal_app = internal_router(state.clone());
+                let public_addr = format!("{host}:{port}");
+                let internal_addr = format!("{ihost}:{internal_port}");
+
+                if tls_cert.is_some() && tls_key.is_some() {
+                    // TLS path: serve both listeners via axum-server.
+                    let cert = tls_cert.unwrap();
+                    let key = tls_key.unwrap();
+                    let config =
+                        axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                            .await?;
+                    // Clone config for the second listener (RustlsConfig is not Clone
+                    // in older versions — reload from the same files).
+                    let config2 =
+                        axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                            .await?;
+                    let handle = axum_server::Handle::<std::net::SocketAddr>::new();
+                    let handle_clone = handle.clone();
+                    let handle2 = handle.clone();
+                    tokio::spawn(async move {
+                        tokio::signal::ctrl_c().await.ok();
+                        println!("Shutting down...");
+                        handle_clone.graceful_shutdown(None);
+                        handle2.graceful_shutdown(None);
+                    });
+                    println!(
+                        "RekhaDB node {node_id} public TLS on {public_addr}, internal TLS on {internal_addr}"
+                    );
+                    let h1 = handle.clone();
+                    let public_fut = axum_server::bind_rustls(public_addr.parse()?, config)
+                        .handle(h1)
+                        .serve(public_app.into_make_service());
+                    let h2 = handle.clone();
+                    let internal_fut = axum_server::bind_rustls(internal_addr.parse()?, config2)
+                        .handle(h2)
+                        .serve(internal_app.into_make_service());
+                    tokio::try_join!(public_fut, internal_fut)?;
+                } else {
+                    println!(
+                        "RekhaDB node {node_id} public on {public_addr}, internal on {internal_addr}"
+                    );
+                    let pub_listener = tokio::net::TcpListener::bind(&public_addr).await?;
+                    let int_listener = tokio::net::TcpListener::bind(&internal_addr).await?;
+                    let shutdown = async {
+                        tokio::signal::ctrl_c().await.ok();
+                        println!("Shutting down...");
+                    };
+                    let pub_serve =
+                        axum::serve(pub_listener, public_app).with_graceful_shutdown(shutdown);
+                    // Internal listener shares the same shutdown signal via a channel.
+                    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    tokio::spawn(async move {
+                        tokio::signal::ctrl_c().await.ok();
+                        let _ = tx.send(());
+                    });
+                    let int_serve = axum::serve(int_listener, internal_app)
+                        .with_graceful_shutdown(async { rx.await.ok(); });
+                    tokio::try_join!(pub_serve, int_serve)?;
+                }
             } else {
-                println!("RekhaDB node {node_id} listening on {addr}");
-                let listener = tokio::net::TcpListener::bind(&addr).await?;
-                let shutdown = async {
-                    tokio::signal::ctrl_c().await.ok();
-                    println!("Shutting down...");
-                };
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown)
-                    .await?;
+                let app = router(state);
+                let addr = format!("{host}:{port}");
+                if let (Some(cert), Some(key)) = (&tls_cert, &tls_key) {
+                    let config =
+                        axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+                    println!("RekhaDB node {node_id} listening on {addr} (TLS)");
+                    let handle = axum_server::Handle::<std::net::SocketAddr>::new();
+                    let handle_clone = handle.clone();
+                    tokio::spawn(async move {
+                        tokio::signal::ctrl_c().await.ok();
+                        println!("Shutting down...");
+                        handle_clone.graceful_shutdown(None);
+                    });
+                    axum_server::bind_rustls(addr.parse()?, config)
+                        .handle(handle)
+                        .serve(app.into_make_service())
+                        .await?;
+                } else {
+                    println!("RekhaDB node {node_id} listening on {addr}");
+                    let listener = tokio::net::TcpListener::bind(&addr).await?;
+                    let shutdown = async {
+                        tokio::signal::ctrl_c().await.ok();
+                        println!("Shutting down...");
+                    };
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(shutdown)
+                        .await?;
+                }
             }
         }
 

@@ -9,5 +9,8 @@ license.workspace = true
 rekha-core = { path = "../rekha-core" }
 wide.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

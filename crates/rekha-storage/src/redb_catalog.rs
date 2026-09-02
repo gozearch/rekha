@@ -290,6 +290,24 @@ impl Catalog for RedbCatalog {
         write_txn.commit()?;
         Ok(())
     }
+
+    fn update_collection_dimension(&self, id: &Uuid, dimension: usize) -> Result<(), CatalogError> {
+        let id_key = id.to_string();
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut collections = write_txn.open_table(COLLECTIONS)?;
+            let record_bytes = match collections.get(id_key.as_str())? {
+                Some(guard) => guard.value().to_vec(),
+                None => return Err(CatalogError::NotFound),
+            };
+            let mut record: CollectionRecord = Self::decode(&record_bytes)?;
+            record.config.dimension = dimension;
+            let bytes = Self::encode(&record)?;
+            collections.insert(id_key.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
 }
 
 impl RedbCatalog {

@@ -93,10 +93,18 @@ pub struct ClusterSnapshotBuilder {
 
 impl RaftSnapshotBuilder<RaftTypeConfig> for ClusterSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<RaftTypeConfig>, StorageError<u64>> {
-        let cluster_data = bincode::serialize(&self.sm).unwrap_or_default();
+        let cluster_data = bincode::serialize(&self.sm).map_err(|e| StorageError::IO {
+            source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                "cluster snapshot serialize failed: {e}"
+            ))),
+        })?;
 
         let engine_data = if let Some(ref engine) = self.sm.engine {
-            engine.snapshot().unwrap_or_default()
+            engine.snapshot().map_err(|e| StorageError::IO {
+                source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                    "engine snapshot failed: {e}"
+                ))),
+            })?
         } else {
             Vec::new()
         };
@@ -177,21 +185,39 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         if data.len() < 4 {
             return Ok(());
         }
-        let cluster_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let cluster_len = u32::from_le_bytes(
+            data[0..4]
+                .try_into()
+                .map_err(|_| StorageError::IO {
+                    source: openraft::StorageIOError::read(&std::io::Error::other(
+                        "snapshot header too short",
+                    )),
+                })?,
+        ) as usize;
 
         if data.len() >= 4 + cluster_len {
             let cluster_data = &data[4..4 + cluster_len];
-            if let Ok(sm) = bincode::deserialize::<ClusterStateMachine>(cluster_data) {
-                let engine = self.engine.clone();
-                *self = sm;
-                self.engine = engine;
-            }
+            // Propagate deserialization failures as IO errors so corrupted
+            // snapshots are not silently ignored.
+            let sm: ClusterStateMachine =
+                bincode::deserialize(cluster_data).map_err(|e| StorageError::IO {
+                    source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                        "cluster snapshot deserialize failed: {e}"
+                    ))),
+                })?;
+            let engine = self.engine.clone();
+            *self = sm;
+            self.engine = engine;
         }
 
         if data.len() > 4 + cluster_len {
             let engine_data = &data[4 + cluster_len..];
             if let Some(ref engine) = self.engine {
-                let _ = engine.restore_snapshot(engine_data);
+                engine.restore_snapshot(engine_data).map_err(|e| StorageError::IO {
+                    source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                        "engine restore failed: {e}"
+                    ))),
+                })?;
             }
         }
 
@@ -203,10 +229,18 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<RaftTypeConfig>>, StorageError<u64>> {
-        let cluster_data = bincode::serialize(self).unwrap_or_default();
+        let cluster_data = bincode::serialize(self).map_err(|e| StorageError::IO {
+            source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                "cluster snapshot serialize failed: {e}"
+            ))),
+        })?;
 
         let engine_data = if let Some(ref engine) = self.engine {
-            engine.snapshot().unwrap_or_default()
+            engine.snapshot().map_err(|e| StorageError::IO {
+                source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                    "engine snapshot failed: {e}"
+                ))),
+            })?
         } else {
             Vec::new()
         };

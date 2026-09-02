@@ -45,6 +45,20 @@ use rekha_core::op::Operation;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[inline]
+fn le_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+#[inline]
+fn le_u64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+#[inline]
+fn le_u16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
+
+
 /// Magic bytes identifying a RekhaDB WAL file: `"RKW1"`.
 const MAGIC: [u8; 4] = *b"RKW1";
 /// On-disk format version.
@@ -301,10 +315,10 @@ impl Wal {
             let mut hdr = [0u8; RECORD_HEADER_LEN];
             file.read_exact(&mut hdr)?;
 
-            let record_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as u64;
-            let stored_crc = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-            let seq = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-            let rec_epoch = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+            let record_len = le_u32(&hdr[0..4]) as u64;
+            let stored_crc = le_u32(&hdr[4..8]);
+            let seq = le_u64(&hdr[8..16]);
+            let rec_epoch = le_u64(&hdr[16..24]);
 
             if record_len < RECORD_HEADER_LEN as u64 || offset + record_len > self.file_len {
                 return Err(WalError::Corrupt(format!(
@@ -373,8 +387,8 @@ impl Wal {
                 let mut hdr = [0u8; RECORD_HEADER_LEN];
                 src.read_exact(&mut hdr)?;
 
-                let record_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as u64;
-                let seq = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+                let record_len = le_u32(&hdr[0..4]) as u64;
+                let seq = le_u64(&hdr[8..16]);
                 if record_len < RECORD_HEADER_LEN as u64 || offset + record_len > self.file_len {
                     return Err(WalError::Corrupt(format!(
                         "record at offset {offset} is out of bounds during prune"
@@ -460,18 +474,18 @@ fn read_and_verify_header(file: &mut File) -> WalResult<u64> {
             &hdr[0..4]
         )));
     }
-    let version = u16::from_le_bytes(hdr[4..6].try_into().unwrap());
+    let version = le_u16(&hdr[4..6]);
     if version != VERSION {
         return Err(WalError::Corrupt(format!(
             "unsupported WAL version {version} (expected {VERSION})"
         )));
     }
-    let stored_crc = u32::from_le_bytes(hdr[14..18].try_into().unwrap());
+    let stored_crc = le_u32(&hdr[14..18]);
     let actual_crc = crc32fast::hash(&hdr[0..14]);
     if stored_crc != actual_crc {
         return Err(WalError::Corrupt("header CRC mismatch".into()));
     }
-    Ok(u64::from_le_bytes(hdr[6..14].try_into().unwrap()))
+    Ok(le_u64(&hdr[6..14]))
 }
 
 /// Scan `file` from the header onwards, stopping at the first invalid record
@@ -490,10 +504,10 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<(u64, u6
         let mut hdr = [0u8; RECORD_HEADER_LEN];
         file.read_exact(&mut hdr)?;
 
-        let record_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as u64;
-        let stored_crc = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-        let seq = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-        let rec_epoch = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+        let record_len = le_u32(&hdr[0..4]) as u64;
+        let stored_crc = le_u32(&hdr[4..8]);
+        let seq = le_u64(&hdr[8..16]);
+        let rec_epoch = le_u64(&hdr[16..24]);
 
         if record_len < RECORD_HEADER_LEN as u64 || offset + record_len > file_len {
             break;

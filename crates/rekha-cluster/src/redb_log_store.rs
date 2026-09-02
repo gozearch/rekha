@@ -12,7 +12,7 @@ use openraft::{
     CommittedLeaderId, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
     StoredMembership, Vote,
 };
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -88,15 +88,20 @@ fn find_last_log_id(db: &Database) -> Result<Option<LogId<u64>>, StorageError<u6
         Err(_) => return Ok(None),
     };
 
-    for idx in (0..1_000_000u64).rev() {
-        let key = idx.to_string();
-        if let Ok(Some(val)) = table.get(key.as_str())
-            && let Ok(entry) = bincode::deserialize::<Entry<RaftTypeConfig>>(val.value())
+    let mut max: Option<LogId<u64>> = None;
+    for entry in table.iter().map_err(io_error)? {
+        let (k, v) = entry.map_err(io_error)?;
+        if let Ok(idx) = k.value().parse::<u64>()
+            && let Ok(entry) = bincode::deserialize::<Entry<RaftTypeConfig>>(v.value())
         {
-            return Ok(Some(entry.log_id));
+            if max.is_none_or(|m: LogId<u64>| entry.log_id.index > m.index) {
+                max = Some(entry.log_id);
+            }
+            // Also consider the parsed idx as fallback if entry deserialization yields older index
+            let _ = idx;
         }
     }
-    Ok(None)
+    Ok(max)
 }
 
 impl RedbLogStore {
@@ -262,12 +267,22 @@ impl RaftLogStorage<RaftTypeConfig> for RedbLogStore {
         let write_txn = self.db.begin_write().map_err(io_error)?;
         {
             let mut table = write_txn.open_table(LOG_TABLE).map_err(io_error)?;
-            // Remove entries at and after log_id.index; stop when we hit a gap
-            for idx in log_id.index..=log_id.index + 10_000 {
-                let key = idx.to_string();
-                if table.remove(key.as_str()).is_err() {
-                    break;
-                }
+            // Collect keys with index >= log_id.index (numeric comparison).
+            let keys_to_remove: Vec<String> = table
+                .iter()
+                .map_err(io_error)?
+                .filter_map(|e| {
+                    let (k, _) = e.ok()?;
+                    let idx = k.value().parse::<u64>().ok()?;
+                    if idx >= log_id.index {
+                        Some(k.value().to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for key in keys_to_remove {
+                let _ = table.remove(key.as_str());
             }
         }
         write_txn.commit().map_err(io_error)?;
@@ -278,8 +293,20 @@ impl RaftLogStorage<RaftTypeConfig> for RedbLogStore {
         let write_txn = self.db.begin_write().map_err(io_error)?;
         {
             let mut table = write_txn.open_table(LOG_TABLE).map_err(io_error)?;
-            for idx in 0..=log_id.index {
-                let key = idx.to_string();
+            let keys_to_remove: Vec<String> = table
+                .iter()
+                .map_err(io_error)?
+                .filter_map(|e| {
+                    let (k, _) = e.ok()?;
+                    let idx = k.value().parse::<u64>().ok()?;
+                    if idx <= log_id.index {
+                        Some(k.value().to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for key in keys_to_remove {
                 let _ = table.remove(key.as_str());
             }
         }

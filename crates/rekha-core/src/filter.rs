@@ -633,4 +633,54 @@ mod tests {
         assert!(serde_json::from_str::<WhereFilter>(r#"{"a": {"$gt": "x"}}"#).is_err());
         assert!(serde_json::from_str::<WhereFilter>(r#"{"a": null}"#).is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Property-based tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn json_roundtrip_preserves_filter(s in "[a-z]{1,8}", i in any::<i64>()) {
+                let json = format!(r#"{{"{s}": {i}}}"#);
+                let f: Result<WhereFilter, _> = serde_json::from_str(&json);
+                if let Ok(filter) = f {
+                    let ser = filter.to_json();
+                    let de: Result<WhereFilter, _> = serde_json::from_str(&ser);
+                    prop_assert!(de.is_ok());
+                    prop_assert_eq!(filter, de.unwrap());
+                }
+            }
+
+            #[test]
+            fn where_filter_eq_matches_inserted_value(
+                key in "[a-z]{1,8}",
+                val in "[a-z]{1,8}"
+            ) {
+                let json = format!(r#"{{"{key}": "{val}"}}"#);
+                let filter: WhereFilter = serde_json::from_str(&json).unwrap();
+                let mut meta = std::collections::HashMap::new();
+                meta.insert(key.clone(), MetadataValue::Str(val.clone()));
+                prop_assert!(filter.matches(&meta));
+
+                let mut meta2 = std::collections::HashMap::new();
+                meta2.insert(key, MetadataValue::Str("other".into()));
+                prop_assert!(!filter.matches(&meta2));
+            }
+
+            #[test]
+            fn filter_serialize_is_stable(s in "[a-z]{1,3}", n in -100i64..100i64) {
+                let json = format!(r#"{{"{s}": {{"$gte": {n}}}}}"#);
+                if let Ok(filter) = serde_json::from_str::<WhereFilter>(&json) {
+                    let ser = serde_json::to_string(&filter).unwrap();
+                    let de: WhereFilter = serde_json::from_str(&ser).unwrap();
+                    prop_assert_eq!(filter, de);
+                }
+            }
+        }
+    }
 }

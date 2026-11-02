@@ -1,0 +1,7 @@
+# Public items that are legitimately referenced nowhere.
+#
+# Every line here is a decision with a reason, and a decision that expires. The
+# file is empty on purpose: the last two entries were `get_where` (wired into
+# `where_document`) and `invalidate_perm_cache` (deleted with the permission
+# cache it was meant to invalidate). If an entry is added, say why it cannot be
+# deleted or wired, and what would remove it.

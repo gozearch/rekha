@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # upload release assets
+  id-token: write # cosign keyless signing (OIDC)
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # Native arm runners rather than cross-compilation: usearch is a C++
+          # dependency, and cross-building it needs a sysroot this workflow is
+          # not prepared to maintain.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      # A release without a changelog is a release nobody can plan around.
+      - name: Require a changelog
+        run: test -f CHANGELOG.md
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # usearch is a C++ dependency.
+      - name: Install build tooling (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake
+
+      # --locked is the point: the artifact must be built from the dependency set
+      # that was tested, not from whatever the registry serves today.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="rekha-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/rekha" "dist/$name/"
+          cp README.md "dist/$name/" 2>/dev/null || true
+          cp CHANGELOG.md "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Sign (keyless, via OIDC)
+        uses: sigstore/cosign-installer@v3
+      - name: Sign artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature "dist/rekha-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz.sig" \
+            "dist/rekha-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rekha-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One SBOM for the release rather than one per matrix leg: generating it
+      # inside the build job compiled cargo-cyclonedx three times for a document
+      # that describes the workspace, not the target.
+      - name: SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json --spec-version 1.5 --describe crate
+          cp "crates/rekha-cli/rekha-cli.cdx.json" \
+             "dist/rekha-${GITHUB_REF_NAME}.cdx.json"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

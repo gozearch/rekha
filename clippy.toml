@@ -1,0 +1,10 @@
+# Test code unwraps freely: a panicking assertion is the failure mode we want
+# there, and a lint that forces `?` into every test makes them worse.
+#
+# These options only affect `clippy::unwrap_used` / `clippy::expect_used`, which
+# are denied at every production crate root: `rekha-api`, `rekha-bench`,
+# `rekha-cli`, `rekha-cluster`, `rekha-core`, `rekha-distance`, `rekha-engine`,
+# `rekha-index`, `rekha-storage`, `rekha-wal`. Integration tests in `tests/` are
+# separate crates and never opt in, so they are unaffected either way.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

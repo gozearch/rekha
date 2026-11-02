@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rekha-core",
+    "crates/rekha-distance",
+    "crates/rekha-index",
+    "crates/rekha-storage",
+    "crates/rekha-wal",
+    "crates/rekha-cluster",
+    "crates/rekha-engine",
+    "crates/rekha-api",
+    "crates/rekha-cli",
+    "crates/rekha-bench",
+]
+
+# Shelved, not deleted. Neither is referenced by any crate that ships:
+# `rekha-repl` is a 1,332-line TUI SQL console with its own binary, and
+# `rekha-objectstore` is a six-line placeholder. Keeping them as members meant
+# compiling and auditing a whole TUI dependency stack (reedline, ratatui,
+# crossterm, terminfo) for code nothing calls. Excluded rather than removed so
+# the work survives and can be revisited.
+exclude = ["crates/rekha-repl", "crates/rekha-objectstore"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+# Measured, not guessed. 1.89 fails because redb 4.4 requires 1.90;
+# `cargo +1.90 check --workspace` succeeds. The number follows the resolved
+# dependency tree rather than a promise maintained by hand, so it is re-measured
+# whenever the lockfile moves. A CI job enforces it.
+rust-version = "1.90"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+wide = "1"
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+crc32fast = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+metrics = "0.22"
+metrics-exporter-prometheus = { version = "0.13", features = ["http-listener"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+subtle = "2"
+parking_lot = "0.12"
+proptest = "1"
+hmac = "0.12"
+sha2 = "0.10"
+
+# Release profile as a correctness decision, not just a performance one.
+#
+# `panic = "abort"` is the other half of the engine's lock swap: `parking_lot`
+# guards do not poison, so a panic no longer disables the lock, and without
+# fail-stop a half-applied mutation would keep being served. Aborting means a
+# panic becomes a node restart that recovers from the WAL and generations,
+# which is the failure mode a database should have.
+#
+# Note that this makes a reachable panic an availability event. That is why the
+# `unwrap`/`expect` lint in this phase is a prerequisite and not a tidy-up.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Benchmarks inherit the release settings so a bench number describes the
+# artifact, but keep symbols so a profile stays readable.
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false
+
+[workspace.lints.rust]
+unused = "deny"
+dead_code = "deny"
+# Denied by default and allowed at the one site that needs it (the mmap in
+# `rekha-engine/src/segment.rs`), so adding unsafety is a reviewed act rather
+# than a habit.
+unsafe_code = "deny"

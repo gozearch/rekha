@@ -1,0 +1,19 @@
+[package]
+name = "rekha-bench"
+description = "Benchmark harness for RekhaDB: write path, durability cost, and checkpoint attribution."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Internal crate: shipped as part of the `rekha` binary, not published.
+publish = false
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+rekha-engine = { path = "../rekha-engine" }
+rekha-storage = { path = "../rekha-storage" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,65 @@
+{
+  "batch": 100,
+  "checkpoints": [
+    {
+      "after_writes": {
+        "cleanup_us": 16351,
+        "index_map_us": 21887,
+        "index_us": 77992,
+        "manifest_us": 33012,
+        "publish_us": 12580,
+        "records_us": 43700,
+        "total_us": 323064,
+        "validate_us": 23521,
+        "vectors_us": 92742
+      },
+      "idle": {
+        "cleanup_us": 16731,
+        "index_map_us": 24079,
+        "index_us": 78039,
+        "manifest_us": 33442,
+        "publish_us": 12724,
+        "records_us": 48061,
+        "total_us": 436501,
+        "validate_us": 22257,
+        "vectors_us": 192308
+      }
+    }
+  ],
+  "collections": 1,
+  "data_dir_bytes": 115957724,
+  "dim": 128,
+  "durability": "durable",
+  "ingest_ms": 18296,
+  "latency_us": {
+    "max": 416185,
+    "p50": 21532,
+    "p95": 238064,
+    "p99": 360626
+  },
+  "optimize": [
+    {
+      "checkpoint": {
+        "cleanup_us": 17289,
+        "index_map_us": 21658,
+        "index_us": 77166,
+        "manifest_us": 32038,
+        "publish_us": 10973,
+        "records_us": 49794,
+        "total_us": 431950,
+        "validate_us": 21841,
+        "vectors_us": 193045
+      },
+      "flush_us": 1,
+      "indexed": 40100,
+      "rebuild_us": 6283690,
+      "records": 40100
+    }
+  ],
+  "records": 40000,
+  "records_per_sec": 2186,
+  "sync_threshold": 1000,
+  "syncs": 400,
+  "threads": 1,
+  "writes": 400
+}

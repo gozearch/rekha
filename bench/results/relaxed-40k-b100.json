@@ -1,0 +1,36 @@
+{
+  "batch": 100,
+  "collections": 1,
+  "data_dir_bytes": 74760728,
+  "dim": 128,
+  "durability": "relaxed",
+  "latency_us": {
+    "max": 454123,
+    "p50": 17251,
+    "p95": 287713,
+    "p99": 423034
+  },
+  "optimize": [
+    {
+      "checkpoint": {
+        "cleanup_us": 17289,
+        "index_us": 80976,
+        "manifest_us": 40531,
+        "publish_us": 12298,
+        "records_us": 53401,
+        "total_us": 436940,
+        "validate_us": 4501,
+        "vectors_us": 219667
+      },
+      "flush_us": 1,
+      "indexed": 40000,
+      "rebuild_us": 6356613,
+      "records": 40000
+    }
+  ],
+  "records": 40000,
+  "sync_threshold": 1000,
+  "syncs": 0,
+  "threads": 1,
+  "writes": 400
+}

@@ -1,0 +1,90 @@
+# A three-node development cluster.
+#
+# This is the topology the README promises, wired the way the binary actually
+# expects it:
+#
+#   * peers are `id@internal-addr`, not positional;
+#   * exactly one node bootstraps the cluster;
+#   * every node has the same cluster secret;
+#   * Raft and forwarded writes use the internal listener (9000), while the
+#     public API stays on 8000.
+#
+# Supply two secrets from your environment; never commit them:
+#
+#   export REKHA_API_KEY="$(openssl rand -hex 16)"
+#   export REKHA_CLUSTER_SECRET="$(openssl rand -hex 32)"
+#   docker compose -f docker-compose.cluster.yml up -d --build
+#
+# This file is a development topology, not a production secret store. In
+# production use Docker secrets, Kubernetes Secrets, or your platform's secret
+# manager, and terminate TLS in front of the public listener.
+
+x-rekha-node: &rekha-node
+  build:
+    context: .
+    dockerfile: Containerfile
+  restart: unless-stopped
+  environment: &rekha-env
+    REKHA_DATA_DIR: /data
+    REKHA_PORT: "8000"
+    REKHA_INTERNAL_HOST: 0.0.0.0
+    REKHA_INTERNAL_PORT: "9000"
+    # The internal listener is where Raft and forwarded writes go. Every node
+    # must be listed, including itself, and the string must be identical on all
+    # of them.
+    REKHA_PEERS: "1@node1:9000,2@node2:9000,3@node3:9000"
+    REKHA_API_KEY: ${REKHA_API_KEY:?set REKHA_API_KEY to at least 32 characters}
+    REKHA_CLUSTER_SECRET: ${REKHA_CLUSTER_SECRET:?set REKHA_CLUSTER_SECRET to at least 32 bytes}
+    REKHA_WAL_DURABILITY: durable
+    # Container scheduling is bursty: the 200 ms default heartbeat leaves Raft
+    # RPCs a 150 ms soft deadline, which a busy runner misses. These are the
+    # documented quickstart values, chosen to elect reliably rather than fast.
+    REKHA_HEARTBEAT_MS: "500"
+    REKHA_ELECTION_MIN_MS: "1500"
+    REKHA_ELECTION_MAX_MS: "3000"
+    RUST_LOG: info
+  healthcheck:
+    # /ready, not /health: a node with no elected leader is alive but cannot
+    # serve, and the container should stay unhealthy until it can.
+    test: ["CMD", "curl", "-sf", "http://localhost:8000/ready"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 20s
+
+services:
+  node1:
+    <<: *rekha-node
+    ports:
+      - "8001:8000"
+    volumes:
+      - node1-data:/data
+    environment:
+      <<: *rekha-env
+      REKHA_NODE_ID: "1"
+      REKHA_BOOTSTRAP: "true"
+
+  node2:
+    <<: *rekha-node
+    ports:
+      - "8002:8000"
+    volumes:
+      - node2-data:/data
+    environment:
+      <<: *rekha-env
+      REKHA_NODE_ID: "2"
+
+  node3:
+    <<: *rekha-node
+    ports:
+      - "8003:8000"
+    volumes:
+      - node3-data:/data
+    environment:
+      <<: *rekha-env
+      REKHA_NODE_ID: "3"
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

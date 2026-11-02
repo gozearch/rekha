@@ -1,0 +1,11 @@
+target/
+*.rs.bk
+.DS_Store
+rekha-data/
+*.pdb
+logs/
+outputs/
+.opencode
+# Local agent tooling config and REPL history (not project files).
+opencode.json
+.rekha_history

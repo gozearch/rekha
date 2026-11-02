@@ -1,0 +1,34 @@
+# Podman Quadlet systemd service for RekhaDB
+#
+# Install:
+#   cp podman/rekha.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start rekha
+#   systemctl --user status rekha
+#
+# Logs:
+#   journalctl --user -u rekha -f
+
+[Container]
+Image=ghcr.io/gozearch/rekha-db:latest
+ContainerName=rekha
+PublishPort=8000:8000
+Volume=rekha-data.volume:/data
+Environment=REKHA_DATA_DIR=/data
+Environment=REKHA_PORT=8000
+# Replace this, or point EnvironmentFile= at a mode-0600 file outside the
+# repository. A container bound to 0.0.0.0 does not run in open mode.
+Environment=REKHA_API_KEY=replace-me-with-32-random-characters
+Restart=unless-stopped
+HealthCmd=curl -sf http://localhost:8000/ready || exit 1
+HealthInterval=5s
+HealthTimeout=3s
+HealthStartPeriod=15s
+HealthRetries=3
+
+[Service]
+Restart=always
+TimeoutStartSec=30
+
+[Install]
+WantedBy=default.target

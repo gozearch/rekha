@@ -1,0 +1,56 @@
+# Dependency policy.
+#
+# Every entry here was produced by running `cargo deny check` against the real
+# lockfile and triaging what it found — not copied from a template. The first
+# run surfaced seven vulnerabilities and two yanked crates; all were fixed by
+# `cargo update` rather than allowlisted, and only the two entries below remain,
+# each with a reason.
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # bincode 1.3.3 is "a complete version ... not in need of any updates"; the
+    # team ceased development after a harassment incident, not because of a
+    # defect. No vulnerability is recorded against 1.3.3.
+    #
+    # Scope of exposure: bincode is used for WAL records, checkpoint metadata
+    # and Raft entry payloads. All of those are written by this process or by a
+    # peer, and the snapshot restore path is gated by the cluster secret. That
+    # is a containment argument, not a proof, so migrating to a maintained
+    # codec is tracked rather than forgotten.
+    { id = "RUSTSEC-2025-0141", reason = "unmaintained, not vulnerable; internal encoding behind cluster auth; migration tracked" },
+]
+
+[licenses]
+# Populated from `cargo metadata` over the real dependency tree, and pruned when
+# a licence stops appearing: an allowance for a licence nothing uses is dead
+# policy that would silently permit a future dependency. Anything not listed here
+# fails the build, so adding one is a deliberate act.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+# Wildcards are denied for registry dependencies, where `*` means "whatever the
+# registry serves today". Internal `path` dependencies carry no version because
+# they are never published; denying those would flag the workspace itself.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

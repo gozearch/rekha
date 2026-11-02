@@ -1,0 +1,90 @@
+name: Benchmark
+
+# Nightly only. A benchmark on every push would be noise, and a gate people
+# learn to ignore is worse than no gate.
+#
+# The comparison is A/B against a base revision **on the same runner in the same
+# job**, not against a committed JSON file. A committed baseline measured on one
+# machine and compared on another measures the machines, not the code — the
+# first version of this workflow did exactly that and would have failed (or
+# passed) for reasons that had nothing to do with a regression.
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base revision to compare against (default: last tag, else HEAD~1)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  BENCH_ARGS: "--durability durable --records 40000 --dim 128 --batch 100 --threads 1 --collections 1"
+
+jobs:
+  write-path:
+    name: write path regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A worktree needs the base revision to exist locally.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # usearch is a C++ dependency.
+      - run: sudo apt-get update && sudo apt-get install -y g++ cmake
+
+      - name: Resolve base revision
+        id: base
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.base }}" ]; then
+            ref="${{ inputs.base }}"
+          elif tag=$(git describe --tags --abbrev=0 2>/dev/null); then
+            ref="$tag"
+          else
+            ref="HEAD~1"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "comparing HEAD against $ref"
+
+      - name: Build and measure the base
+        run: |
+          set -euo pipefail
+          git worktree add /tmp/base "${{ steps.base.outputs.ref }}"
+          cd /tmp/base
+          cargo build --release --locked -p rekha-bench
+          ./target/release/rekha-bench \
+            --data-dir /tmp/data-base --out /tmp/base.json $BENCH_ARGS
+
+      - name: Build and measure HEAD
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p rekha-bench
+          ./target/release/rekha-bench \
+            --data-dir /tmp/data-head --out /tmp/head.json $BENCH_ARGS
+
+      # Same machine, same commit-time conditions, so the only variable left is
+      # the diff between the two revisions.
+      - name: Compare
+        run: |
+          python3 scripts/bench-regression.py \
+            --baseline /tmp/base.json \
+            --candidate /tmp/head.json \
+            --p99-budget 0.20 \
+            --ingest-budget 0.25
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.run_id }}
+          path: |
+            /tmp/base.json
+            /tmp/head.json

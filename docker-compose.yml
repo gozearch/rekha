@@ -1,0 +1,23 @@
+services:
+  rekha:
+    build:
+      context: .
+      dockerfile: Containerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - rekha-data:/data
+    environment:
+      - REKHA_DATA_DIR=/data
+      - REKHA_PORT=8000
+      # Binding 0.0.0.0 is not loopback, so the server will not run in open
+      # mode: an API key is required or every request is 401. It must be at
+      # least 32 characters (`openssl rand -hex 16`), because it is stored as a
+      # hash and a short value is recoverable from a stolen catalog.
+      - REKHA_API_KEY=${REKHA_API_KEY:?set REKHA_API_KEY to at least 32 characters}
+      # REKHA_KEY_PEPPER is optional defence-in-depth: set it only if you want a
+      # secret that is not in the data directory.
+    restart: unless-stopped
+
+volumes:
+  rekha-data:

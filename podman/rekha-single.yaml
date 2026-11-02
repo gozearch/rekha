@@ -1,0 +1,61 @@
+# Podman single-node RekhaDB
+#
+# Usage:
+#   podman kube play podman/rekha-single.yaml
+#
+# With custom image:
+#   podman build -t rekha .
+#   podman kube play podman/rekha-single.yaml --image localhost/rekha
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rekha
+  labels:
+    app: rekha
+spec:
+  containers:
+    - name: rekha
+      image: ghcr.io/gozearch/rekha-db:latest
+      ports:
+        - containerPort: 8000
+          hostPort: 8000
+      volumeMounts:
+        - name: rekha-data
+          mountPath: /data
+      env:
+        - name: REKHA_DATA_DIR
+          value: /data
+        - name: REKHA_PORT
+          value: "8000"
+        # Replace this value, or use a Secret. A container bound to 0.0.0.0
+        # does not run in open mode, so requests without a key are rejected.
+        - name: REKHA_API_KEY
+          value: "replace-me-with-32-random-characters"
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 15
+        periodSeconds: 10
+  volumes:
+    - name: rekha-data
+      persistentVolumeClaim:
+        claimName: rekha-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rekha-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

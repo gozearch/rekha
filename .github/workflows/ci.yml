@@ -1,0 +1,265 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned, not floating: `stable` moves under the repository between runs,
+      # so a green build yesterday says nothing about today. The version matches
+      # rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `dead_code = "deny"` cannot see a `pub` item in a library crate: rustc
+      # treats it as reachable from the crate root. Eight unused functions and
+      # one unused type survived that lint, so this runs the check the compiler
+      # cannot. See scripts/dead-pub.py.
+      - name: Dead public items
+        run: python3 scripts/dead-pub.py
+      - name: Unused dependencies
+        run: |
+          cargo install cargo-machete --locked
+          ./scripts/dead-deps.sh
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release --bin rekha
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          # A private repository rejects tokenless uploads. The coverage run
+          # above is the gate; this step publishes the report when a
+          # CODECOV_TOKEN is configured.
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  conformance:
+    name: Chroma client + differential conformance
+    runs-on: ubuntu-latest
+    env:
+      # Pinned: an unpinned client or reference server silently changes the
+      # contract these suites assert. Bump deliberately, and record the new
+      # version in tests/conformance/README.md.
+      CHROMADB_VERSION: "1.5.9"
+      REKHA_KEY: conformance-key-0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          # Its post-job cache save has failed the job after every test passed.
+          # A cold download is cheaper than a red run.
+          enable-cache: false
+      # usearch is a C++ dependency.
+      - run: sudo apt-get update && sudo apt-get install -y g++ cmake
+      - run: cargo build --bin rekha
+
+      - name: Start Rekha
+        run: |
+          REKHA_API_KEY="$REKHA_KEY" ./target/debug/rekha serve \
+            --data-dir /tmp/rekha-conf --host 127.0.0.1 --port 8123 \
+            > /tmp/rekha-server.log 2>&1 &
+          echo $! > /tmp/rekha.pid
+          for i in $(seq 1 60); do
+            if curl -sf -H "x-chroma-token: $REKHA_KEY" \
+                http://127.0.0.1:8123/api/v2/heartbeat > /dev/null; then
+              echo "server ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not become ready"; cat /tmp/rekha-server.log; exit 1
+
+      - name: Client conformance
+        run: |
+          uv run --no-project --with "chromadb==$CHROMADB_VERSION" \
+            python tests/conformance/run.py \
+            --host 127.0.0.1 --port 8123 --token "$REKHA_KEY"
+
+      # Recovery has three distinct paths; each is restarted and verified
+      # separately so a passing run names the path it actually exercised.
+      - name: Restart durability (checkpoint)
+        run: bash tests/conformance/restart-mode.sh checkpoint
+
+      - name: Restart durability (checkpoint + WAL tail)
+        run: bash tests/conformance/restart-mode.sh tail
+
+      - name: Restart durability (WAL only)
+        run: bash tests/conformance/restart-mode.sh wal
+
+      - name: Start reference Chroma
+        run: |
+          uv run --no-project --with "chromadb==$CHROMADB_VERSION" chroma run \
+            --path /tmp/chroma-ref --port 8899 > /tmp/chroma-ref.log 2>&1 &
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8899/api/v2/heartbeat > /dev/null; then
+              echo "reference ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "reference did not become ready"; cat /tmp/chroma-ref.log; exit 1
+
+      - name: Differential conformance
+        run: |
+          python3 tests/conformance/differential.py \
+            --target http://127.0.0.1:8123 \
+            --reference http://localhost:8899 \
+            --token "$REKHA_KEY"
+
+      - name: Upload server logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rekha-server-log
+          path: |
+            /tmp/rekha-server.log
+            /tmp/rekha-server-restarted.log
+            /tmp/chroma-ref.log
+
+  deny:
+    name: Dependencies (advisories, licences, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  cluster-smoke:
+    name: Cluster smoke (documented compose)
+    runs-on: ubuntu-latest
+    env:
+      REKHA_API_KEY: smoke-key-0123456789abcdef0123456789
+      REKHA_CLUSTER_SECRET: smoke-cluster-secret-0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+      # This is the quickstart the README promises. Building it here is what
+      # keeps the compose file from drifting away from the binary again.
+      - name: Start the documented 3-node cluster
+        run: docker compose -f docker-compose.cluster.yml up -d --build
+      - name: Wait for readiness
+        run: |
+          set -euo pipefail
+          for port in 8001 8002 8003; do
+            for i in $(seq 1 60); do
+              if curl -sf -H "x-chroma-token: $REKHA_API_KEY" \
+                  "http://127.0.0.1:$port/ready" > /dev/null; then
+                echo "node on $port ready"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                echo "node on $port did not become ready"
+                docker compose -f docker-compose.cluster.yml logs
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+      - name: Write through one node and read through another
+        run: |
+          set -euo pipefail
+          auth=(-H "x-chroma-token: $REKHA_API_KEY" -H "content-type: application/json")
+          # `--retry-all-errors` covers the 503 a group returns while its shard
+          # leaders are still being elected; the API documents that retry.
+          id=$(curl -sf --retry 60 --retry-delay 1 --retry-all-errors "${auth[@]}" \
+            -X POST http://127.0.0.1:8001/api/v2/collections \
+            -d '{"name":"smoke","dimension":4}' \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+          curl -sf --retry 60 --retry-delay 1 --retry-all-errors "${auth[@]}" -X POST \
+            "http://127.0.0.1:8001/api/v2/collections/$id/add" \
+            -d '{"ids":["a","b"],"embeddings":[[1,2,3,4],[4,3,2,1]]}'
+          count=$(curl -sf --retry 60 --retry-delay 1 --retry-all-errors "${auth[@]}" -X POST \
+            "http://127.0.0.1:8002/api/v2/collections/$id/count")
+          echo "count on node 2: $count"
+          test "$count" = '{"count":2}'
+      - name: Lose a node and keep serving
+        run: |
+          set -euo pipefail
+          auth=(-H "x-chroma-token: $REKHA_API_KEY" -H "content-type: application/json")
+          # `stop`, not `kill`: the restart policy would bring a killed
+          # container straight back, and this check is about the survivors.
+          docker compose -f docker-compose.cluster.yml stop node1
+          for i in $(seq 1 60); do
+            if curl -sf -H "x-chroma-token: $REKHA_API_KEY" \
+                http://127.0.0.1:8002/ready > /dev/null; then
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "the survivors did not elect a leader"
+              docker compose -f docker-compose.cluster.yml logs
+              exit 1
+            fi
+            sleep 1
+          done
+          id=$(curl -sf --retry 60 --retry-delay 1 --retry-all-errors "${auth[@]}" \
+            -X POST http://127.0.0.1:8002/api/v2/collections \
+            -d '{"name":"after-failover","dimension":4}' \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+          curl -sf --retry 60 --retry-delay 1 --retry-all-errors "${auth[@]}" -X POST \
+            "http://127.0.0.1:8002/api/v2/collections/$id/add" \
+            -d '{"ids":["c"],"embeddings":[[0,0,0,0]]}'
+      - name: Logs
+        if: always()
+        run: docker compose -f docker-compose.cluster.yml logs
+      - name: Stop
+        if: always()
+        run: docker compose -f docker-compose.cluster.yml down -v
+
+  msrv:
+    name: MSRV (1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Deliberately not the pinned toolchain: this is the oldest compiler the
+      # crate claims to support, declared as `rust-version` in Cargo.toml. Without
+      # a job that actually builds with it, the claim is decoration.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+      - uses: Swatinem/rust-cache@v2
+      # Incremental artifacts written by the pinned 1.97 toolchain make rustc
+      # 1.90 ICE in this workspace (`check_expr_unsafe_binder_cast`, on
+      # `middleware::auth`). Reproduced by running both against one target dir,
+      # gone with incremental off. The gate is about whether this compiler can
+      # build the tree, not about a cache format.
+      - run: cargo check --workspace
+        env:
+          CARGO_INCREMENTAL: "0"

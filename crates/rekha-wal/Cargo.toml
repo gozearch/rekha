@@ -1,0 +1,23 @@
+[package]
+name = "rekha-wal"
+description = "Durable per-collection write-ahead log for RekhaDB: the source of truth, replicated via log shipping."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Internal crate: shipped as part of the `rekha` binary, not published.
+publish = false
+
+[dependencies]
+rekha-core = { path = "../rekha-core" }
+bincode = "1"
+crc32fast = "1"
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,2787 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
+//! RekhaDB HTTP API — Chroma-compatible REST server.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use axum::extract::{Extension, Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
+use rekha_cluster::RaftTypeConfig;
+use rekha_cluster::raft_types::ClusterOperation;
+use rekha_core::config::CollectionConfig;
+use rekha_core::filter::WhereFilter;
+use rekha_core::types::{Distance, Embedding, Id, Metadata};
+use rekha_engine::{Engine, EngineError, QueryOptions};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub mod auth_routes;
+pub mod chroma;
+pub mod leadership;
+
+pub mod middleware {
+    use axum::http::{HeaderMap, Request, StatusCode};
+    use axum::middleware::Next;
+    use axum::response::Response;
+    use subtle::ConstantTimeEq;
+
+    use rekha_core::auth::{RouteAction, has_permission, hash_api_key_with_pepper, route_action};
+
+    /// Authenticated request context attached to request extensions after successful auth.
+    #[derive(Debug, Clone)]
+    pub struct AuthContext {
+        pub user_id: String,
+        pub user_name: String,
+        pub permissions: Vec<rekha_core::auth::Permission>,
+    }
+
+    /// The identity the configured shared key authenticates as.
+    ///
+    /// Built in one place because two paths reach it — the legacy single-key
+    /// deployment, and the window in which a clustered node has applied the
+    /// bootstrap user but not yet its key row. Two constructions would be two
+    /// permission sets that can drift.
+    fn shared_key_context() -> AuthContext {
+        AuthContext {
+            user_id: "legacy".into(),
+            user_name: "legacy".into(),
+            permissions: vec![rekha_core::auth::Permission {
+                id: "legacy-wide".into(),
+                action: "*".into(),
+                tenant: None,
+                database: None,
+            }],
+        }
+    }
+
+    /// Public RBAC auth middleware.
+    ///
+    /// 1. Extract API key from `x-chroma-token` / `x-api-key` / `Authorization: Bearer`.
+    /// 2. If RBAC users exist, require a valid RBAC key (lookup via catalog).
+    /// 3. Else if legacy `api_key` is set, check via constant-time compare and treat as superadmin.
+    /// 4. Else (no RBAC, no legacy key) allow through (bootstrap / open mode).
+    /// 5. For matched routes, check `route_action` against the caller's permissions.
+    pub async fn auth(
+        mut request: Request<axum::body::Body>,
+        next: Next,
+    ) -> Result<Response, StatusCode> {
+        let state = request
+            .extensions()
+            .get::<std::sync::Arc<super::AppState>>()
+            .cloned()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let path = request.uri().path().to_owned();
+        let method = request.method().to_string();
+        let is_public = matches!(
+            path.as_str(),
+            "/health"
+                | "/ready"
+                | "/api/v2/heartbeat"
+                | "/api/v2/version"
+                | "/api/v2/pre-flight-checks"
+        );
+        if is_public {
+            return Ok(next.run(request).await);
+        }
+
+        let headers: HeaderMap = request.headers().clone();
+        let provided = headers
+            .get("x-chroma-token")
+            .or_else(|| headers.get("x-api-key"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| {
+                        if s.to_ascii_lowercase().starts_with("bearer ") {
+                            Some(s[7..].trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+            });
+
+        let catalog = state.engine.catalog();
+        // A failed read is not "there are no users". Treating it as one fell
+        // through to the legacy shared-key path, so a storage error was a
+        // fail-open. Ask once, and refuse the request if the answer cannot be
+        // read.
+        let users_exist = match catalog.list_users() {
+            Ok(users) => !users.is_empty(),
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+
+        let auth_ctx = if users_exist {
+            let token = provided.ok_or(StatusCode::UNAUTHORIZED)?;
+            let hash = hash_api_key_with_pepper(&token, &state.pepper);
+            // Deliberately no permission cache. A cache here has to be
+            // invalidated on every user, key and role change -- and those
+            // changes are log entries that apply on every node -- while the
+            // version this replaces was invalidated nowhere: a deleted user kept
+            // working until the entry's TTL expired. The reads it saved are
+            // in-process table lookups on the store this request already reads
+            // to check collection access.
+            let looked_up = catalog
+                .lookup_api_key(&hash)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            match looked_up {
+                Some((user_id, _meta)) => {
+                    let user = catalog
+                        .get_user(&user_id)
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                        .ok_or(StatusCode::UNAUTHORIZED)?;
+                    if !user.enabled {
+                        return Err(StatusCode::UNAUTHORIZED);
+                    }
+                    let perms = catalog
+                        .get_user_permissions(&user_id)
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    AuthContext {
+                        user_id: user.id.clone(),
+                        user_name: user.name.clone(),
+                        permissions: perms,
+                    }
+                }
+                // One apply writes the bootstrap user, its key and its role, so a
+                // reader can arrive after the user row lands and before the key
+                // row does. The honest answer for that instant is not "401 for a
+                // cluster that is still starting". The environment key is the
+                // credential the bootstrap hashes, so accepting *it* here keeps
+                // the node authenticable, and the constant-time comparison
+                // against the configured secret means no other credential is
+                // widened.
+                None if state.api_key.as_deref().is_some_and(|expected| {
+                    token.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1
+                }) =>
+                {
+                    shared_key_context()
+                }
+                None => return Err(StatusCode::UNAUTHORIZED),
+            }
+        } else if let Some(ref expected) = state.api_key {
+            let token = provided.ok_or(StatusCode::UNAUTHORIZED)?;
+            let authorized = token.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1;
+            if !authorized {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            shared_key_context()
+        } else {
+            if !state.allow_open_mode {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            AuthContext {
+                user_id: "anonymous".into(),
+                user_name: "anonymous".into(),
+                permissions: vec![rekha_core::auth::Permission {
+                    id: "open".into(),
+                    action: "*".into(),
+                    tenant: None,
+                    database: None,
+                }],
+            }
+        };
+
+        // Authorization fails closed. The previous form checked permissions
+        // `if let Some(..)` and skipped everything else, so a route the mapping
+        // did not recognise was allowed for any authenticated caller — which is
+        // how `/optimize` was unprotected until it was patched by hand.
+        match route_action(method.as_str(), &path) {
+            RouteAction::Public | RouteAction::AuthenticatedOnly => {}
+            RouteAction::Permission {
+                action,
+                tenant,
+                database,
+            } => {
+                // Native v2 collection routes carry no tenant in the path; the
+                // handler resolves the collection's tenant and re-checks with
+                // `check_collection_access`. Here the gate is coarse on purpose,
+                // so a tenant-scoped operator is not denied before that check.
+                let is_native = tenant.is_none()
+                    && database.is_none()
+                    && (action.starts_with("collection.") || action.starts_with("record."))
+                    && !path.starts_with("/api/v2/auth/");
+                let allowed = if is_native {
+                    auth_ctx
+                        .permissions
+                        .iter()
+                        .any(|p| p.action == "*" || p.action == action)
+                } else {
+                    has_permission(
+                        &auth_ctx.permissions,
+                        &action,
+                        tenant.as_deref(),
+                        database.as_deref(),
+                    )
+                };
+                if !allowed {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+            RouteAction::Unmatched => {
+                // Not a route this build knows. Deny rather than skip, and do it
+                // before the router so an unlisted path cannot reach a handler
+                // that forgot to authorise itself.
+                return Err(StatusCode::NOT_FOUND);
+            }
+        }
+
+        request.extensions_mut().insert(auth_ctx);
+        Ok(next.run(request).await)
+    }
+
+    pub async fn internal_auth(
+        request: Request<axum::body::Body>,
+        next: Next,
+    ) -> Result<Response, StatusCode> {
+        let state = request
+            .extensions()
+            .get::<std::sync::Arc<super::AppState>>()
+            .cloned()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Fail closed. Internal routes drive Raft and WAL shipping; leaving them
+        // open when no secret is configured would expose cluster administration
+        // on any listener that mounts them. An *empty* secret is treated as
+        // unset for the same reason: it would authenticate a request that sends
+        // no header at all.
+        let Some(ref expected) = state.cluster_secret else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        if expected.is_empty() {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let headers: HeaderMap = request.headers().clone();
+        let provided = headers
+            .get("x-rekha-cluster-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let authorized = provided.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1;
+        if !authorized {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(next.run(request).await)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+
+/// Server-wide settings that are not owned by the engine.
+pub struct ServerConfig {
+    pub tenant: String,
+    pub database: String,
+    pub api_key: Option<String>,
+    pub cluster_secret: Option<String>,
+    pub pepper: Vec<u8>,
+    pub allow_open_mode: bool,
+}
+
+pub struct AppState {
+    pub engine: Arc<Engine>,
+    pub tenant: String,
+    pub database: String,
+    pub raft: Option<Arc<openraft::Raft<rekha_cluster::RaftTypeConfig>>>,
+    pub api_key: Option<String>,
+    pub cluster_secret: Option<String>,
+    pub pepper: Vec<u8>,
+    pub allow_open_mode: bool,
+    /// Where the other nodes live, for forwarding writes to the leader.
+    ///
+    /// Empty in single-node mode. Seeded from `--peers` and extended by
+    /// committed membership entries; the addresses are the nodes' internal
+    /// listeners, which is where forwarded writes land.
+    ///
+    /// Cloning it shares the same map, so there is one directory per process
+    /// and no second copy to fall out of date.
+    pub peers: rekha_cluster::PeerDirectory,
+    /// Outbound client for forwarding writes.
+    pub http: reqwest::Client,
+    /// Leadership as observed from consensus, when this node has a Raft group.
+    ///
+    /// Used to *route* a write, never to authorise one: the log decides whether
+    /// a write is legal, this only decides whether to forward it first.
+    pub leader: Option<rekha_cluster::LeaderTracker>,
+    /// Raised when a committed entry could not be applied. A node in this state
+    /// must stop reporting readiness.
+    pub apply_failure: Arc<AtomicBool>,
+    /// Whether the cluster's bootstrap credentials are applied on this node.
+    ///
+    /// Until they are, a request can authenticate as the bootstrap user and
+    /// still hold no permissions, which reads as a 403 to a client that waited
+    /// for readiness. `/ready` stays false until this is set. Defaults to true
+    /// for callers that never attach a flag (tests, single-node open mode).
+    pub bootstrap_ready: Arc<AtomicBool>,
+    /// Whether client data writes travel through the Raft log.
+    ///
+    /// Deliberately separate from `raft.is_some()`. A single-node deployment
+    /// still holds a Raft group for metadata (RBAC, the collection registry),
+    /// so using the presence of `raft` to decide the data path sent single-node
+    /// writes into the log while the engine was configured to be its own
+    /// durable record — and the apply refused, after the entry had committed.
+    /// The client got 201 and the record was never stored.
+    pub data_via_log: bool,
+    /// The consensus groups this node runs, when it runs more than the
+    /// metadata group.
+    ///
+    /// `None` in single-node mode and in a cluster started with one group, so
+    /// every earlier behaviour is preserved without a flag.
+    pub shards: Option<Arc<rekha_cluster::ShardCluster>>,
+    /// Collections already placed per node, cached for this leadership term.
+    ///
+    /// Only the leader changes placement, so this is exactly accurate while this
+    /// node leads, and rebuilt once when it starts leading. Rebuilding on every
+    /// creation would make creating `n` collections `O(n^2)` — measured: 200
+    /// collections took 29s before placement became a decision and 82s when the
+    /// load was recomputed from the catalog each time.
+    pub placement_cache: tokio::sync::Mutex<Option<(u64, std::collections::HashMap<u64, u32>)>>,
+    /// One async lock per collection, held from prepare through propose.
+    ///
+    /// The single-node path validates and writes inside one collection lock, so
+    /// two metadata updates cannot merge from the same base. Splitting prepare
+    /// from apply would reopen that window; this closes it again, and costs
+    /// nothing in throughput because the log already totals-orders writes to a
+    /// collection.
+    write_locks: parking_lot::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AppState {
+    pub fn new(
+        engine: Arc<Engine>,
+        raft: Option<Arc<openraft::Raft<rekha_cluster::RaftTypeConfig>>>,
+        config: ServerConfig,
+    ) -> Self {
+        Self {
+            engine,
+            tenant: config.tenant,
+            database: config.database,
+            raft,
+            api_key: config.api_key,
+            cluster_secret: config.cluster_secret,
+            pepper: config.pepper,
+            allow_open_mode: config.allow_open_mode,
+            peers: rekha_cluster::PeerDirectory::default(),
+            http: reqwest::Client::new(),
+            leader: None,
+            apply_failure: Arc::new(AtomicBool::new(false)),
+            bootstrap_ready: Arc::new(AtomicBool::new(true)),
+            data_via_log: false,
+            shards: None,
+            placement_cache: tokio::sync::Mutex::new(None),
+            write_locks: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Attach the consensus leadership view, used to route writes.
+    pub fn with_leader_tracker(mut self, tracker: rekha_cluster::LeaderTracker) -> Self {
+        self.leader = Some(tracker);
+        self
+    }
+
+    /// Declare whether client data writes go through the Raft log.
+    ///
+    /// Must agree with the engine's `ApplyMode`: `true` pairs with
+    /// `ApplyMode::Committed`, `false` with `ApplyMode::Durable`. Startup
+    /// asserts that, because the two disagreeing is how a node acknowledges
+    /// writes it never stores.
+    pub fn with_data_via_log(mut self, enabled: bool) -> Self {
+        self.data_via_log = enabled;
+        self
+    }
+
+    /// Attach the per-shard consensus groups this node participates in.
+    pub fn with_shards(mut self, shards: Arc<rekha_cluster::ShardCluster>) -> Self {
+        self.shards = Some(shards);
+        self
+    }
+
+    /// The `Raft` instance for `group`.
+    ///
+    /// `METADATA_GROUP` is this node's metadata group; every other id is a
+    /// shard the node hosts. `None` means "this node is not a member", which is
+    /// a routing answer rather than an error.
+    pub fn raft_for(
+        &self,
+        group: rekha_cluster::GroupId,
+    ) -> Option<Arc<openraft::Raft<rekha_cluster::RaftTypeConfig>>> {
+        if group == rekha_cluster::METADATA_GROUP {
+            return self.raft.clone();
+        }
+        self.shards
+            .as_ref()?
+            .raft(rekha_cluster::ShardId(group - 1))
+    }
+
+    /// Whether this node hosts the group that holds `collection`.
+    pub fn hosts_collection(&self, collection: &uuid::Uuid) -> bool {
+        match self.shards.as_ref() {
+            // No shard registry means one group holds everything.
+            None => self.raft.is_some(),
+            Some(shards) => self
+                .shard_of(collection)
+                .is_some_and(|shard| shards.hosts(shard)),
+        }
+    }
+
+    /// The shard that holds `collection`, from its catalog row.
+    ///
+    /// This is the only way a collection's shard is learned. It is decided once
+    /// by the metadata leader and recorded; deriving it from the id let routing
+    /// and storage disagree about where the bytes were, and the disagreement
+    /// only showed up as reads returning empty from a node that thought it was
+    /// a replica.
+    ///
+    /// `None` means the row is missing (the create has not been applied here
+    /// yet) or unsharded (single node). Both are "this node cannot answer a
+    /// placement question", which callers must treat as retry-later, never as
+    /// "route somewhere plausible".
+    pub fn shard_of(&self, collection: &uuid::Uuid) -> Option<rekha_cluster::ShardId> {
+        match self.engine.get_collection_by_id(collection) {
+            Ok(Some(record)) => record.shard,
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(collection = %collection, %e, "could not read a collection's shard");
+                None
+            }
+        }
+    }
+
+    /// Share the flag the state machine raises when a committed entry cannot be
+    /// applied.
+    pub fn with_apply_failure_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.apply_failure = flag;
+        self
+    }
+
+    /// Share the flag that says the bootstrap credentials are applied here.
+    pub fn with_bootstrap_ready_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.bootstrap_ready = flag;
+        self
+    }
+
+    fn write_lock(&self, collection_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.write_locks.lock();
+        locks
+            .entry(collection_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Attach the cluster topology so writes can be forwarded to the leader.
+    pub fn with_peer_directory(mut self, peers: rekha_cluster::PeerDirectory) -> Self {
+        self.peers = peers;
+        self
+    }
+}
+
+/// Live record counts for `ids`, fetched from the nodes that hold the data.
+///
+/// A count is a data question: a node that is not a replica cannot answer it,
+/// and answering `0` would look like an empty collection. This asks each
+/// collection's first replica in one request per replica, not one per
+/// collection, so a list of a thousand collections costs at most one round trip
+/// per node.
+///
+/// A replica that cannot be reached is left out of the result rather than
+/// reported as zero. Callers decide what to show for an unknown count; they must
+/// not paper over it with a number that means "empty".
+async fn counts_for(
+    state: &AppState,
+    ids: &[uuid::Uuid],
+) -> Result<std::collections::HashMap<uuid::Uuid, u64>, ApiError> {
+    let mut counts = std::collections::HashMap::new();
+    let mut remote: std::collections::HashMap<u64, Vec<uuid::Uuid>> =
+        std::collections::HashMap::new();
+
+    for id in ids {
+        match state.engine.count_local(id) {
+            Ok(Some(local)) => {
+                counts.insert(*id, local);
+            }
+            Ok(None) => {
+                // A count belongs to a replica that holds the data, so the target
+                // is the first owner of the collection's shard.
+                let owner = state.shard_of(id).and_then(|shard| {
+                    state
+                        .shards
+                        .as_ref()
+                        .and_then(|shards| shards.placement().owners(shard).first().copied())
+                });
+                if let Some(owner) = owner {
+                    remote.entry(owner).or_default().push(*id);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(collection = %id, %e, "could not count a collection");
+            }
+        }
+    }
+
+    for (owner, ids) in remote {
+        let Some(url) = state.peers.url(owner) else {
+            continue;
+        };
+        let mut request = state
+            .http
+            .post(format!("{url}/internal/stats/counts"))
+            .json(&ids);
+        if let Some(secret) = state.cluster_secret.as_deref() {
+            request = request.header(crate::leadership::SECRET_HEADER, secret);
+        }
+        match request.send().await {
+            Ok(response) => match response
+                .json::<std::collections::HashMap<String, u64>>()
+                .await
+            {
+                Ok(remote_counts) => {
+                    for (id, count) in remote_counts {
+                        if let Ok(id) = id.parse() {
+                            counts.insert(id, count);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(node = owner, %e, "unreadable count response"),
+            },
+            Err(e) => tracing::warn!(node = owner, %e, "count request failed"),
+        }
+    }
+
+    // Every requested id must be answered. A missing entry means the replica
+    // that holds it could not be reached, and the caller must not turn that into
+    // a zero: "the collection is empty" and "I could not ask" are different
+    // facts, and only one of them is true.
+    if let Some(missing) = ids.iter().find(|id| !counts.contains_key(*id)) {
+        return Err(ApiError::Engine(EngineError::Unavailable(format!(
+            "no replica answered the count for collection {missing}; retry, or check that \
+             the shard's owners are reachable"
+        ))));
+    }
+    Ok(counts)
+}
+
+/// Counts this node holds, for a peer that needs them.
+async fn stats_counts(
+    State(state): State<Arc<AppState>>,
+    Json(ids): Json<Vec<uuid::Uuid>>,
+) -> Json<std::collections::HashMap<String, u64>> {
+    let mut counts = std::collections::HashMap::new();
+    for id in ids {
+        if let Ok(Some(count)) = state.engine.count_local(&id) {
+            counts.insert(id.to_string(), count);
+        }
+    }
+    Json(counts)
+}
+
+/// Helper to check per-collection access for native v2 routes.
+/// Loads the collection's tenant/database and verifies the caller's permissions.
+pub(crate) fn check_collection_access(
+    catalog: &dyn rekha_storage::Catalog,
+    perms: &[rekha_core::auth::Permission],
+    action: &str,
+    collection_id: &uuid::Uuid,
+) -> Result<(), EngineError> {
+    let record = catalog
+        .get_collection_by_id(collection_id)
+        .map_err(EngineError::Catalog)?
+        .ok_or_else(|| EngineError::CollectionNotFound(collection_id.to_string()))?;
+    let tenant = record.config.tenant.as_str();
+    let database = record.config.database.as_str();
+    if rekha_core::auth::has_permission(perms, action, Some(tenant), Some(database))
+        || rekha_core::auth::has_permission(perms, action, Some(tenant), None)
+        || rekha_core::auth::has_permission(perms, action, None, None)
+    {
+        Ok(())
+    } else {
+        Err(EngineError::Forbidden(format!(
+            "missing permission {action} on {tenant}/{database}"
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error mapping (newtype wrapper to satisfy orphan rules)
+// ---------------------------------------------------------------------------
+
+pub(crate) enum ApiError {
+    Engine(EngineError),
+    /// This node may not perform the write. `leader` names the node that can,
+    /// so a client or proxy can retry against it.
+    NotLeader {
+        leader: Option<u64>,
+    },
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            ApiError::Engine(e) => {
+                let status = engine_error_status(&e);
+                let message = e.to_string();
+                (status, Json(serde_json::json!({ "error": message }))).into_response()
+            }
+            ApiError::NotLeader { leader } => {
+                let mut headers = axum::http::HeaderMap::new();
+                if let Some(id) = leader
+                    && let Ok(value) = axum::http::HeaderValue::from_str(&id.to_string())
+                {
+                    headers.insert(
+                        axum::http::HeaderName::from_static(leadership::LEADER_HEADER),
+                        value,
+                    );
+                }
+                headers.insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    headers,
+                    Json(serde_json::json!({
+                        "error": "this node is not the leader for this write; retry against the leader",
+                        "leader": leader,
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+impl From<EngineError> for ApiError {
+    fn from(e: EngineError) -> Self {
+        ApiError::Engine(e)
+    }
+}
+
+/// Create a collection and make it a cluster fact.
+///
+/// The log decides. In cluster mode the collection is proposed through Raft and
+/// then materialized by the state machine on every node, including the leader;
+/// How many collections are already placed on each node, read from the catalog.
+///
+/// This is the rebuild path, not the per-creation path: [`AppState::placement_cache`]
+/// holds the incrementally-maintained answer and calls this only when the
+/// leadership term changes, because a previous leader's placements are the only
+/// ones in the catalog that this cache did not see happen.
+fn load_from_catalog(
+    state: &AppState,
+    placement: &rekha_cluster::Placement,
+) -> Result<std::collections::HashMap<u64, u32>, EngineError> {
+    let mut load: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for record in state.engine.catalog().list_collections_all()? {
+        let Some(shard) = record.shard else {
+            // An unsharded row in a sharded cluster: nothing known holds it, so
+            // it contributes no load rather than a guessed one.
+            continue;
+        };
+        for &node in placement.owners(shard) {
+            *load.entry(node).or_default() += 1;
+        }
+    }
+    Ok(load)
+}
+
+/// Decide where `config` goes and replicate the decision.
+///
+/// The leader decides because only it can see how loaded the nodes already are.
+/// Recording the voter set instead made every node a replica, which put the data
+/// back on every disk — the exact thing sharding removes — while the write path
+/// had already started routing by shard, so the two disagreed about where the
+/// data was.
+async fn propose_with_placement(
+    state: &AppState,
+    raft: &Arc<openraft::Raft<rekha_cluster::RaftTypeConfig>>,
+    shards: &Arc<rekha_cluster::ShardCluster>,
+    config: &CollectionConfig,
+) -> Result<(), EngineError> {
+    let placement = shards.placement();
+
+    // Held across the propose below on purpose: two creations choosing from the
+    // same load picture would pick the same shard and land twice on one node.
+    // Collection creation already serialises at the metadata leader, so this
+    // costs nothing that was not already serialised.
+    let mut cache = state.placement_cache.lock().await;
+    let term = raft.metrics().borrow().current_term;
+    let mut load = match cache.take() {
+        Some((cached_term, load)) if cached_term == term => load,
+        // A new term means a previous leader placed collections this process did
+        // not witness. One rebuild per election, not one per creation.
+        _ => load_from_catalog(state, placement)?,
+    };
+    let shard = placement.place(config.id, &load);
+
+    raft.client_write(ClusterOperation::AddCollection {
+        config: config.clone(),
+        shard: Some(shard),
+    })
+    .await
+    .map_err(|e| EngineError::Recovery(format!("failed to replicate collection creation: {e}")))?;
+
+    // Only after the entry commits: a rolled-back proposal must not leave load
+    // counted for a collection that does not exist.
+    for &owner in placement.owners(shard) {
+        *load.entry(owner).or_default() += 1;
+    }
+    *cache = Some((term, load));
+    Ok(())
+}
+
+/// Create a collection and make it a cluster fact.
+///
+/// The log decides. In cluster mode the collection is proposed through Raft and
+/// then materialized by the state machine on every node, including the leader;
+/// the leader does not create it locally first, because a create that is
+/// interrupted before the log commits would leave one node holding a collection
+/// the cluster has never heard of.
+pub(crate) async fn create_collection_clustered(
+    state: &AppState,
+    config: &CollectionConfig,
+) -> Result<rekha_storage::CollectionRecord, EngineError> {
+    // Friendly early duplicate detection so the common case is a 409 without a
+    // log round trip. The authoritative check is the catalog's own uniqueness
+    // constraint inside the state machine.
+    if state
+        .engine
+        .get_collection(&config.tenant, &config.database, &config.name)?
+        .is_some()
+    {
+        return Err(EngineError::Catalog(
+            rekha_storage::CatalogError::AlreadyExists,
+        ));
+    }
+
+    let Some(raft) = state.raft.clone() else {
+        let engine = state.engine.clone();
+        let config = config.clone();
+        return offload(move || engine.create_collection(&config)).await;
+    };
+
+    match state.shards.clone() {
+        Some(shards) => propose_with_placement(state, &raft, &shards, config).await?,
+        // One group holds everything, and a single node has no shards at all.
+        None => {
+            raft.client_write(ClusterOperation::AddCollection {
+                config: config.clone(),
+                shard: None,
+            })
+            .await
+            .map_err(|e| {
+                EngineError::Recovery(format!("failed to replicate collection creation: {e}"))
+            })?;
+        }
+    }
+
+    let engine = state.engine.clone();
+    let id = config.id;
+    offload(move || engine.get_collection_by_id(&id))
+        .await?
+        .ok_or_else(|| {
+            EngineError::Recovery(format!(
+                "collection {id} committed to the log but was not materialized locally"
+            ))
+        })
+}
+
+/// Delete a collection through the log.
+///
+/// The removal is proposed before anything is deleted locally, so a failed
+/// proposal leaves the collection intact everywhere rather than removing it
+/// from one node.
+pub(crate) async fn delete_collection_clustered(
+    state: &AppState,
+    collection_id: Uuid,
+) -> Result<(), EngineError> {
+    let Some(raft) = state.raft.clone() else {
+        let engine = state.engine.clone();
+        return offload(move || engine.delete_collection(&collection_id)).await;
+    };
+    raft.client_write(ClusterOperation::RemoveCollection { collection_id })
+        .await
+        .map_err(|e| {
+            EngineError::Recovery(format!("failed to replicate collection deletion: {e}"))
+        })?;
+    Ok(())
+}
+
+/// Prepare a write on the leader and get it committed.
+///
+/// Two paths, one meaning:
+///
+/// * Single-node — append through the WAL and apply, exactly as before.
+/// * Cluster — validate locally, then propose one entry. The state machine
+///   applies it on every node, so the log index is the dataset sequence and
+///   there is one replication mechanism instead of two.
+///
+/// The per-collection lock is held across prepare and propose so a metadata
+/// patch cannot be resolved from a base that another write is about to replace.
+pub(crate) async fn write_batch<F>(
+    state: &AppState,
+    collection_id: Uuid,
+    prepare: F,
+) -> Result<usize, ApiError>
+where
+    F: FnOnce() -> Result<rekha_engine::PreparedBatch, EngineError> + Send + 'static,
+{
+    // The guard is owned so it can be held across awaits without borrowing the
+    // state borrow that produced it.
+    let lock = state.write_lock(collection_id);
+    let _guard = lock.lock_owned().await;
+
+    let prepared = offload(prepare).await?;
+    let ops = prepared.ops.len();
+    commit_batch(state, collection_id, prepared).await?;
+    Ok(ops)
+}
+
+async fn commit_batch(
+    state: &AppState,
+    collection_id: Uuid,
+    prepared: rekha_engine::PreparedBatch,
+) -> Result<(), ApiError> {
+    // The data path is a deployment decision, not a consequence of holding a
+    // Raft group. Single-node keeps one for metadata but writes through its own
+    // WAL.
+    if !state.data_via_log {
+        let engine = state.engine.clone();
+        offload(move || engine.append_ops(&collection_id, &prepared.ops)).await?;
+        return Ok(());
+    }
+
+    let raft = match state.shards.as_ref() {
+        Some(shards) => {
+            let record = state
+                .engine
+                .get_collection_by_id(&collection_id)?
+                .ok_or_else(|| EngineError::CollectionNotFound(collection_id.to_string()))?;
+            let Some(shard) = record.shard else {
+                return Err(ApiError::Engine(EngineError::NotReplica {
+                    collection: collection_id.to_string(),
+                    shard: None,
+                }));
+            };
+            let Some(raft) = shards.raft(shard) else {
+                // The request reached a node that does not host this shard.
+                // `require_leader` forwards those, so reaching here is a route
+                // that bypassed the middleware; say so instead of writing
+                // somewhere the data does not belong.
+                return Err(ApiError::Engine(EngineError::NotReplica {
+                    collection: collection_id.to_string(),
+                    shard: Some(shard),
+                }));
+            };
+
+            // A shard group's log must know the collection before it applies a
+            // batch for it: the metadata group's `AddCollection` and this
+            // shard's entries are in different logs, so there is no ordering
+            // between them. One idempotent entry per collection per process
+            // closes that gap, and the first write pays it.
+            if !shards.is_ensured(collection_id) {
+                raft.client_write(ClusterOperation::AddCollection {
+                    config: record.config,
+                    shard: Some(shard),
+                })
+                .await
+                .map_err(|e| {
+                    EngineError::Recovery(format!(
+                        "could not tell shard {shard} about collection {collection_id}: {e}"
+                    ))
+                })?;
+                shards.mark_ensured(collection_id);
+            }
+            raft
+        }
+        None => state.raft.clone().ok_or_else(|| {
+            EngineError::Recovery(
+                "this node is configured to write through the log but has no Raft group".into(),
+            )
+        })?,
+    };
+
+    let operation = ClusterOperation::Batch {
+        collection_id,
+        ops: prepared.ops,
+        dimension: prepared.dimension,
+    };
+
+    match raft.client_write(operation).await {
+        Ok(response) => {
+            // The entry committed. That is not the same as "the data is here":
+            // if this node could not apply it, the client must be told now
+            // rather than discover it on the next read.
+            match serde_json::from_str::<rekha_cluster::BatchResponse>(&response.data) {
+                Ok(applied) => match applied.error {
+                    None => Ok(()),
+                    Some(error) => Err(ApiError::Engine(EngineError::Recovery(format!(
+                        "the write committed at log index {} but this node could not apply it: \
+                         {error}",
+                        applied.seq
+                    )))),
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        "unreadable apply response; the entry committed but its outcome is unknown"
+                    );
+                    Ok(())
+                }
+            }
+        }
+        // The log is the authority on who may write, so this — not a cached
+        // leader read — is what makes routing correct across an election.
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(forward),
+        )) => Err(ApiError::NotLeader {
+            leader: forward.leader_id.or(forward.leader_node),
+        }),
+        Err(e) => Err(ApiError::Engine(EngineError::Recovery(format!(
+            "the write could not be committed to the log: {e}"
+        )))),
+    }
+}
+
+/// Run blocking engine work on the blocking pool.
+///
+/// The engine fsyncs WAL batches and runs checkpoint phases synchronously, and
+/// queries scan and rank in memory. Those calls share a runtime with Raft,
+/// which must send a heartbeat every `heartbeat_interval`. A few hundred
+/// milliseconds of fsync on a worker thread delays that heartbeat, followers
+/// time out at `election_timeout_max`, and the cluster elects a new leader.
+///
+/// The failure looks like a consensus bug and is a scheduling decision: under
+/// sustained write load the cluster loses leadership precisely because it is
+/// doing what it was asked to do. Moving engine work to the blocking pool keeps
+/// the async workers free to answer heartbeats.
+pub(crate) async fn offload<T, F>(work: F) -> Result<T, EngineError>
+where
+    F: FnOnce() -> Result<T, EngineError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(join) => Err(EngineError::Io(std::io::Error::other(format!(
+            "engine worker task failed: {join}"
+        )))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+/// Maximum records accepted in a single write or delete batch.
+/// Advertised by /pre-flight-checks and enforced by the write handlers.
+pub const MAX_BATCH_SIZE: usize = 10_000;
+pub(crate) const MAX_QUERY_EMBEDDINGS: usize = 100;
+pub(crate) const MAX_N_RESULTS: usize = 1_000;
+pub(crate) const MAX_ID_LENGTH: usize = 512;
+pub(crate) const MAX_NAME_LENGTH: usize = 512;
+pub(crate) const MAX_DIMENSION: usize = 65_536;
+
+pub(crate) fn validation_err(msg: impl Into<String>) -> EngineError {
+    EngineError::Validation(msg.into())
+}
+
+pub(crate) fn validate_name(name: &str) -> Result<(), EngineError> {
+    if name.is_empty() {
+        return Err(validation_err("name must not be empty"));
+    }
+    if name.len() > MAX_NAME_LENGTH {
+        return Err(validation_err(format!(
+            "name exceeds max length {MAX_NAME_LENGTH}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_ids(ids: &[Id]) -> Result<(), EngineError> {
+    if ids.is_empty() {
+        return Err(validation_err("ids must not be empty"));
+    }
+    if ids.len() > MAX_BATCH_SIZE {
+        return Err(validation_err(format!(
+            "batch size {} exceeds max {MAX_BATCH_SIZE}",
+            ids.len()
+        )));
+    }
+    for id in ids {
+        if id.is_empty() {
+            return Err(validation_err("id must not be empty"));
+        }
+        if id.len() > MAX_ID_LENGTH {
+            return Err(validation_err(format!(
+                "id exceeds max length {MAX_ID_LENGTH}: {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_embeddings(embeddings: &[Vec<f32>]) -> Result<(), EngineError> {
+    if embeddings.is_empty() {
+        return Err(validation_err("embeddings must not be empty"));
+    }
+    for emb in embeddings {
+        if emb.is_empty() {
+            return Err(validation_err("embedding must not be empty"));
+        }
+        if emb.len() > MAX_DIMENSION {
+            return Err(validation_err(format!(
+                "embedding dimension {} exceeds max {MAX_DIMENSION}",
+                emb.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_add_request(req: &AddRequest) -> Result<(), EngineError> {
+    validate_ids(&req.ids)?;
+    validate_embeddings(&req.embeddings)?;
+    if req.ids.len() != req.embeddings.len() {
+        return Err(validation_err(format!(
+            "ids len {} != embeddings len {}",
+            req.ids.len(),
+            req.embeddings.len()
+        )));
+    }
+    if let Some(ref v) = req.metadatas
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "metadatas len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
+    }
+    if let Some(ref v) = req.documents
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "documents len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_upsert_request(req: &UpsertRequest) -> Result<(), EngineError> {
+    validate_ids(&req.ids)?;
+    validate_embeddings(&req.embeddings)?;
+    if req.ids.len() != req.embeddings.len() {
+        return Err(validation_err(format!(
+            "ids len {} != embeddings len {}",
+            req.ids.len(),
+            req.embeddings.len()
+        )));
+    }
+    if let Some(ref v) = req.metadatas
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "metadatas len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
+    }
+    if let Some(ref v) = req.documents
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "documents len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_query_request(req: &QueryRequest) -> Result<(), EngineError> {
+    if req.query_embeddings.is_empty() {
+        return Err(validation_err("query_embeddings must not be empty"));
+    }
+    if req.query_embeddings.len() > MAX_QUERY_EMBEDDINGS {
+        return Err(validation_err(format!(
+            "query_embeddings len {} exceeds max {MAX_QUERY_EMBEDDINGS}",
+            req.query_embeddings.len()
+        )));
+    }
+    if req.n_results == 0 {
+        return Err(validation_err("n_results must be >= 1"));
+    }
+    if req.n_results > MAX_N_RESULTS {
+        return Err(validation_err(format!(
+            "n_results {} exceeds max {MAX_N_RESULTS}",
+            req.n_results
+        )));
+    }
+    for emb in &req.query_embeddings {
+        if emb.is_empty() {
+            return Err(validation_err("query embedding must not be empty"));
+        }
+        if emb.len() > MAX_DIMENSION {
+            return Err(validation_err(format!(
+                "query embedding dimension {} exceeds max {MAX_DIMENSION}",
+                emb.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_delete_request(req: &DeleteRequest) -> Result<(), EngineError> {
+    validate_ids(&req.ids)
+}
+
+pub(crate) fn validate_update_request(req: &UpdateRequest) -> Result<(), EngineError> {
+    validate_ids(&req.ids)?;
+    if let Some(ref v) = req.metadatas
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "metadatas len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
+    }
+    if let Some(ref v) = req.documents
+        && v.len() != req.ids.len()
+    {
+        return Err(validation_err(format!(
+            "documents len {} != ids len {}",
+            v.len(),
+            req.ids.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Shared helper: map EngineError variants to HTTP status.
+pub(crate) fn engine_error_status(err: &EngineError) -> StatusCode {
+    match err {
+        EngineError::CollectionNotFound(_) => StatusCode::NOT_FOUND,
+        // A catalog identity collision is the caller's conflict, not a server
+        // fault. Chroma answers a duplicate collection name with 409; returning
+        // 500 made a retriable race look like a crash.
+        EngineError::Catalog(rekha_storage::CatalogError::AlreadyExists) => StatusCode::CONFLICT,
+        EngineError::Catalog(rekha_storage::CatalogError::NotFound) => StatusCode::NOT_FOUND,
+        EngineError::Catalog(rekha_storage::CatalogError::InvalidArgument(_)) => {
+            StatusCode::BAD_REQUEST
+        }
+        EngineError::Validation(_) => StatusCode::BAD_REQUEST,
+        EngineError::Forbidden(_) => StatusCode::FORBIDDEN,
+        // Retryable, and never a number: a count that cannot be fetched is not
+        // zero.
+        EngineError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request / Response DTOs
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateCollectionRequest {
+    pub name: String,
+    pub dimension: usize,
+    #[serde(default = "default_distance")]
+    pub distance: Distance,
+}
+
+fn default_distance() -> Distance {
+    Distance::L2
+}
+
+#[derive(Serialize)]
+pub struct CollectionResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub dimension: usize,
+    pub distance: Distance,
+    /// Live record count, or `null` when no replica could answer.
+    ///
+    /// `null` rather than `0`: a list that reports zero for a collection it
+    /// could not reach is a wrong answer that looks like a right one.
+    pub count: Option<u64>,
+    /// The shard this collection was placed on, if the deployment is sharded.
+    ///
+    /// Exposed because it is the answer to "where is my data", which an
+    /// operator otherwise has to reconstruct by hashing — the thing this field
+    /// exists to stop being the source of truth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct AddRequest {
+    pub ids: Vec<Id>,
+    pub embeddings: Vec<Vec<f32>>,
+    pub metadatas: Option<Vec<Option<Metadata>>>,
+    pub documents: Option<Vec<Option<String>>>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateRequest {
+    pub ids: Vec<Id>,
+    /// Optional: a metadata-only update omits this (or sends null).
+    #[serde(default)]
+    pub embeddings: Option<Vec<Embedding>>,
+    pub metadatas: Option<Vec<Option<Metadata>>>,
+    pub documents: Option<Vec<Option<String>>>,
+}
+
+#[derive(Deserialize)]
+pub struct UpsertRequest {
+    pub ids: Vec<Id>,
+    pub embeddings: Vec<Vec<f32>>,
+    pub metadatas: Option<Vec<Option<Metadata>>>,
+    pub documents: Option<Vec<Option<String>>>,
+}
+
+#[derive(Deserialize)]
+pub struct DeleteRequest {
+    pub ids: Vec<Id>,
+}
+
+#[derive(Deserialize)]
+pub struct QueryRequest {
+    pub query_embeddings: Vec<Vec<f32>>,
+    #[serde(default = "default_k")]
+    pub n_results: usize,
+    pub where_filter: Option<WhereFilter>,
+    /// Chroma's document-text eligibility filter. Absent means unfiltered.
+    #[serde(default)]
+    pub where_document: Option<rekha_core::filter::WhereDocument>,
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+fn default_k() -> usize {
+    10
+}
+
+#[derive(Serialize)]
+pub struct QueryResponse {
+    pub ids: Vec<Vec<String>>,
+    pub distances: Option<Vec<Vec<f32>>>,
+    pub metadatas: Option<Vec<Vec<Option<Metadata>>>>,
+    pub documents: Option<Vec<Vec<Option<String>>>>,
+}
+
+#[derive(Deserialize)]
+pub struct GetRequest {
+    pub ids: Option<Vec<Id>>,
+    pub where_filter: Option<WhereFilter>,
+    #[serde(default)]
+    pub where_document: Option<rekha_core::filter::WhereDocument>,
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct GetResponse {
+    pub ids: Vec<String>,
+    pub embeddings: Option<Vec<Vec<f32>>>,
+    pub metadatas: Option<Vec<Option<Metadata>>>,
+    pub documents: Option<Vec<Option<String>>>,
+}
+
+#[derive(Serialize)]
+pub struct CountResponse {
+    pub count: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Internal cluster endpoints (WAL shipping + Raft RPCs)
+// ---------------------------------------------------------------------------
+
+async fn raft_append_entries(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(group): axum::extract::Path<u32>,
+    Json(req): Json<AppendEntriesRequest<RaftTypeConfig>>,
+) -> Result<Json<AppendEntriesResponse<u64>>, StatusCode> {
+    let raft = state.raft_for(group).ok_or(StatusCode::NOT_FOUND)?;
+    raft.append_entries(req)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn raft_vote(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(group): axum::extract::Path<u32>,
+    Json(req): Json<VoteRequest<u64>>,
+) -> Result<Json<VoteResponse<u64>>, StatusCode> {
+    let raft = state.raft_for(group).ok_or(StatusCode::NOT_FOUND)?;
+    raft.vote(req)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[allow(clippy::type_complexity)]
+async fn raft_install_snapshot(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(group): axum::extract::Path<u32>,
+    Json(req): Json<(
+        openraft::Vote<u64>,
+        openraft::SnapshotMeta<u64, u64>,
+        Vec<u8>,
+    )>,
+) -> Result<Json<openraft::raft::SnapshotResponse<u64>>, StatusCode> {
+    let raft = state.raft_for(group).ok_or(StatusCode::NOT_FOUND)?;
+    let (vote, meta, data) = req;
+    let snapshot = openraft::Snapshot {
+        meta,
+        snapshot: Box::new(std::io::Cursor::new(data)),
+    };
+    raft.install_full_snapshot(vote, snapshot)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
+
+async fn create_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Json(req): Json<CreateCollectionRequest>,
+) -> Result<Json<CollectionResponse>, ApiError> {
+    // Per-tenant/database check for create
+    if !rekha_core::auth::has_permission(
+        &auth.permissions,
+        "collection.create",
+        Some(&state.tenant),
+        Some(&state.database),
+    ) && !rekha_core::auth::has_permission(
+        &auth.permissions,
+        "collection.create",
+        Some(&state.tenant),
+        None,
+    ) && !rekha_core::auth::has_permission(&auth.permissions, "collection.create", None, None)
+    {
+        return Err(ApiError::Engine(EngineError::Forbidden(
+            "missing permission collection.create".into(),
+        )));
+    }
+    validate_name(&req.name)?;
+    if req.dimension > MAX_DIMENSION {
+        return Err(ApiError::Engine(validation_err(format!(
+            "dimension {} exceeds max {MAX_DIMENSION}",
+            req.dimension
+        ))));
+    }
+    let mut config = CollectionConfig::new(req.name.clone(), req.dimension, req.distance);
+    config.tenant = state.tenant.clone();
+    config.database = state.database.clone();
+    let record = create_collection_clustered(&state, &config).await?;
+    // Known to be empty by construction, and a fresh collection answers `Some(0)`
+    // rather than `None`: this is a fact the server just created, not a count it
+    // failed to fetch.
+    let count = Some(0);
+
+    Ok(Json(CollectionResponse {
+        id: record.config.id,
+        name: record.config.name,
+        dimension: record.config.dimension,
+        distance: record.config.space,
+        count,
+        shard: record.shard.map(|shard| shard.0),
+    }))
+}
+
+async fn list_collections(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+) -> Result<Json<Vec<CollectionResponse>>, ApiError> {
+    if !rekha_core::auth::has_permission(
+        &auth.permissions,
+        "collection.list",
+        Some(&state.tenant),
+        Some(&state.database),
+    ) && !rekha_core::auth::has_permission(
+        &auth.permissions,
+        "collection.list",
+        Some(&state.tenant),
+        None,
+    ) && !rekha_core::auth::has_permission(&auth.permissions, "collection.list", None, None)
+    {
+        return Err(ApiError::Engine(EngineError::Forbidden(
+            "missing permission collection.list".into(),
+        )));
+    }
+    let records = state
+        .engine
+        .list_collections(&state.tenant, &state.database)?;
+    let ids: Vec<uuid::Uuid> = records.iter().map(|r| r.config.id).collect();
+    // One unreachable shard owner must not fail the whole list, so a missing
+    // count is reported as `null` for that row instead of aborting the response
+    // or inventing a zero.
+    let counts = counts_for(&state, &ids).await.unwrap_or_default();
+    let mut out = Vec::with_capacity(records.len());
+    for record in records {
+        let count = counts.get(&record.config.id).copied();
+        out.push(CollectionResponse {
+            id: record.config.id,
+            name: record.config.name,
+            dimension: record.config.dimension,
+            distance: record.config.space,
+            count,
+            shard: record.shard.map(|shard| shard.0),
+        });
+    }
+    Ok(Json(out))
+}
+
+async fn get_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<CollectionResponse>, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "collection.get",
+        &id,
+    )?;
+    let record = state
+        .engine
+        .get_collection_by_id(&id)?
+        .ok_or_else(|| EngineError::CollectionNotFound(id.to_string()))?;
+    let count = counts_for(&state, &[id])
+        .await?
+        .get(&id)
+        .copied()
+        .ok_or_else(|| {
+            ApiError::Engine(EngineError::Unavailable(format!(
+                "no replica answered the count for collection {id}"
+            )))
+        })?;
+    Ok(Json(CollectionResponse {
+        id: record.config.id,
+        name: record.config.name,
+        dimension: record.config.dimension,
+        distance: record.config.space,
+        count: Some(count),
+        shard: record.shard.map(|shard| shard.0),
+    }))
+}
+
+async fn delete_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "collection.delete",
+        &id,
+    )?;
+    delete_collection_clustered(&state, id).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn add_records(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AddRequest>,
+) -> Result<StatusCode, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "record.add",
+        &id,
+    )?;
+    validate_add_request(&req)?;
+    let embeddings: Vec<Embedding> = req.embeddings.into_iter().map(|e| e.into()).collect();
+    let engine = state.engine.clone();
+    let ids = req.ids;
+    let metadatas = req.metadatas;
+    let documents = req.documents;
+    write_batch(&state, id, move || {
+        engine.prepare_add(
+            &id,
+            &ids,
+            &embeddings,
+            metadatas.as_deref(),
+            documents.as_deref(),
+        )
+    })
+    .await?;
+    Ok(StatusCode::OK)
+}
+
+async fn upsert_records(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpsertRequest>,
+) -> Result<StatusCode, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "record.upsert",
+        &id,
+    )?;
+    validate_upsert_request(&req)?;
+    let embeddings: Vec<Embedding> = req.embeddings.into_iter().map(|e| e.into()).collect();
+    let metadatas = req.metadatas.map(|list| {
+        list.into_iter()
+            .map(|o| o.map(rekha_core::types::metadata_patch_from))
+            .collect::<Vec<_>>()
+    });
+    let engine = state.engine.clone();
+    let ids = req.ids;
+    let documents = req.documents;
+    write_batch(&state, id, move || {
+        engine.prepare_upsert(
+            &id,
+            &ids,
+            &embeddings,
+            metadatas.as_deref(),
+            documents.as_deref(),
+        )
+    })
+    .await?;
+    Ok(StatusCode::OK)
+}
+
+async fn update_records(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateRequest>,
+) -> Result<StatusCode, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "record.update",
+        &id,
+    )?;
+    validate_update_request(&req)?;
+    let metadatas = req.metadatas.map(|list| {
+        list.into_iter()
+            .map(|o| o.map(rekha_core::types::metadata_patch_from))
+            .collect::<Vec<_>>()
+    });
+    let engine = state.engine.clone();
+    let ids = req.ids;
+    let embeddings = req.embeddings;
+    let documents = req.documents;
+    write_batch(&state, id, move || {
+        engine.prepare_update(
+            &id,
+            &ids,
+            embeddings.as_deref(),
+            metadatas.as_deref(),
+            documents.as_deref(),
+        )
+    })
+    .await?;
+    Ok(StatusCode::OK)
+}
+
+async fn delete_records(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<DeleteRequest>,
+) -> Result<StatusCode, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "record.delete",
+        &id,
+    )?;
+    validate_delete_request(&req)?;
+    let engine = state.engine.clone();
+    let ids = req.ids;
+    write_batch(&state, id, move || engine.prepare_delete(&id, &ids)).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn query_records(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<QueryRequest>,
+) -> Result<Json<QueryResponse>, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "record.query",
+        &id,
+    )?;
+    validate_query_request(&req)?;
+    let include_metadatas = req.include.iter().any(|s| s == "metadatas");
+    let include_documents = req.include.iter().any(|s| s == "documents");
+    let include_distances = req.include.iter().any(|s| s == "distances");
+
+    let mut all_results = Vec::with_capacity(req.query_embeddings.len());
+    // The scan/rank loop is CPU-bound; run it on the blocking pool so a large
+    // query cannot delay Raft heartbeats.
+    let engine = state.engine.clone();
+    let query_embeddings = req.query_embeddings.clone();
+    let where_filter = req.where_filter.clone();
+    let where_document = req.where_document.clone();
+    let n_results = req.n_results;
+    all_results.extend(
+        offload(move || {
+            let mut results = Vec::with_capacity(query_embeddings.len());
+            for query_emb in &query_embeddings {
+                let embedding: Embedding = query_emb.clone().into();
+                let opts = QueryOptions {
+                    ef: 0,
+                    where_filter: where_filter.clone(),
+                    where_document: where_document.clone(),
+                    oversampling: 4,
+                };
+                results.push(engine.query(&id, &embedding, n_results, &opts)?);
+            }
+            Ok(results)
+        })
+        .await?,
+    );
+
+    let n_queries = all_results.len();
+    let k = all_results.first().map_or(0, |r| r.len());
+
+    let mut ids: Vec<Vec<String>> = Vec::with_capacity(n_queries);
+    let mut distances: Option<Vec<Vec<f32>>> = if include_distances {
+        Some(Vec::with_capacity(n_queries))
+    } else {
+        None
+    };
+    let mut metadatas: Option<Vec<Vec<Option<Metadata>>>> = if include_metadatas {
+        Some(Vec::with_capacity(n_queries))
+    } else {
+        None
+    };
+    let mut documents: Option<Vec<Vec<Option<String>>>> = if include_documents {
+        Some(Vec::with_capacity(n_queries))
+    } else {
+        None
+    };
+
+    for results in &all_results {
+        ids.push(results.iter().map(|r| r.id.clone()).collect());
+        if let Some(ref mut d) = distances {
+            d.push(results.iter().map(|r| r.distance).collect());
+        }
+        if let Some(ref mut m) = metadatas {
+            m.push(results.iter().map(|r| r.metadata.clone()).collect());
+        }
+        if let Some(ref mut doc) = documents {
+            doc.push(results.iter().map(|r| r.document.clone()).collect());
+        }
+    }
+
+    // Pad shorter result sets to k if needed (Chroma returns Vec<Vec<...>>
+    // where inner vecs are all length k, with empty strings / None for missing).
+    for vec in ids.iter_mut() {
+        let len = vec.len();
+        if len < k {
+            vec.resize_with(k, String::new);
+        }
+    }
+    if let Some(ref mut d) = distances {
+        for vec in d.iter_mut() {
+            let len = vec.len();
+            if len < k {
+                vec.resize_with(k, || f32::INFINITY);
+            }
+        }
+    }
+    if let Some(ref mut m) = metadatas {
+        for vec in m.iter_mut() {
+            let len = vec.len();
+            if len < k {
+                vec.resize_with(k, || None);
+            }
+        }
+    }
+    if let Some(ref mut doc) = documents {
+        for vec in doc.iter_mut() {
+            let len = vec.len();
+            if len < k {
+                vec.resize_with(k, || None);
+            }
+        }
+    }
+
+    Ok(Json(QueryResponse {
+        ids,
+        distances,
+        metadatas,
+        documents,
+    }))
+}
+
+async fn get_records(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<GetRequest>,
+) -> Result<Json<GetResponse>, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "record.get",
+        &id,
+    )?;
+    let ids = req.ids.unwrap_or_default();
+    let include_embeddings = req.include.iter().any(|s| s == "embeddings");
+
+    // A `where` or `where_document` with no ids is a filter-only read, not an
+    // empty result. The handler used to ignore both fields and answer `[]`,
+    // which reads to a client exactly like "nothing matched".
+    let records: Vec<Option<rekha_engine::Record>> =
+        if ids.is_empty() && req.where_filter.is_none() && req.where_document.is_none() {
+            Vec::new()
+        } else if req.where_filter.is_none() && req.where_document.is_none() {
+            state.engine.get(&id, &ids)?
+        } else {
+            state
+                .engine
+                .get_records(
+                    &id,
+                    (!ids.is_empty()).then_some(ids.as_slice()),
+                    req.where_filter.as_ref(),
+                    req.where_document.as_ref(),
+                    None,
+                    0,
+                )?
+                .into_iter()
+                .map(Some)
+                .collect()
+        };
+
+    let out_ids: Vec<String> = records
+        .iter()
+        .filter_map(|r| r.as_ref().map(|r| r.id.clone()))
+        .collect();
+    let out_embeddings = if include_embeddings {
+        Some(
+            records
+                .iter()
+                .filter_map(|r| {
+                    r.as_ref()
+                        .and_then(|r| r.embedding.as_ref().map(|e| e.iter().copied().collect()))
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let out_metadatas: Vec<Option<Metadata>> = records
+        .iter()
+        .map(|r| r.as_ref().and_then(|r| r.metadata.clone()))
+        .collect();
+    let out_documents: Vec<Option<String>> = records
+        .iter()
+        .map(|r| r.as_ref().and_then(|r| r.document.clone()))
+        .collect();
+
+    Ok(Json(GetResponse {
+        ids: out_ids,
+        embeddings: out_embeddings,
+        metadatas: Some(out_metadatas),
+        documents: Some(out_documents),
+    }))
+}
+
+async fn count_records(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<CountResponse>, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "record.count",
+        &id,
+    )?;
+    let count = state.engine.count(&id)?;
+    Ok(Json(CountResponse { count }))
+}
+
+/// POST /api/v2/collections/{id}/optimize — force-flush, rebuild the ANN graph,
+/// publish a checkpoint, and prune the WAL.
+///
+/// Operationally this is how an operator (or a test) forces a checkpoint
+/// without waiting for `sync_threshold` writes, which is also the only way to
+/// exercise the publication path over HTTP.
+async fn optimize_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<middleware::AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_collection_access(
+        state.engine.catalog().as_ref(),
+        &auth.permissions,
+        "collection.optimize",
+        &id,
+    )?;
+    // `optimize` compacts segments and rebuilds the index — measured at 6.5 s
+    // for 40k records. Running that on an async worker thread would starve
+    // Raft heartbeats for the whole duration and force an election.
+    let engine = state.engine.clone();
+    let stats = offload(move || engine.optimize(&id)).await?;
+    Ok(Json(serde_json::json!({
+        "records": stats.records,
+        "indexed": stats.indexed,
+        "wal_bytes_before": stats.wal_bytes_before,
+        "wal_bytes_after": stats.wal_bytes_after,
+        "flush_us": stats.flush_us,
+        "rebuild_us": stats.rebuild_us,
+        "checkpoint": {
+            "records_us": stats.checkpoint.records_us,
+            "index_us": stats.checkpoint.index_us,
+            "vectors_us": stats.checkpoint.vectors_us,
+            "index_map_us": stats.checkpoint.index_map_us,
+            "manifest_us": stats.checkpoint.manifest_us,
+            "validate_us": stats.checkpoint.validate_us,
+            "publish_us": stats.checkpoint.publish_us,
+            "cleanup_us": stats.checkpoint.cleanup_us,
+            "total_us": stats.checkpoint.total_us,
+        },
+    })))
+}
+
+async fn raft_membership(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let raft = state.raft.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let metrics = raft.metrics().borrow().clone();
+    let members: Vec<u64> = metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .chain(metrics.membership_config.membership().learner_ids())
+        .collect();
+    // Per-shard leadership, so an operator can see which group is electing
+    // without reading logs. `None` while a group has no leader, never a
+    // default id.
+    let shards: Option<Vec<serde_json::Value>> = state.shards.as_ref().map(|shards| {
+        shards
+            .shards()
+            .into_iter()
+            .map(|id| {
+                serde_json::json!({
+                    "shard": id.0,
+                    "leader": shards.leader(id),
+                })
+            })
+            .collect()
+    });
+
+    Ok(Json(serde_json::json!({
+        "members": members,
+        "leader": metrics.current_leader,
+        "state": format!("{:?}", metrics.state),
+        "shards": shards,
+    })))
+}
+
+/// Membership changes are refused while shards exist.
+///
+/// Placement is a function of the voter set: a node is one of the inputs every
+/// shard's owner set is computed from, so adding or removing one moves shards
+/// without moving their data. The two halves would then disagree about where a
+/// collection lives, which reads as a never-ending election for that shard
+/// rather than as an error. Refusing is the only honest answer until a
+/// rebalance exists.
+///
+/// The voter set is persisted in each node's placement document, and a node
+/// whose `--peers` disagrees with that document refuses to start. So a
+/// membership change that landed here would not merely be invisible: it would
+/// leave every node unable to restart.
+fn refuse_membership_change() -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    Err((
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "membership cannot change while shards are placed: a node is one of the \
+                      voters each shard's owner set is computed from, so adding or removing one \
+                      moves shards without moving their data. Rebalance support is required \
+                      first.",
+        })),
+    ))
+}
+
+/// Turn a Raft write failure into something an operator can act on.
+fn membership_write_error(
+    error: openraft::error::RaftError<u64, openraft::error::ClientWriteError<u64, u64>>,
+    doing: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use openraft::error::{ClientWriteError, RaftError};
+
+    if let RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) = &error {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{doing} has to run on the metadata leader, and this node is not it"
+                ),
+                "leader": forward.leader_id.or(forward.leader_node),
+            })),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": format!("{doing} failed: {error}") })),
+    )
+}
+
+/// How many times an internal admin call has been forwarded.
+const ADMIN_HOPS: &str = "x-rekha-admin-hops";
+const MAX_ADMIN_HOPS: u8 = 3;
+
+fn admin_hops(headers: &axum::http::HeaderMap) -> u8 {
+    headers
+        .get(ADMIN_HOPS)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn too_many_admin_hops() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::LOOP_DETECTED,
+        Json(serde_json::json!({
+            "error": "the membership request was forwarded too many times; no stable metadata \
+                      leader was found",
+        })),
+    )
+}
+
+/// The leader a Raft write pointed at, if it was refused for that reason.
+fn leader_of(
+    error: &openraft::error::RaftError<u64, openraft::error::ClientWriteError<u64, u64>>,
+) -> Option<u64> {
+    match error {
+        openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(forward),
+        ) => forward.leader_id.or(forward.leader_node),
+        _ => None,
+    }
+}
+
+/// Replay an internal admin call on the metadata leader.
+///
+/// These endpoints live on the internal listener, which has no public
+/// `require_leader` middleware. A CLI command can therefore land on any node,
+/// and leadership can move between the caller's lookup and the command. The
+/// Raft client already reported where the leader is; retrying there turns a
+/// 503 that says "ask again" into a command that works. The hop header keeps a
+/// leadership race from becoming a loop.
+async fn forward_admin(
+    state: &AppState,
+    leader: u64,
+    path: &str,
+    body: &serde_json::Value,
+    hops: u8,
+) -> Option<Result<StatusCode, (StatusCode, Json<serde_json::Value>)>> {
+    // Never forward to ourselves: that is a stale `ForwardToLeader` answer, and
+    // replaying it here would turn a transient race into a loop.
+    if state.raft.as_ref()?.metrics().borrow().id == leader {
+        return None;
+    }
+    let url = state.peers.url(leader)?;
+    let mut request = state
+        .http
+        .post(format!("{url}{path}"))
+        .timeout(std::time::Duration::from_secs(15))
+        .header(ADMIN_HOPS, (hops + 1).to_string())
+        .json(body);
+    if let Some(secret) = state.cluster_secret.as_ref() {
+        request = request.header(leadership::SECRET_HEADER, secret.as_str());
+    }
+    let response = request.send().await.ok()?;
+    let status = response.status();
+    if status.is_success() {
+        return Some(Ok(StatusCode::OK));
+    }
+    let body = response.json::<serde_json::Value>().await.unwrap_or_else(
+        |_| serde_json::json!({"error": "the metadata leader refused the request"}),
+    );
+    Some(Err((status, Json(body))))
+}
+
+/// The placement this cluster was built with.
+///
+/// A node joining has no `--peers`, so it has nobody to ask except the node it
+/// was told to join; this is what it asks. The answer is the same three inputs
+/// every member persists, so the joiner routes by the same owner sets as
+/// everyone else — while hosting nothing until it is promoted.
+async fn raft_placement(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let shards = state.shards.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let placement = shards.placement();
+    Ok(Json(serde_json::json!({
+        "shard_count": placement.shard_count(),
+        "replication_factor": placement.replication_factor(),
+        "voters": placement.voters(),
+    })))
+}
+
+/// Admit a node to the metadata group as a learner.
+///
+/// A learner does not vote, so the voter set — and with it placement — is
+/// unchanged. That is why this is admitted while shards are placed and
+/// [`raft_remove_member`] is not: the membership guard exists to stop shards
+/// moving, and nothing moves here.
+///
+/// The address is proposed as a committed entry first. The Raft client reaches
+/// the learner through the shared address book, which until now knew only what
+/// `--peers` said at each node's last start, so without this the leader has no
+/// way to reach a node the flag does not mention — the reason adding a node
+/// used to require restarting the whole cluster.
+///
+/// Admission is deliberately non-blocking. Waiting for a learner to catch up
+/// before answering holds an operator's request open for as long as the data
+/// takes — and forever if the learner is unreachable. The entry that admits it
+/// is committed before this returns; `/ready` and the replication metrics are
+/// where catch-up progress belongs.
+async fn raft_add_learner(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let hops = admin_hops(&headers);
+    if hops >= MAX_ADMIN_HOPS {
+        return Err(too_many_admin_hops());
+    }
+    let raft = state.raft.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "no metadata group"})),
+    ))?;
+    let node_id = req["node_id"].as_u64().ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "node_id is required"})),
+    ))?;
+    let addr = req["addr"]
+        .as_str()
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "addr is required: it is how the leader reaches the new node, and no \
+                          flag teaches it that address",
+            })),
+        ))?
+        .to_owned();
+
+    if state.peers.addr(node_id).as_deref() != Some(addr.as_str()) {
+        // Committed, not local: every node has to be able to reach the new node,
+        // and the address has to survive a restart and a change of leader.
+        if let Err(e) = raft
+            .client_write(ClusterOperation::AddNode {
+                node_id,
+                addr: addr.clone(),
+            })
+            .await
+        {
+            if let Some(leader) = leader_of(&e)
+                && let Some(response) =
+                    forward_admin(&state, leader, "/internal/cluster/add_learner", &req, hops).await
+            {
+                return response;
+            }
+            return Err(membership_write_error(
+                e,
+                "recording where the new node lives",
+            ));
+        }
+    }
+
+    if let Err(e) = raft.add_learner(node_id, node_id, false).await {
+        if let Some(leader) = leader_of(&e)
+            && let Some(response) =
+                forward_admin(&state, leader, "/internal/cluster/add_learner", &req, hops).await
+        {
+            return response;
+        }
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn raft_remove_member(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let hops = admin_hops(&headers);
+    if hops >= MAX_ADMIN_HOPS {
+        return Err(too_many_admin_hops());
+    }
+    if state.shards.is_some() {
+        refuse_membership_change()?;
+    }
+    let raft = state.raft.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "no metadata group"})),
+    ))?;
+    let node_id = req["node_id"].as_u64().ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "node_id is required"})),
+    ))?;
+    let metrics = raft.metrics().borrow().clone();
+    let new_members: std::collections::BTreeSet<u64> = metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .chain(metrics.membership_config.membership().learner_ids())
+        .filter(|&id| id != node_id)
+        .collect();
+    if new_members.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "the last member cannot be removed"})),
+        ));
+    }
+    if let Err(e) = raft.change_membership(new_members, true).await {
+        if let Some(leader) = leader_of(&e)
+            && let Some(response) = forward_admin(
+                &state,
+                leader,
+                "/internal/cluster/remove_member",
+                &req,
+                hops,
+            )
+            .await
+        {
+            return response;
+        }
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
+    }
+    Ok(StatusCode::OK)
+}
+
+/// Health check — always returns 200 OK.
+async fn health_handler() -> Result<StatusCode, StatusCode> {
+    Ok(StatusCode::OK)
+}
+
+/// Readiness check — returns 200 if engine is accessible, 503 otherwise.
+///
+/// The body states the active durability level so an operator can confirm
+/// remotely what a successful write promises, instead of inferring it from
+/// deployment notes.
+async fn ready_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // In cluster mode, readiness means "can this node serve a write", which
+    // requires an elected leader this node can reach. Reporting ready while
+    // there is no leader would route load at nodes that can only answer 503.
+    let cluster = match state.raft.as_ref() {
+        Some(raft) => {
+            let m = raft.metrics().borrow().clone();
+            let leader = m.current_leader;
+            let role = format!("{:?}", m.state).to_lowercase();
+            let has_leader = leader.is_some();
+            Some(serde_json::json!({
+                "node_id": m.id,
+                "role": role,
+                "term": m.current_term,
+                "leader": leader,
+                "applied_index": m.last_applied.map(|l| l.index),
+                "quorum_age_ms": m.millis_since_quorum_ack,
+            }))
+            .map(|info| (info, has_leader))
+        }
+        None => None,
+    };
+    let has_leader = cluster.as_ref().map(|(_, ok)| *ok).unwrap_or(true);
+    let cluster_info = cluster.map(|(info, _)| info);
+
+    // Shard leadership is as load-bearing as metadata leadership. A node whose
+    // shard group is mid-election answers 503 to every write for that shard, so
+    // reporting ready routes load into a window already known to be bad. The
+    // metadata group's leader was the only one consulted here, which is why a
+    // node could be "ready" and unable to accept the data it was sent.
+    let shards_without_leader: Vec<u32> = state
+        .shards
+        .as_ref()
+        .map(|shards| {
+            shards
+                .shards()
+                .into_iter()
+                .filter(|shard| shards.leader(*shard).is_none())
+                .map(|shard| shard.0)
+                .collect()
+        })
+        .unwrap_or_default();
+    let shards_ready = shards_without_leader.is_empty();
+    let shards_info = state.shards.as_ref().map(|shards| {
+        serde_json::json!({
+            "hosted": shards.shards().len(),
+            "without_leader": shards_without_leader,
+        })
+    });
+    // A node whose bootstrap credentials have not fully applied can accept the
+    // bootstrap key and still deny its requests, because the role assignment
+    // lands in a separate catalog write. Treat that window as "not ready" so a
+    // client that waits for readiness does not get a 403 for a healthy cluster.
+    let bootstrap_ready = state.bootstrap_ready.load(Ordering::SeqCst);
+    let is_ready = has_leader && shards_ready && bootstrap_ready;
+
+    // A node that could not apply a committed entry has diverged from the log
+    // it claims to have. It must not serve, whatever else it thinks.
+    if state.apply_failure.load(Ordering::SeqCst) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ready": false,
+                "error": "a committed log entry could not be applied; this node is diverged \
+                          and must be restarted or rebuilt from a snapshot",
+                "cluster": cluster_info,
+            })),
+        );
+    }
+
+    match state
+        .engine
+        .list_collections(&state.tenant, &state.database)
+    {
+        Ok(collections) => {
+            let status = if is_ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "ready": is_ready,
+                    "durability": state.engine.durability().as_str(),
+                    "tenant": state.tenant,
+                    "database": state.database,
+                    "collections": collections.len(),
+                    "bootstrap_ready": bootstrap_ready,
+                    "cluster": cluster_info,
+                    "shards": shards_info,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ready": false,
+                "durability": state.engine.durability().as_str(),
+                "error": e.to_string(),
+                "cluster": cluster_info,
+            })),
+        ),
+    }
+}
+
+/// ChromaDB auth identity stub.
+async fn auth_identity() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "user_id": "00000000-0000-0000-0000-000000000000"
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Tenants and databases
+// ---------------------------------------------------------------------------
+
+/// A namespace request that could not be served.
+///
+/// Separate from `ApiError` because these are not collection-scoped: the
+/// failure is about whether a namespace exists, not about the data in it. It is
+/// a struct rather than a tuple because a refusal also carries routing headers,
+/// and a 136-byte tuple in every `Result` trips `result_large_err`.
+struct NamespaceError {
+    status: StatusCode,
+    message: String,
+    /// The node that can accept this write, when this one cannot.
+    leader: Option<u64>,
+}
+
+impl NamespaceError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            leader: None,
+        }
+    }
+}
+
+impl IntoResponse for NamespaceError {
+    fn into_response(self) -> axum::response::Response {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(leader) = self.leader
+            && let Ok(value) = axum::http::HeaderValue::from_str(&leader.to_string())
+        {
+            headers.insert(
+                axum::http::HeaderName::from_static(leadership::LEADER_HEADER),
+                value,
+            );
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        let mut body = serde_json::json!({ "error": self.message });
+        if let Some(leader) = self.leader {
+            body["leader"] = serde_json::json!(leader);
+        }
+        (self.status, headers, Json(body)).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct NamespaceRequest {
+    name: String,
+}
+
+fn namespace_error(status: StatusCode, message: impl Into<String>) -> NamespaceError {
+    NamespaceError::new(status, message)
+}
+
+/// The same `503` + `x-rekha-leader` contract the collection path uses.
+///
+/// A node whose cached leadership is stale appends to a log it does not lead,
+/// and `client_write` says so instead of forwarding. Reporting a bare error
+/// would hide the one fact the caller needs: another node can accept this write.
+fn not_leader(leader: Option<u64>) -> NamespaceError {
+    NamespaceError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "this node is not the metadata leader; retry against the leader".into(),
+        leader,
+    }
+}
+
+/// Propose a metadata operation to the log.
+///
+/// Returns `Ok(false)` on a single-node deployment, where the caller applies the
+/// change to its own catalog and the log has nothing to say about it.
+async fn replicate_metadata(
+    state: &AppState,
+    op: ClusterOperation,
+) -> Result<bool, NamespaceError> {
+    let Some(raft) = state.raft.as_ref() else {
+        if state.shards.is_some() {
+            // A clustered node with no metadata group has not been admitted yet.
+            // Writing its local catalog would create a namespace exactly one
+            // node knows about.
+            return Err(namespace_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this node has not joined a cluster yet; retry once it is admitted",
+            ));
+        }
+        return Ok(false);
+    };
+    use openraft::error::{ClientWriteError, RaftError};
+    match raft.client_write(op).await {
+        Ok(_) => Ok(true),
+        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
+            Err(not_leader(forward.leader_id))
+        }
+        Err(e) => Err(namespace_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("the metadata log refused this write: {e}"),
+        )),
+    }
+}
+
+fn missing_namespace(what: &str) -> NamespaceError {
+    namespace_error(StatusCode::NOT_FOUND, format!("{what} does not exist"))
+}
+
+fn catalog_unavailable(e: rekha_storage::CatalogError) -> NamespaceError {
+    namespace_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// Validate a tenant or database name and trim it.
+fn namespace_name(raw: &str) -> Result<String, NamespaceError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(namespace_error(
+            StatusCode::BAD_REQUEST,
+            "name must not be empty",
+        ));
+    }
+    validate_name(name).map_err(|e| {
+        let status = engine_error_status(&e);
+        namespace_error(status, e.to_string())
+    })?;
+    Ok(name.to_string())
+}
+
+/// Every database that exists under `tenant`.
+///
+/// A namespace exists if it was created, or if a collection already lives in
+/// it. Both are catalog facts, so this is a union of two reads of one store
+/// rather than a second source of truth — but it is a union because a
+/// collection created before its database row existed must not make its own
+/// database invisible. Reporting an empty list for a namespace that holds data
+/// is the same class of lie as a create that persists nothing.
+fn databases_of(
+    catalog: &dyn rekha_storage::Catalog,
+    tenant: &str,
+) -> Result<std::collections::BTreeSet<String>, rekha_storage::CatalogError> {
+    let mut names = std::collections::BTreeSet::new();
+    for (owner, database) in catalog.list_databases()? {
+        if owner == tenant {
+            names.insert(database);
+        }
+    }
+    for record in catalog.list_collections_all()? {
+        if record.config.tenant == tenant {
+            names.insert(record.config.database);
+        }
+    }
+    Ok(names)
+}
+
+fn tenant_exists(
+    catalog: &dyn rekha_storage::Catalog,
+    tenant: &str,
+) -> Result<bool, rekha_storage::CatalogError> {
+    Ok(catalog.list_tenants()?.iter().any(|known| known == tenant)
+        || !databases_of(catalog, tenant)?.is_empty())
+}
+
+/// Chroma's client requires a database id; the catalog keys by name.
+fn database_id(tenant: &str, name: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{tenant}/{name}").as_bytes())
+}
+
+/// GET /api/v2/tenants/{name} — does this tenant exist?
+async fn get_tenant(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, NamespaceError> {
+    let catalog = state.engine.catalog();
+    // The configured namespace always exists: the server serves it, whether or
+    // not a row has been written yet.
+    if name != state.tenant
+        && !tenant_exists(catalog.as_ref(), &name).map_err(catalog_unavailable)?
+    {
+        return Err(missing_namespace(&format!("tenant {name}")));
+    }
+    Ok(Json(serde_json::json!({ "name": name })))
+}
+
+/// POST /api/v2/tenants — create a tenant.
+///
+/// Idempotent, and the response is sent only once the namespace exists. In
+/// cluster mode the row is a log entry, so a tenant created here is visible on
+/// every node instead of only on the one that served the request.
+async fn create_tenant(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<NamespaceRequest>,
+) -> Result<Json<serde_json::Value>, NamespaceError> {
+    let name = namespace_name(&req.name)?;
+    if !replicate_metadata(
+        &state,
+        ClusterOperation::CreateTenant { name: name.clone() },
+    )
+    .await?
+    {
+        match state.engine.catalog().create_tenant(&name) {
+            Ok(()) | Err(rekha_storage::CatalogError::AlreadyExists) => {}
+            Err(e) => return Err(catalog_unavailable(e)),
+        }
+    }
+    Ok(Json(serde_json::json!({ "name": name })))
+}
+
+/// GET /api/v2/tenants/{tenant}/databases — list databases under a tenant.
+async fn list_databases(
+    State(state): State<Arc<AppState>>,
+    Path(tenant): Path<String>,
+) -> Result<Json<serde_json::Value>, NamespaceError> {
+    let catalog = state.engine.catalog();
+    if tenant != state.tenant
+        && !tenant_exists(catalog.as_ref(), &tenant).map_err(catalog_unavailable)?
+    {
+        return Err(missing_namespace(&format!("tenant {tenant}")));
+    }
+    let mut names = databases_of(catalog.as_ref(), &tenant).map_err(catalog_unavailable)?;
+    if tenant == state.tenant {
+        names.insert(state.database.clone());
+    }
+    let rows: Vec<serde_json::Value> = names
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                "id": database_id(&tenant, &name),
+                "name": name,
+                "tenant": tenant,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!(rows)))
+}
+
+/// GET /api/v2/tenants/{tenant}/databases/{name} — does this database exist?
+async fn get_database(
+    State(state): State<Arc<AppState>>,
+    Path((tenant, name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, NamespaceError> {
+    let catalog = state.engine.catalog();
+    let exists = (tenant == state.tenant && name == state.database)
+        || databases_of(catalog.as_ref(), &tenant)
+            .map_err(catalog_unavailable)?
+            .contains(&name);
+    if !exists {
+        return Err(missing_namespace(&format!("database {tenant}/{name}")));
+    }
+    Ok(Json(serde_json::json!({
+        "id": database_id(&tenant, &name),
+        "name": name,
+        "tenant": tenant,
+    })))
+}
+
+/// POST /api/v2/tenants/{tenant}/databases — create a database.
+///
+/// A database is created inside an existing tenant; a missing tenant is a 404,
+/// never an implicit create. Idempotent, and replicated in cluster mode for the
+/// same reason as the tenant itself.
+async fn create_database(
+    State(state): State<Arc<AppState>>,
+    Path(tenant): Path<String>,
+    Json(req): Json<NamespaceRequest>,
+) -> Result<Json<serde_json::Value>, NamespaceError> {
+    let name = namespace_name(&req.name)?;
+    let catalog = state.engine.catalog();
+    if !tenant_exists(catalog.as_ref(), &tenant).map_err(catalog_unavailable)? {
+        return Err(missing_namespace(&format!("tenant {tenant}")));
+    }
+    match replicate_metadata(
+        &state,
+        ClusterOperation::CreateDatabase {
+            tenant: tenant.clone(),
+            name: name.clone(),
+        },
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => match catalog.create_database(&tenant, &name) {
+            Ok(()) | Err(rekha_storage::CatalogError::AlreadyExists) => {}
+            Err(e) => return Err(catalog_unavailable(e)),
+        },
+        Err(e) => return Err(e),
+    }
+    Ok(Json(serde_json::json!({ "name": name, "tenant": tenant })))
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+fn public_routes() -> Router<Arc<AppState>> {
+    let public: Router<Arc<AppState>> = Router::new()
+        .route(
+            "/api/v2/collections",
+            post(create_collection).get(list_collections),
+        )
+        .route(
+            "/api/v2/collections/{id}",
+            get(get_collection).delete(delete_collection),
+        )
+        .route("/api/v2/collections/{id}/add", post(add_records))
+        .route("/api/v2/collections/{id}/upsert", post(upsert_records))
+        .route("/api/v2/collections/{id}/update", post(update_records))
+        .route("/api/v2/collections/{id}/delete", post(delete_records))
+        .route("/api/v2/collections/{id}/query", post(query_records))
+        .route("/api/v2/collections/{id}/get", post(get_records))
+        .route("/api/v2/collections/{id}/count", post(count_records))
+        .route(
+            "/api/v2/collections/{id}/optimize",
+            post(optimize_collection),
+        )
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
+        .route("/api/v2/auth/identity", get(auth_identity))
+        .route("/api/v2/tenants", post(create_tenant))
+        .route("/api/v2/tenants/{name}", get(get_tenant))
+        .route(
+            "/api/v2/tenants/{tenant}/databases",
+            get(list_databases).post(create_database),
+        )
+        .route(
+            "/api/v2/tenants/{tenant}/databases/{name}",
+            get(get_database),
+        );
+    public
+        .merge(chroma::chroma_router())
+        .merge(auth_routes::auth_router())
+}
+
+fn internal_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        // One process runs one `Raft` per group, so the group id travels in the
+        // path. A vote addressed to the wrong group would corrupt two logs.
+        .route(
+            "/internal/raft/{group}/append_entries",
+            post(raft_append_entries),
+        )
+        .route("/internal/raft/{group}/vote", post(raft_vote))
+        .route(
+            "/internal/raft/{group}/install_snapshot",
+            post(raft_install_snapshot),
+        )
+        // Membership is a property of a whole group, not of a single RPC, and
+        // these operate on the metadata group.
+        .route("/internal/stats/counts", post(stats_counts))
+        .route("/internal/cluster/membership", get(raft_membership))
+        .route("/internal/cluster/placement", get(raft_placement))
+        .route("/internal/cluster/add_learner", post(raft_add_learner))
+        .route("/internal/cluster/remove_member", post(raft_remove_member))
+        // Writes arriving at a follower are forwarded here, on the leader's
+        // internal listener, and re-dispatched through the public pipeline so
+        // the original caller's credentials are still what is authorized.
+        .route(
+            "/internal/forward/{*rest}",
+            axum::routing::any(leadership::dispatch_forwarded),
+        )
+}
+
+/// Build the full router (public + internal + Chroma) on a single listener.
+/// For production, prefer separate listeners via [`public_router`] and
+/// [`internal_router`] so internal endpoints are not exposed publicly.
+/// Combined router for single-listener deployments.
+///
+/// Public and internal routes carry **separate** authentication layers:
+/// public routes use RBAC ([`middleware::auth`]), internal routes use the
+/// cluster secret ([`middleware::internal_auth`]). Applying the public layer
+/// to everything meant an internal RPC had to hold a valid *API key* as well
+/// as the cluster secret — so `REKHA_CLUSTER_SECRET` alone was not enough and a
+/// clustered node could not talk to its peers once RBAC users existed.
+pub fn router(app_state: Arc<AppState>) -> Router {
+    let public = public_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            leadership::require_leader,
+        ))
+        .layer(axum::middleware::from_fn(middleware::auth));
+    let internal = internal_routes().layer(axum::middleware::from_fn(middleware::internal_auth));
+    public
+        .merge(internal)
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            32 * 1024 * 1024,
+        ))
+        .layer(axum::Extension(app_state.clone()))
+        .with_state(app_state)
+}
+
+/// Public API router (collections, health, tenants, Chroma compat).
+/// Intended for the public listener.
+pub fn public_router(app_state: Arc<AppState>) -> Router {
+    public_routes()
+        // Inner layer: runs after authentication, so an unauthenticated write
+        // is rejected as 401 rather than being told where the leader is.
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            leadership::require_leader,
+        ))
+        .layer(axum::middleware::from_fn(middleware::auth))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            32 * 1024 * 1024,
+        ))
+        .layer(axum::Extension(app_state.clone()))
+        .with_state(app_state)
+}
+
+/// Internal cluster router (Raft RPCs and forwarded writes).
+/// Intended for a separate, network-isolated listener.
+pub fn internal_router(app_state: Arc<AppState>) -> Router {
+    internal_routes()
+        .route("/health", get(health_handler))
+        .layer(axum::middleware::from_fn(middleware::internal_auth))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            32 * 1024 * 1024,
+        ))
+        .layer(axum::Extension(app_state.clone()))
+        .with_state(app_state)
+}
+
+#[cfg(test)]
+mod offload_tests {
+    use std::time::{Duration, Instant};
+
+    use super::offload;
+    use rekha_engine::EngineError;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn engine_work_runs_on_a_blocking_thread() {
+        let caller = std::thread::current().id();
+        let worker = offload(move || Ok(std::thread::current().id()))
+            .await
+            .unwrap();
+        assert_ne!(
+            caller, worker,
+            "engine work must not run on the async worker thread"
+        );
+    }
+
+    /// The property that matters: a slow engine call must not stop the runtime
+    /// from running other tasks. Raft heartbeats are such a task, and a delayed
+    /// heartbeat is an election.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn slow_engine_work_does_not_starve_the_runtime() {
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(tokio::spawn(offload(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok(())
+            })));
+        }
+
+        // A heartbeat-shaped timer must still fire on time while those run.
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a timer was delayed to {elapsed:?}: blocking work is running on the async worker"
+        );
+
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_engine_error_propagates_unchanged() {
+        let err = offload(|| Err::<(), _>(EngineError::CollectionNotFound("x".into())))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::CollectionNotFound(_)));
+    }
+}

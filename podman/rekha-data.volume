@@ -1,0 +1,12 @@
+# Podman Quadlet volume definition for RekhaDB data
+#
+# Install:
+#   cp podman/rekha-data.volume ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start rekha-data
+
+[Volume]
+VolumeName=rekha-data
+
+[Install]
+WantedBy=default.target

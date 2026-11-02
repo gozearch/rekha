@@ -1,0 +1,19 @@
+{
+  "batch": 1,
+  "collections": 1,
+  "data_dir_bytes": 3762330,
+  "dim": 128,
+  "durability": "durable",
+  "latency_us": {
+    "max": 168091,
+    "p50": 4214,
+    "p95": 7777,
+    "p99": 12693
+  },
+  "optimize": [],
+  "records": 2000,
+  "sync_threshold": 1000,
+  "syncs": 2000,
+  "threads": 1,
+  "writes": 2000
+}

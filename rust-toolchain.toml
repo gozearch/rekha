@@ -1,0 +1,11 @@
+# Pinned so a build is reproducible across machines and across CI runs.
+#
+# This is the version the code is developed and linted against. It is
+# deliberately newer than the MSRV: `rust-version` in Cargo.toml declares the
+# oldest supported compiler (1.90, the floor redb 4.4 sets), and a separate CI
+# job checks the tree still builds with it. Pinning the newest supported
+# compiler here would make the MSRV claim unverified.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

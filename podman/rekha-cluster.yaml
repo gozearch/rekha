@@ -1,0 +1,193 @@
+# Podman 3-node RekhaDB cluster (template)
+#
+# This manifest is a starting point, not a tested deployment: the compose file
+# in docker-compose.cluster.yml is the path CI builds and runs. Podman DNS
+# between separately created pods varies by version, so verify that node1,
+# node2, and node3 resolve before relying on this.
+#
+# Replace the two placeholder secrets below, or use podman secrets and
+# secretKeyRef. A node refuses an API key shorter than 32 characters and a
+# cluster secret of at least 32 bytes.
+#
+# Usage:
+#   podman kube play podman/rekha-cluster.yaml
+#
+# With custom image:
+#   podman build -t rekha .
+#   podman kube play podman/rekha-cluster.yaml --image localhost/rekha
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rekha-node1
+  labels:
+    app: rekha
+    node: "1"
+spec:
+  containers:
+    - name: rekha
+      image: ghcr.io/gozearch/rekha-db:latest
+      ports:
+        - containerPort: 8000
+          hostPort: 8001
+      volumeMounts:
+        - name: node1-data
+          mountPath: /data
+      env:
+        - name: REKHA_DATA_DIR
+          value: /data
+        - name: REKHA_PORT
+          value: "8000"
+        - name: REKHA_NODE_ID
+          value: "1"
+        - name: REKHA_BOOTSTRAP
+          value: "true"
+        - name: REKHA_PEERS
+          value: "1@node1:8000,2@node2:8000,3@node3:8000"
+        - name: REKHA_API_KEY
+          value: "replace-me-with-32-random-characters"
+        - name: REKHA_CLUSTER_SECRET
+          value: "replace-me-cluster-secret-32-bytes"
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 15
+        periodSeconds: 10
+  volumes:
+    - name: node1-data
+      persistentVolumeClaim:
+        claimName: node1-data
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rekha-node2
+  labels:
+    app: rekha
+    node: "2"
+spec:
+  containers:
+    - name: rekha
+      image: ghcr.io/gozearch/rekha-db:latest
+      ports:
+        - containerPort: 8000
+          hostPort: 8002
+      volumeMounts:
+        - name: node2-data
+          mountPath: /data
+      env:
+        - name: REKHA_DATA_DIR
+          value: /data
+        - name: REKHA_PORT
+          value: "8000"
+        - name: REKHA_NODE_ID
+          value: "2"
+        - name: REKHA_PEERS
+          value: "1@node1:8000,2@node2:8000,3@node3:8000"
+        - name: REKHA_API_KEY
+          value: "replace-me-with-32-random-characters"
+        - name: REKHA_CLUSTER_SECRET
+          value: "replace-me-cluster-secret-32-bytes"
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 15
+        periodSeconds: 10
+  volumes:
+    - name: node2-data
+      persistentVolumeClaim:
+        claimName: node2-data
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rekha-node3
+  labels:
+    app: rekha
+    node: "3"
+spec:
+  containers:
+    - name: rekha
+      image: ghcr.io/gozearch/rekha-db:latest
+      ports:
+        - containerPort: 8000
+          hostPort: 8003
+      volumeMounts:
+        - name: node3-data
+          mountPath: /data
+      env:
+        - name: REKHA_DATA_DIR
+          value: /data
+        - name: REKHA_PORT
+          value: "8000"
+        - name: REKHA_NODE_ID
+          value: "3"
+        - name: REKHA_PEERS
+          value: "1@node1:8000,2@node2:8000,3@node3:8000"
+        - name: REKHA_API_KEY
+          value: "replace-me-with-32-random-characters"
+        - name: REKHA_CLUSTER_SECRET
+          value: "replace-me-cluster-secret-32-bytes"
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 15
+        periodSeconds: 10
+  volumes:
+    - name: node3-data
+      persistentVolumeClaim:
+        claimName: node3-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: node1-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: node2-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: node3-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

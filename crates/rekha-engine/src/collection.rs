@@ -44,6 +44,15 @@ pub(crate) struct Collection {
     /// Highest WAL seq materialized into the index (Chroma's `max_seq_id`
     /// analog; checkpoints push it to `catalog.advance_log_offset`).
     pub(crate) flushed_seq: u64,
+    /// Highest sequence applied to this collection, from either write path.
+    ///
+    /// Single-node: the WAL sequence. Cluster: the Raft log index, which is
+    /// what a record's `seq` is there — and the local WAL is never written, so
+    /// it cannot be used as the checkpoint boundary the way single-node does.
+    /// Without this, a clustered checkpoint claimed to cover sequence 0 while
+    /// holding records with seq 10, and validation rejected the generation with
+    /// "record has seq past the snapshot boundary".
+    pub(crate) applied_seq: u64,
     /// Internal offset per id, assigned monotonically by `next_offset` and
     /// never reused after delete (Chroma's offset scheme). The metadata
     /// postings reference these offsets, so they are stable across a record's
@@ -461,6 +470,7 @@ impl Collection {
             buffer: Vec::new(),
             index: Box::new(index),
             flushed_seq: 0,
+            applied_seq: 0,
             offsets: HashMap::new(),
             id_by_offset: HashMap::new(),
             next_offset: 0,
@@ -870,6 +880,11 @@ impl Collection {
         self.next_offset = next_offset;
         self.flushed_seq = meta.flushed_seq;
         self.last_checkpoint_seq = meta.flushed_seq;
+        // The generation covers every sequence at or below `snapshot_seq`, so
+        // that is where this collection's applied watermark resumes. A cluster
+        // node cannot recover it from the WAL, which is why it is taken from
+        // the manifest.
+        self.applied_seq = meta.snapshot_seq;
         if let Some(index) = index {
             self.index = Box::new(index);
         }
@@ -1028,7 +1043,7 @@ impl Collection {
             )));
         }
 
-        let next_seq = self.wal.last_seq() + 1;
+        let next_seq = self.wal.last_seq().max(self.applied_seq) + 1;
         let snapshot_seq = next_seq - 1;
         let mut files: Vec<CheckpointFile> = Vec::new();
         let mut phase = Instant::now();
@@ -1697,6 +1712,10 @@ impl Collection {
     /// metadata index and the offset maps are derived state, exactly like the
     /// index.
     pub(crate) fn apply_operation(&mut self, op: &Operation, seq: u64) -> EngineResult<()> {
+        // Both write paths converge here, so this is the one place that knows
+        // how far the collection has been advanced regardless of where the
+        // sequence came from (WAL seq single-node, Raft index in a cluster).
+        self.applied_seq = self.applied_seq.max(seq);
         match op {
             Operation::Add {
                 id,

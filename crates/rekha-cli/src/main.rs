@@ -1222,6 +1222,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // dropped, and a gauge that is never set afterwards never registers
             // with the recorder at all.
             spawn_raft_metrics(raft.clone());
+            spawn_raft_log_size_metrics(std::path::PathBuf::from(&data_dir));
 
             // If --internal-port is set, run separate listeners for public and
             // internal routes. Otherwise use a single combined router.
@@ -1861,6 +1862,42 @@ fn spawn_raft_metrics(raft: std::sync::Arc<openraft::Raft<rekha_cluster::RaftTyp
             if metrics.changed().await.is_err() {
                 break;
             }
+        }
+    });
+}
+
+/// Publish the on-disk size of every Raft log this node holds.
+///
+/// Snapshotting is off by default, so a log grows with every metadata
+/// operation and every write to a hosted shard, and nothing truncates it. That
+/// is a deliberate trade (see the snapshot policy in `serve`), and it is only
+/// acceptable if the growth is observable: an unmeasured log becomes a disk-full
+/// outage, and the failure mode of a full disk here is worse than a slow one.
+fn spawn_raft_log_size_metrics(data_dir: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let metadata_log = data_dir.join("raft_log.redb");
+        let shard_logs = data_dir.join("raft_log");
+        loop {
+            if let Ok(metadata) = std::fs::metadata(&metadata_log) {
+                metrics::gauge!("rekha_raft_log_bytes", "group" => "metadata")
+                    .set(metadata.len() as f64);
+            }
+            if let Ok(entries) = std::fs::read_dir(&shard_logs) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("shard-")) else {
+                        continue;
+                    };
+                    let Some(shard) = rest.strip_suffix(".redb") else {
+                        continue;
+                    };
+                    if let Ok(metadata) = entry.metadata() {
+                        metrics::gauge!("rekha_raft_log_bytes", "group" => format!("shard-{shard}"))
+                            .set(metadata.len() as f64);
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
     });
 }

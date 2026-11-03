@@ -22,6 +22,11 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A restart test that kills a node after its log has been purged and asserts it
   becomes ready and can still commit, plus a test that the default
   configuration never purges.
+- A four-node test that restarts a shard owner across two purge cycles and
+  asserts no records are lost.
+- `rekha_raft_log_bytes{group}` Prometheus gauge for the metadata log and each
+  shard log. With compaction disabled by default the logs grow, and unmeasured
+  growth is a disk-full outage.
 
 ### Changed
 
@@ -74,6 +79,12 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `read_log_entries` silently skipped a missing or undecodable entry in the
   middle of the Raft log. A hole is now an error, while a purged prefix and an
   unwritten tail are still legitimately absent.
+- A clustered checkpoint failed with "record has seq past the snapshot
+  boundary". The boundary was taken from the collection's local WAL, which the
+  cluster write path never appends to, so it was always 0 while records carried
+  Raft indexes. The collection now tracks the highest sequence applied through
+  either path, restores it from the checkpoint manifest, and uses it as the
+  boundary.
 - The documented `docker compose -f docker-compose.cluster.yml up -d` command
   could not start the current binary.
 - Stale "WAL shipping" documentation in the cluster and API crates and in the

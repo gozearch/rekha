@@ -762,8 +762,9 @@ impl Engine {
     ///
     /// After the batch, an auto-checkpoint runs when the WAL has accumulated
     /// `config.hnsw.sync_threshold` records since the last checkpoint (best
-    /// effort to keep the WAL bounded; a checkpoint failure is propagated but
-    /// durability is unaffected — the WAL still holds the un-checkpointed tail).
+    /// effort to keep the WAL bounded; a checkpoint failure is logged and the
+    /// WAL tail is retained — durability is unaffected and the write still
+    /// reports success).
     pub fn add(
         &self,
         collection_id: &Uuid,
@@ -1016,6 +1017,8 @@ impl Engine {
     /// Cluster mode only: there, a checkpoint is not durability (the Raft log
     /// is) but log truncation and restart cost, so it must not sit on the write
     /// path. Single-node engines checkpoint inline from `append_ops`.
+    /// A per-collection failure is logged and skipped so one bad shard does
+    /// not stop the others.
     pub fn checkpoint_if_due(&self) -> EngineResult<usize> {
         let handles: Vec<(Uuid, Arc<Mutex<Collection>>)> = {
             let collections = self.collections.read();
@@ -1028,9 +1031,15 @@ impl Engine {
             if !collection.checkpoint_due() {
                 continue;
             }
-            collection.checkpoint(self.catalog.as_ref())?;
-            ran += 1;
-            tracing::debug!(%id, "background checkpoint complete");
+            match collection.checkpoint(self.catalog.as_ref()) {
+                Ok(_) => {
+                    ran += 1;
+                    tracing::debug!(%id, "background checkpoint complete");
+                }
+                Err(e) => {
+                    tracing::warn!(%id, "background checkpoint failed; WAL tail retained: {e}");
+                }
+            }
         }
         Ok(ran)
     }

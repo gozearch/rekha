@@ -3965,3 +3965,92 @@ fn materializing_is_idempotent_and_preserves_an_open_collection() {
     engine.materialize_collection(&config.id).unwrap();
     assert_eq!(engine.count(&config.id).unwrap(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// P0: delete / upsert between checkpoints must not disable checkpointing.
+// Incremental generations hard-link previous segments, which still contain
+// deleted and superseded vectors. The staged validator used to require
+// `sum(segment.len()) == live_count`, so the first delete made every later
+// checkpoint fail and every later write 500 after the WAL commit.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delete_between_checkpoints_keeps_checkpoint_working() {
+    let dir = TempDir::new().unwrap();
+    let mut rng = Lcg::new(10_001);
+    // batch_size=2 flushes so vectors reach segments; sync_threshold default
+    // (1000) so only explicit checkpoints run.
+    let (engine, id) = test_engine(&dir, 2);
+    let _ = add_n(&engine, &id, &mut rng, 10, "d");
+    engine.checkpoint(&id).unwrap();
+
+    engine.delete(&id, &["d0".to_string()]).unwrap();
+    // This explicit checkpoint is what used to fail with
+    // "staged segments hold 10 vectors but 9 were written".
+    engine.checkpoint(&id).unwrap();
+    assert_eq!(engine.count(&id).unwrap(), 9);
+
+    // Writes after the delete-checkpoint must succeed (previously every write
+    // re-attempted the broken checkpoint and returned 500).
+    let ids = vec!["new".to_string()];
+    let embs = vec![rand_embedding(&mut rng, DIM)];
+    engine.add(&id, &ids, &embs, None, None).unwrap();
+    engine.checkpoint(&id).unwrap();
+    assert_eq!(engine.count(&id).unwrap(), 10);
+
+    // The second generation must survive a restart with vectors intact.
+    drop(engine);
+    let engine = open_engine(&dir);
+    let id = collection_id_by_name(&engine);
+    assert_eq!(engine.count(&id).unwrap(), 10);
+    let got = engine.get(&id, &["d1".to_string()]).unwrap();
+    assert!(got[0].as_ref().unwrap().embedding.is_some());
+    let missing = engine.get(&id, &["d0".to_string()]).unwrap();
+    assert!(missing[0].is_none());
+}
+
+#[test]
+fn upsert_flushed_vector_between_checkpoints_keeps_checkpoint_working() {
+    let dir = TempDir::new().unwrap();
+    let mut rng = Lcg::new(10_002);
+    let (engine, id) = test_engine(&dir, 2);
+    let _ = add_n(&engine, &id, &mut rng, 8, "u");
+    engine.checkpoint(&id).unwrap();
+
+    // Upsert a flushed record: the old segment keeps the superseded vector,
+    // the new generation appends the replacement. Total segments then exceed
+    // the live count by design.
+    let ids = vec!["u0".to_string()];
+    let embs = vec![rand_embedding(&mut rng, DIM)];
+    engine.upsert(&id, &ids, &embs, None, None).unwrap();
+    engine.checkpoint(&id).unwrap();
+    assert_eq!(engine.count(&id).unwrap(), 8);
+
+    drop(engine);
+    let engine = open_engine(&dir);
+    let id = collection_id_by_name(&engine);
+    assert_eq!(engine.count(&id).unwrap(), 8);
+}
+
+#[test]
+fn auto_checkpoint_after_delete_does_not_fail_the_write() {
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir);
+    let mut config = CollectionConfig::new("coll".to_owned(), DIM, Distance::L2);
+    config.hnsw.batch_size = 2;
+    config.hnsw.sync_threshold = 5;
+    let id = engine.create_collection(&config).unwrap().config.id;
+    let mut rng = Lcg::new(10_003);
+    let _ = add_n(&engine, &id, &mut rng, 5, "a");
+    // First auto-checkpoint has now run (5 >= 5).
+    engine.delete(&id, &["a0".to_string()]).unwrap();
+    // This add crosses the threshold again with a dead vector on disk. The
+    // write already committed to the WAL, so it must report success even if
+    // the background checkpoint were to fail.
+    let ids = vec!["z0".to_string(), "z1".to_string(), "z2".to_string()];
+    let embs: Vec<Embedding> = (0..3).map(|_| rand_embedding(&mut rng, DIM)).collect();
+    engine
+        .add(&id, &ids, &embs, None, None)
+        .expect("auto-checkpoint must not turn an acknowledged write into an error");
+    assert_eq!(engine.count(&id).unwrap(), 7);
+}

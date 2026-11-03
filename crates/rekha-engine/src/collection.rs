@@ -1251,13 +1251,13 @@ impl Collection {
         fault::check("checkpoint.files")?;
 
         // ---- S1: validate before anything becomes authoritative -----------
-        self.validate_staged(
-            &gen_dir,
-            &meta,
-            &staged_segments,
-            &staged_index,
-            staged_index.len(),
-        )?;
+        // On failure the staging directory is removed: it was never published,
+        // so leaving it behind only accumulates orphan generations and makes
+        // the next checkpoint re-attempt more expensive.
+        if let Err(e) = self.validate_staged(&gen_dir, &meta, &staged_segments, &staged_index) {
+            let _ = std::fs::remove_dir_all(&gen_dir);
+            return Err(e);
+        }
         timings.validate_us = phase.elapsed().as_micros() as u64;
         phase = Instant::now();
         fault::check("checkpoint.validated")?;
@@ -1346,13 +1346,18 @@ impl Collection {
     /// `order.bin` — they were serialized from the structures checked below, and
     /// a full re-read would double checkpoint I/O. Recovery performs the
     /// independent, from-disk validation in [`Collection::read_generation`].
+    ///
+    /// Incremental generations legitimately retain dead vectors: segments are
+    /// append-only and hard-linked, so a deleted or superseded vector stays on
+    /// disk until `optimize` compacts. The invariant is therefore *not* that
+    /// the segment vector count equals the live count, but that every live
+    /// vector resolves and every staged mapping points at a live record.
     fn validate_staged(
         &self,
         gen_dir: &Path,
         meta: &CheckpointMeta,
         segments: &[std::sync::Arc<crate::segment::Segment>],
         segment_index: &HashMap<Id, usize>,
-        expected_vectors: usize,
     ) -> EngineResult<()> {
         let reject = |reason: String| Err(EngineError::Serialization(reason));
 
@@ -1385,13 +1390,23 @@ impl Collection {
         }
 
         if segments.is_empty() {
-            if expected_vectors != 0 {
-                return reject(format!(
-                    "staged generation holds no segment but {expected_vectors} records have vectors"
-                ));
-            }
             if !segment_index.is_empty() {
                 return reject("staged generation has a segment index but no segment".into());
+            }
+            // No vectors were persisted. Any live record that needs a segment
+            // (stripped of its inline embedding) would be unresolvable, and any
+            // record still carrying an embedding should have been written.
+            for (id, record) in &self.records {
+                if record.embedding.is_some() {
+                    return reject(format!(
+                        "record `{id}` carries a vector but the staged generation holds no segment"
+                    ));
+                }
+                if record.seq <= meta.flushed_seq {
+                    return reject(format!(
+                        "record `{id}` is covered by the checkpoint but the staged generation holds no segment"
+                    ));
+                }
             }
         } else {
             let total: usize = segments.iter().map(|s| s.len()).sum();
@@ -1407,26 +1422,58 @@ impl Collection {
                     ));
                 }
             }
-            if total != expected_vectors {
+            // Dead vectors are expected: incremental checkpoints hard-link
+            // previous segments, which still contain deleted and superseded
+            // vectors. The segment store may therefore hold *more* vectors
+            // than the live set references. Holding fewer is corruption.
+            if total < segment_index.len() {
                 return reject(format!(
-                    "staged segments hold {total} vectors but {expected_vectors} were written"
-                ));
-            }
-            if segment_index.len() != expected_vectors {
-                return reject(format!(
-                    "staged segment index covers {} records but {expected_vectors} were written",
+                    "staged segments hold {total} vectors but the staged index references {} records",
                     segment_index.len()
                 ));
             }
+            let starts = Self::segment_starts(segments);
+            let mut seen_offsets = std::collections::HashSet::with_capacity(segment_index.len());
             for (id, &offset) in segment_index {
                 if offset >= total {
                     return reject(format!(
                         "staged segment index maps `{id}` to offset {offset}, out of bounds"
                     ));
                 }
+                if !seen_offsets.insert(offset) {
+                    return reject(format!(
+                        "staged segment index maps more than one record to offset {offset}"
+                    ));
+                }
                 if !self.records.contains_key(id) {
                     return reject(format!(
                         "staged segment index references unknown record `{id}`"
+                    ));
+                }
+                // The offset must resolve through the staged segments, not
+                // just be in range: a gap (e.g. a short write) would otherwise
+                // surface later as a record that exists but can never be matched.
+                if Self::resolve_vector(segments, &starts, offset).is_none() {
+                    return reject(format!(
+                        "staged segment index maps `{id}` to offset {offset}, which does not resolve"
+                    ));
+                }
+            }
+            // Every live vector must be referenced. Records carrying an inline
+            // embedding are the newly written ones; stripped records (no
+            // inline embedding, seq within the flushed watermark) live in the
+            // carried-over segments. Metadata-only records (no embedding, seq
+            // past the watermark) legitimately have no vector.
+            for (id, record) in &self.records {
+                if record.embedding.is_some() {
+                    if !segment_index.contains_key(id) {
+                        return reject(format!(
+                            "live record `{id}` carries a vector missing from the staged index"
+                        ));
+                    }
+                } else if record.seq <= meta.flushed_seq && !segment_index.contains_key(id) {
+                    return reject(format!(
+                        "record `{id}` is covered by the checkpoint but has no vector in the staged generation"
                     ));
                 }
             }
@@ -1563,9 +1610,9 @@ impl Collection {
     }
 
     /// Auto-checkpoint when the WAL has accumulated `sync_threshold` records
-    /// past the last checkpoint watermark. Failures propagate as engine errors
-    /// (the write already committed to the WAL; a checkpoint failure is
-    /// reported but not rolled back).
+    /// past the last checkpoint watermark. Best-effort: the write already
+    /// committed to the WAL, so a checkpoint failure is logged and the WAL
+    /// tail is kept — it must never turn an acknowledged write into an error.
     /// Record how many entries have been applied since the last checkpoint.
     ///
     /// Cluster mode has no local WAL to measure growth against, so the trigger
@@ -1587,8 +1634,19 @@ impl Collection {
         // records were all deleted has an empty map but a WAL full of delete
         // operations; skipping it meant that history could never be pruned and
         // every restart replayed all of it.
-        if threshold > 0 && new_records >= threshold {
-            self.checkpoint(catalog)?;
+        if threshold > 0
+            && new_records >= threshold
+            && let Err(e) = self.checkpoint(catalog)
+        {
+            // The batch already committed to the WAL before this ran, so the
+            // data is durable. Failing the write here would tell the client the
+            // write failed when it did not (clients retry, duplicating it)
+            // while also leaving an orphan staging directory per attempt.
+            tracing::warn!(
+                collection = %self.config.id,
+                "auto-checkpoint failed; WAL tail retained: {e}"
+            );
+            crate::metrics::record_checkpoint(&crate::CheckpointTimings::default(), false);
         }
         Ok(())
     }

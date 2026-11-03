@@ -85,6 +85,15 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Raft indexes. The collection now tracks the highest sequence applied through
   either path, restores it from the checkpoint manifest, and uses it as the
   boundary.
+- A corrupted `batch_len` in the middle of the WAL was classified as a torn tail
+  and truncated, discarding every acknowledged batch behind it while `verify`
+  reported the directory clean. Classification now asks whether the sequence
+  continues behind the damage: a continuation means a hole, which is refused and
+  never truncated. A torn tail at the end of the file is still discardable.
+- Chroma's `delete` silently ignored `limit`, so a request to remove one
+  matching record removed every match. It is now honoured for both the
+  filter/id selection and the explicit id list, under the same collection lock
+  as the selection itself.
 - The documented `docker compose -f docker-compose.cluster.yml up -d` command
   could not start the current binary.
 - Stale "WAL shipping" documentation in the cluster and API crates and in the

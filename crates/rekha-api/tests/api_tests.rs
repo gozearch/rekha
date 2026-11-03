@@ -746,6 +746,53 @@ async fn chroma_get_applies_where_and_pagination() {
     assert_ne!(v["ids"], v2["ids"], "offset must advance the window");
 }
 
+/// `delete` must honour `limit`.
+///
+/// Chroma accepts a `limit` on delete. The request struct did not declare the
+/// field, so serde dropped it and the handler removed every match: a caller
+/// asking to remove one record out of six lost all six.
+#[tokio::test]
+async fn chroma_delete_honours_limit() {
+    let (_dir, server) = test_app_no_auth();
+    chroma_create(&server, "lim", Some(2), None).await;
+    chroma_add_tagged(&server, "lim").await;
+
+    // Five records exist, three of them tag=a; remove at most two of those.
+    let resp = server
+        .post(&format!("{CHROMA_BASE}/lim/delete"))
+        .json(&serde_json::json!({"where": {"tag": {"$eq": "a"}}, "limit": 2}))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let v: serde_json::Value = resp.json();
+    assert_eq!(
+        v["deleted"].as_u64(),
+        Some(2),
+        "limit must bound the delete: {v}"
+    );
+
+    let resp = server.get(&format!("{CHROMA_BASE}/lim/count")).await;
+    let v: serde_json::Value = resp.json();
+    assert_eq!(
+        v.as_u64(),
+        Some(3),
+        "three records must survive a limit of two"
+    );
+
+    // The same limit applies when the selector is an id list.
+    let resp = server
+        .post(&format!("{CHROMA_BASE}/lim/delete"))
+        .json(&serde_json::json!({"ids": ["b0", "b1"], "limit": 1}))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let resp = server.get(&format!("{CHROMA_BASE}/lim/count")).await;
+    let v: serde_json::Value = resp.json();
+    assert_eq!(
+        v.as_u64(),
+        Some(2),
+        "an id list with a limit must delete exactly that many"
+    );
+}
+
 /// `delete` must support a metadata filter, and combine it with `ids`.
 #[tokio::test]
 async fn chroma_delete_by_where() {

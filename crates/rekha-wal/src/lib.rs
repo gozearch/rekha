@@ -740,6 +740,62 @@ fn encode_batch(ops: &[(u64, u64, Vec<u8>)], first_seq: u64) -> WalResult<Vec<u8
     Ok(frame)
 }
 
+/// Whether a complete, checksum-valid batch that continues the sequence exists
+/// after `from`.
+///
+/// This is what separates a torn tail from a hole. A torn tail is the last thing
+/// in the file, so nothing valid can follow it. If a valid continuation does
+/// exist, the damage is in the middle of committed history: the bytes behind it
+/// were acknowledged, and discarding them because the *length field* of the
+/// preceding frame is unreadable is silent data loss.
+///
+/// The search is byte-by-byte, because a corrupted length field is exactly the
+/// case where the next frame's position cannot be computed. It runs only on the
+/// failure path, over an in-memory copy of the remainder, so a normal open pays
+/// nothing for it. `RESYNC_LIMIT` bounds the copy: a continuation further away
+/// than that is not treated as evidence, and the classification stays
+/// conservative in the direction that preserves data (it reports a tail rather
+/// than refusing to start).
+fn has_valid_continuation(file: &mut File, file_len: u64, from: u64, after_seq: u64) -> bool {
+    const RESYNC_LIMIT: u64 = 256 * 1024 * 1024;
+
+    if from >= file_len {
+        return false;
+    }
+    let end = file_len.min(from.saturating_add(RESYNC_LIMIT));
+    let len = (end - from) as usize;
+    let mut bytes = vec![0u8; len];
+    if file.seek(SeekFrom::Start(from)).is_err() || file.read_exact(&mut bytes).is_err() {
+        return false;
+    }
+
+    let header = BATCH_HEADER_LEN;
+    let mut at = 0usize;
+    while at + header + 4 <= bytes.len() {
+        let batch_len = le_u32(&bytes[at..at + 4]) as usize;
+        let stored_crc = le_u32(&bytes[at + 4..at + 8]);
+        let batch_first = le_u64(&bytes[at + 8..at + 16]);
+        // Any frame carrying a sequence beyond the last one successfully read is
+        // a continuation. Comparing against the damaged frame's own `batch_first`
+        // would be circular, and batches are not contiguous in index the way a
+        // single-entry frame suggests: the next batch simply starts after it.
+        if batch_first > after_seq
+            && batch_len as u64 >= MIN_BATCH_LEN
+            && at + 4 + batch_len <= bytes.len()
+        {
+            let commit_at = batch_len - 4;
+            let body = &bytes[at + 4..at + 4 + batch_len];
+            if le_u32(&body[commit_at..commit_at + 4]) == COMMIT_MAGIC
+                && crc32fast::hash(&body[4..commit_at]) == stored_crc
+            {
+                return true;
+            }
+        }
+        at += 1;
+    }
+    false
+}
+
 /// Scan the log, classifying anything that stops it.
 ///
 /// A batch is complete only if its commit marker is present and its checksum
@@ -804,18 +860,28 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<ScanResu
         let batch_first = le_u64(&hdr[8..16]);
 
         if batch_len < MIN_BATCH_LEN || offset + 4 + batch_len > file_len {
+            // A length field that cannot describe a frame is not proof of a torn
+            // tail: a truncated write leaves a *correct* length with a short
+            // body, while a corrupted one leaves a length that fits nothing. Ask
+            // whether the sequence continues behind this offset before deciding.
+            let next = batch_first.max(last_seq + 1);
+            let ends_log = !has_valid_continuation(file, file_len, offset + 1, last_seq);
             return Ok(outcome(
                 TailReason::TruncatedFrame,
-                batch_first.max(last_seq + 1),
+                next,
                 offset,
-                true,
+                ends_log,
                 count,
                 first_seq,
                 last_seq,
             ));
         }
 
-        let ends_log = offset + 4 + batch_len >= file_len;
+        // `ends_log` cannot be judged from position alone: a corrupted length
+        // can make a mid-file frame appear to run to the end of the file. Every
+        // failure below therefore also asks whether the sequence continues after
+        // this offset, and a continuation means the damage is a hole.
+        let last_by_position = offset + 4 + batch_len >= file_len;
         let body_len = batch_len as usize;
         if buf.len() < body_len {
             buf.resize(body_len, 0);
@@ -830,7 +896,7 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<ScanResu
                 TailReason::TruncatedFrame,
                 batch_first.max(last_seq + 1),
                 offset,
-                ends_log,
+                last_by_position && !has_valid_continuation(file, file_len, offset + 1, last_seq),
                 count,
                 first_seq,
                 last_seq,
@@ -841,7 +907,7 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<ScanResu
                 TailReason::ChecksumMismatch,
                 batch_first.max(last_seq + 1),
                 offset,
-                ends_log,
+                last_by_position && !has_valid_continuation(file, file_len, offset + 1, last_seq),
                 count,
                 first_seq,
                 last_seq,
@@ -858,7 +924,8 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<ScanResu
                     TailReason::UndecodablePayload,
                     batch_first.max(last_seq + 1),
                     offset,
-                    ends_log,
+                    last_by_position
+                        && !has_valid_continuation(file, file_len, offset + 1, last_seq),
                     count,
                     first_seq,
                     last_seq,
@@ -873,7 +940,8 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<ScanResu
                     TailReason::UndecodablePayload,
                     batch_first.max(last_seq + 1),
                     offset,
-                    ends_log,
+                    last_by_position
+                        && !has_valid_continuation(file, file_len, offset + 1, last_seq),
                     count,
                     first_seq,
                     last_seq,
@@ -884,7 +952,8 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<ScanResu
                     TailReason::FencedEpoch,
                     seq,
                     offset,
-                    ends_log,
+                    last_by_position
+                        && !has_valid_continuation(file, file_len, offset + 1, last_seq),
                     count,
                     first_seq,
                     last_seq,
@@ -895,7 +964,8 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<ScanResu
                     TailReason::NonMonotonicSeq,
                     seq,
                     offset,
-                    ends_log,
+                    last_by_position
+                        && !has_valid_continuation(file, file_len, offset + 1, last_seq),
                     count,
                     first_seq,
                     last_seq,
@@ -906,7 +976,8 @@ fn scan(file: &mut File, header_epoch: u64, file_len: u64) -> WalResult<ScanResu
                     TailReason::NonMonotonicSeq,
                     seq,
                     offset,
-                    ends_log,
+                    last_by_position
+                        && !has_valid_continuation(file, file_len, offset + 1, last_seq),
                     count,
                     first_seq,
                     last_seq,
@@ -1354,6 +1425,96 @@ mod tests {
                 }
             ),
             "expected a checksum suspect tail, got {:?}",
+            inspection.tail
+        );
+    }
+
+    /// A corrupted `batch_len` in the middle of the log is a hole, not a tail.
+    ///
+    /// The length field is what tells the scanner where the next frame starts,
+    /// so damaging it used to look exactly like a torn final batch: the frame
+    /// "ended" at or past the end of the file and the rest of the log was
+    /// discarded. An acknowledged middle frame is not a tail, however it is
+    /// damaged, so the classifier now asks whether the sequence continues behind
+    /// the damage.
+    #[test]
+    fn corrupted_batch_len_in_the_middle_is_a_hole() {
+        let (dir, id) = setup();
+        let mut wal = open_fresh(&dir, &id, 1, true);
+        wal.append(add("1")).unwrap();
+        let off1 = wal.size_bytes();
+        wal.append(add("2")).unwrap();
+        wal.append(add("3")).unwrap();
+        wal.append(add("4")).unwrap();
+        drop(wal);
+        let path = wal_path(&dir, &id);
+        let len_before = std::fs::metadata(&path).unwrap().len();
+
+        // Make frame 2's length run past the end of the file.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(off1)).unwrap();
+        file.write_all(&0xFFFF_FFF0u32.to_le_bytes()).unwrap();
+        drop(file);
+
+        let inspection = Wal::inspect(dir.path(), &id).unwrap();
+        assert!(
+            matches!(inspection.tail, WalTail::Corrupt { .. }),
+            "expected Corrupt, got {:?}",
+            inspection.tail
+        );
+        assert_eq!(
+            inspection.record_count, 1,
+            "only the frame before the damage is provably intact"
+        );
+
+        // And a discard policy must not act on it.
+        assert!(
+            Wal::open(
+                dir.path(),
+                &id,
+                Epoch(1),
+                WalOptions::new(true),
+                TailRepair::DiscardSuspect
+            )
+            .is_err(),
+            "DiscardSuspect must refuse a hole"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len_before,
+            "a hole must never be truncated"
+        );
+    }
+
+    /// The same damage in the *final* frame is still a tolerable tail: nothing
+    /// follows it, so no acknowledged record is being thrown away.
+    #[test]
+    fn corrupted_batch_len_at_the_end_is_suspect() {
+        let (dir, id) = setup();
+        let mut wal = open_fresh(&dir, &id, 1, true);
+        wal.append(add("1")).unwrap();
+        let off1 = wal.size_bytes();
+        wal.append(add("2")).unwrap();
+        drop(wal);
+        let path = wal_path(&dir, &id);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(off1)).unwrap();
+        file.write_all(&0xFFFF_FFF0u32.to_le_bytes()).unwrap();
+        drop(file);
+
+        let inspection = Wal::inspect(dir.path(), &id).unwrap();
+        assert!(
+            matches!(inspection.tail, WalTail::Suspect { .. }),
+            "expected Suspect, got {:?}",
             inspection.tail
         );
     }

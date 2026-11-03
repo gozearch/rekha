@@ -2757,7 +2757,7 @@ fn delete_where_does_not_remove_non_matching_records() {
     // Selection happens under the collection lock, so a record cannot slip in
     // between the filter evaluation and the delete.
     let batch = engine
-        .prepare_delete_where(&id, None, Some(&filter), None)
+        .prepare_delete_where(&id, None, Some(&filter), None, None)
         .unwrap();
     assert_eq!(batch.ops.len(), 8, "exactly the tag=a records are selected");
     engine.append_ops(&id, &batch.ops).unwrap();

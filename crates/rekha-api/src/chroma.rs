@@ -247,6 +247,9 @@ pub struct ChromaDeleteRequest {
     pub where_filter: Option<WhereFilter>,
     #[serde(default)]
     pub where_document: Option<WhereDocument>,
+    /// Maximum number of records to remove. Chroma accepts it on delete; the
+    /// handler used to drop the field, so a limited delete removed every match.
+    pub limit: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -712,11 +715,17 @@ pub(crate) async fn delete_records_chroma(
         return Ok((StatusCode::OK, Json(serde_json::json!({ "deleted": 0 }))));
     }
 
+    let limit = req.limit;
     let deleted = match (req.ids, req.where_filter, req.where_document) {
         // Exactly one selector, ids only: Chroma reports the number of ids
         // submitted, including ids that did not exist, so the count describes
         // the request rather than stored state.
-        (Some(ids), None, None) => {
+        (Some(mut ids), None, None) => {
+            // `limit` applies here too: a caller that names ten ids but asks
+            // for one deletion must not lose ten records.
+            if let Some(limit) = limit {
+                ids.truncate(limit);
+            }
             let n = ids.len();
             let engine = state.engine.clone();
             crate::write_batch(&state, id, move || engine.prepare_delete(&id, &ids)).await?;
@@ -730,7 +739,13 @@ pub(crate) async fn delete_records_chroma(
         (ids, filter, document) => {
             let engine = state.engine.clone();
             crate::write_batch(&state, id, move || {
-                engine.prepare_delete_where(&id, ids.as_deref(), filter.as_ref(), document.as_ref())
+                engine.prepare_delete_where(
+                    &id,
+                    ids.as_deref(),
+                    filter.as_ref(),
+                    document.as_ref(),
+                    limit,
+                )
             })
             .await?
         }

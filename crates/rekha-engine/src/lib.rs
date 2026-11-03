@@ -1000,10 +1000,18 @@ impl Engine {
         ids: Option<&[Id]>,
         filter: Option<&WhereFilter>,
         document: Option<&WhereDocument>,
+        limit: Option<usize>,
     ) -> EngineResult<PreparedBatch> {
         let coll = self.collection(collection_id)?;
         let coll = coll.lock();
-        let ids = coll.select(ids, filter, document);
+        let mut ids = coll.select(ids, filter, document);
+        // Chroma's `delete` takes a `limit`. Ignoring it deleted every match,
+        // which turns a "delete one matching record" call into a bulk removal.
+        // The truncation happens under the same lock as the selection so the
+        // limit counts records, not whatever survived a concurrent write.
+        if let Some(limit) = limit {
+            ids.truncate(limit);
+        }
         let ops: Vec<Operation> = ids.into_iter().map(|id| Operation::Delete { id }).collect();
         Ok(PreparedBatch {
             ops,

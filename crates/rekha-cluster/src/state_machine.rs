@@ -229,6 +229,75 @@ impl ClusterStateMachine {
         self.bootstrap_ready = Some(flag);
     }
 
+    /// Resume from the boundary a purged log implies.
+    ///
+    /// openraft replays `[last_applied, committed]` at startup. A state machine
+    /// that reports `last_applied = None` therefore asks for the whole log,
+    /// including the prefix a snapshot already purged — which openraft then
+    /// refuses (`expected index [0, 32), got [20, 31)`) and the node fails to
+    /// start.
+    ///
+    /// The purge point *is* the snapshot boundary: openraft only purges up to
+    /// `snapshot.last_log_id - max_in_snapshot_log_to_keep`. Resuming there
+    /// says "everything at or below this has already been applied and is
+    /// covered by durable state", which is what makes the remaining tail
+    /// sufficient.
+    ///
+    /// The membership is seeded from the placement document rather than the
+    /// log because the membership entry lives in the purged prefix. Callers
+    /// must pass the voter set the placement says this group has; that
+    /// document is the authority a starting node is already validated against.
+    pub fn resume_from(
+        &mut self,
+        last_applied: Option<LogId<u64>>,
+        membership: StoredMembership<u64, u64>,
+    ) {
+        self.last_applied = last_applied;
+        self.membership = membership;
+    }
+
+    /// Rebuild `placements` from the catalog.
+    ///
+    /// The map is normally reconstructed by replaying `AddCollection` entries.
+    /// After a purge those entries are gone, and an empty map is not benign: a
+    /// shard group derives its snapshot scope from it, so the next snapshot
+    /// would archive no collections at all and the following purge would delete
+    /// the only remaining copy of the data's history.
+    ///
+    /// The catalog row is written by the same entry that fills this map, so it
+    /// is an authoritative source rather than a guess.
+    pub fn seed_placements(&mut self, catalog: &dyn Catalog) -> Result<(), String> {
+        let rows = catalog
+            .list_collections_all()
+            .map_err(|e| format!("cannot rebuild placement from the catalog: {e}"))?;
+        for row in rows {
+            let Some(shard) = row.shard else { continue };
+            // A shard group must seed only its own collections: the snapshot
+            // scope is derived from this map, and checkpointing a collection
+            // this node does not host would fail the snapshot build.
+            let belongs = match self.role {
+                GroupRole::Metadata => true,
+                GroupRole::Shard(own) => shard == own,
+            };
+            if belongs {
+                self.placements.insert(row.config.id, shard);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild the address book this machine carries in snapshots.
+    ///
+    /// `nodes` is what a snapshot ships so a joining node can reach the rest of
+    /// the group; `addresses` is the live copy used by the network factory.
+    /// After a purge the `AddNode` entries are gone, so the seed is the peer
+    /// list the process was started with.
+    pub fn seed_nodes(&mut self, peers: impl IntoIterator<Item = (u64, String)>) {
+        for (node_id, addr) in peers {
+            self.nodes.insert(node_id, NodeInfo { node_id, addr });
+        }
+    }
+
     fn mark_bootstrap_ready(&self) {
         if let Some(flag) = &self.bootstrap_ready {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);

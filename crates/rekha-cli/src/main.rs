@@ -453,6 +453,21 @@ async fn fetch_placement(
     }
 }
 
+/// The voter set a group starts with, before any membership entry is replayed.
+///
+/// Reconstructing membership from the placement document rather than the log is
+/// only sound because the two cannot currently diverge: promotion and
+/// `remove_member` are not implemented, so a group's voters are exactly the
+/// owners the placement assigned. When membership changes land, this must be
+/// replaced by a persisted `StoredMembership`.
+fn seeded_membership(
+    voters: impl IntoIterator<Item = u64>,
+    log_id: Option<openraft::LogId<u64>>,
+) -> openraft::StoredMembership<u64, u64> {
+    let voters: std::collections::BTreeSet<u64> = voters.into_iter().collect();
+    openraft::StoredMembership::new(log_id, openraft::Membership::new(vec![voters], ()))
+}
+
 #[tokio::main]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -732,8 +747,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(AtomicBool::new(!engine.catalog().list_users()?.is_empty()));
 
             // Create Raft components.
-            let log_store =
+            let mut log_store =
                 RedbLogStore::open(std::path::PathBuf::from(&data_dir).join("raft_log.redb"))?;
+            // If this log was previously compacted, the entries that carried
+            // the membership and the applied boundary are gone. Both have to be
+            // restored before Raft starts, or it asks for a prefix that no
+            // longer exists and refuses to start.
+            let purge_watermark = log_store.purge_watermark().await;
             let mut sm = ClusterStateMachine::new();
             sm.set_bootstrap_ready_flag(bootstrap_ready.clone());
             // Replicated RBAC/collection operations are applied by the state
@@ -747,6 +767,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             sm.set_addresses(peer_dir.clone());
             let apply_failure = Arc::new(AtomicBool::new(false));
             sm.set_apply_failure_flag(apply_failure.clone());
+
+            // Resume from the compaction boundary. Without this, the state
+            // machine reports "applied nothing" and openraft tries to replay
+            // the purged prefix.
+            //
+            // Everything here is gated on an actual purge. On a first start the
+            // log is intact and replay reconstructs all of it; seeding it early
+            // would give the node a voter set before the cluster has been
+            // initialised, which changes election behaviour rather than
+            // recovering it.
+            if let Some(boundary) = purge_watermark {
+                // The maps this machine carries in a snapshot are normally
+                // rebuilt by replaying the log. Those entries are gone, so seed
+                // them from the sources that are durable regardless: the
+                // catalog for placement, the peer list for addresses.
+                sm.seed_nodes(
+                    peer_dir
+                        .ids()
+                        .into_iter()
+                        .filter_map(|id| peer_dir.addr(id).map(|addr| (id, addr))),
+                );
+                if let Err(e) = sm.seed_placements(engine.catalog().as_ref()) {
+                    // Not fatal: a node that routes by catalog row still serves,
+                    // and this only affects what a future snapshot would contain.
+                    eprintln!("placement could not be rebuilt from the catalog: {e}");
+                }
+                let voters: Vec<u64> = match &topology {
+                    Topology::Sharded(placement) | Topology::Joining(placement) => {
+                        placement.voters().to_vec()
+                    }
+                    Topology::Single => vec![node_id],
+                };
+                sm.resume_from(Some(boundary), seeded_membership(voters, Some(boundary)));
+                println!(
+                    "Resuming after log compaction at index {}: state before it is in \
+                     durable storage, not in the log",
+                    boundary.index
+                );
+            }
             let network = RaftNetworkFactoryImpl::new(peer_dir.clone())
                 .with_cluster_secret(cluster_secret.clone());
             // Election timing is a durability-adjacent decision, so it is
@@ -770,11 +829,57 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
 
+            // Snapshotting is what purges the Raft log, and purging shortens the
+            // history a restarted node can replay. The resume path above makes
+            // that safe for a single node (a purged log now restarts and keeps
+            // committing), but the equivalent path for a shard group has not
+            // been exercised end to end, and the state machine still rebuilds
+            // its boundary from the purge watermark rather than a persisted
+            // snapshot.
+            //
+            // So the default is still to never snapshot: disk growth is
+            // observable and recoverable, whereas a group that cannot restart is
+            // not. `REKHA_SNAPSHOT_EVERY_N_LOGS` opts in, and is also how the
+            // restart regression test exercises the purge path without creating
+            // thousands of collections.
+            let snapshot_every: u64 = match std::env::var("REKHA_SNAPSHOT_EVERY_N_LOGS") {
+                Ok(raw) => raw.trim().parse().map_err(|e| {
+                    format!(
+                        "REKHA_SNAPSHOT_EVERY_N_LOGS must be a whole number of log entries \
+                         (0 disables snapshotting): {e}"
+                    )
+                })?,
+                Err(std::env::VarError::NotPresent) => 0,
+                Err(e) => return Err(format!("REKHA_SNAPSHOT_EVERY_N_LOGS: {e}").into()),
+            };
+            let snapshot_policy = if snapshot_every == 0 {
+                openraft::SnapshotPolicy::Never
+            } else {
+                openraft::SnapshotPolicy::LogsSinceLast(snapshot_every)
+            };
+            match snapshot_policy {
+                openraft::SnapshotPolicy::Never => println!(
+                    "Raft snapshots: disabled (the log is never purged). Set \
+                     REKHA_SNAPSHOT_EVERY_N_LOGS to enable stream compaction."
+                ),
+                openraft::SnapshotPolicy::LogsSinceLast(n) => {
+                    println!("Raft snapshots: every {n} log entries, keeping {n}");
+                }
+            }
+
             let raft_config = Arc::new(openraft::Config {
                 heartbeat_interval: heartbeat_ms,
                 election_timeout_min: election_min_ms,
                 election_timeout_max: election_max_ms,
                 replication_lag_threshold: 10000,
+                snapshot_policy,
+                // openraft keeps 1,000 entries *before* a snapshot by default,
+                // so a snapshot alone does not purge anything until the log is
+                // far past the threshold. The same knob bounds that history:
+                // "compact every N, keep N" is one number an operator can reason
+                // about, and a small value lets the purge path be tested without
+                // writing thousands of entries.
+                max_in_snapshot_log_to_keep: snapshot_every.max(1),
                 ..Default::default()
             });
 
@@ -899,14 +1004,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut cluster = ShardCluster::new(placement.clone());
                     for shard in &hosted_shards {
                         let index = shard.0;
-                        let log_store =
+                        let mut log_store =
                             RedbLogStore::open(log_dir.join(format!("shard-{index}.redb")))?;
+                        let purge_watermark = log_store.purge_watermark().await;
                         let mut shard_sm = ClusterStateMachine::for_shard(node_id, *shard);
                         shard_sm.set_catalog(engine.catalog());
                         shard_sm.set_engine(
                             engine.clone() as Arc<dyn rekha_cluster::EngineSnapshotProvider>
                         );
                         shard_sm.set_apply_failure_flag(apply_failure.clone());
+                        // Same resume logic as the metadata group, and gated the
+                        // same way: only a purged log needs its membership and
+                        // placement reconstructed rather than replayed.
+                        if let Some(boundary) = purge_watermark {
+                            shard_sm.seed_nodes(
+                                peer_dir
+                                    .ids()
+                                    .into_iter()
+                                    .filter_map(|id| peer_dir.addr(id).map(|addr| (id, addr))),
+                            );
+                            if let Err(e) = shard_sm.seed_placements(engine.catalog().as_ref()) {
+                                eprintln!(
+                                    "shard {index}: placement could not be rebuilt from the \
+                                     catalog: {e}"
+                                );
+                            }
+                            shard_sm.resume_from(
+                                Some(boundary),
+                                seeded_membership(
+                                    placement.owners(*shard).iter().copied(),
+                                    Some(boundary),
+                                ),
+                            );
+                        }
                         let network = RaftNetworkFactoryImpl::new(peer_dir.clone())
                             .with_group(ShardCluster::group_id(*shard))
                             .with_cluster_secret(cluster_secret.clone());

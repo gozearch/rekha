@@ -14,6 +14,14 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A required changelog check in the release workflow.
 - Production checklist and expanded configuration/endpoint documentation in the
   README.
+- `REKHA_SNAPSHOT_EVERY_N_LOGS`: compact the Raft log every N entries, keeping N
+  entries of history. `0` (the default) disables snapshotting, so the log is
+  never purged; operators raising `raft_log.redb` size alerts can opt in.
+- Persisted Raft commit point and purge watermark, including the leader that
+  wrote them. Both are restored on startup.
+- A restart test that kills a node after its log has been purged and asserts it
+  becomes ready and can still commit, plus a test that the default
+  configuration never purges.
 
 ### Changed
 
@@ -49,6 +57,23 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A checkpoint after any delete or flushed-vector upsert failed forever: the
+  staged-generation validator required the segment vector count to equal the
+  live count, but incremental generations hard-link earlier segments that still
+  hold deleted and superseded vectors. Every later write on that collection then
+  returned 500 after already committing to the WAL, and the WAL was never
+  pruned. Validation now checks that each live record resolves to a staged
+  vector instead of comparing totals, and a failed checkpoint no longer fails
+  the write that triggered it.
+- Restarting a node whose Raft log had been purged panicked inside openraft
+  (`purge_upto(...) <= committed(None)`) and left the process serving every
+  request with 503 forever. The commit point is now persisted, purge writes the
+  entries, watermark, and commit point in one transaction, and a state machine
+  that resumes from a compaction boundary seeds its membership and placement
+  from durable state instead of replaying a prefix that no longer exists.
+- `read_log_entries` silently skipped a missing or undecodable entry in the
+  middle of the Raft log. A hole is now an error, while a purged prefix and an
+  unwritten tail are still legitimately absent.
 - The documented `docker compose -f docker-compose.cluster.yml up -d` command
   could not start the current binary.
 - Stale "WAL shipping" documentation in the cluster and API crates and in the

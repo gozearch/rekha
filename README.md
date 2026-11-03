@@ -212,6 +212,7 @@ target untouched.
 | `REKHA_SHARDS` | `4 × nodes` | Placement shards; creation-only and persisted |
 | `REKHA_REPLICATION_FACTOR` | `3` | Replicas per shard; creation-only and persisted |
 | `REKHA_WAL_DURABILITY` | `durable` | `durable` fsyncs each batch; `relaxed` does not |
+| `REKHA_SNAPSHOT_EVERY_N_LOGS` | `0` | Compact the Raft log every N entries, keeping N. `0` disables snapshotting, so the log grows but is never purged. Raise `raft_log.redb` size alerts before enabling |
 | `REKHA_API_KEY` | — | API key for authentication; bootstraps the superadmin |
 | `REKHA_TLS_CERT` | — | TLS certificate path |
 | `REKHA_TLS_KEY` | — | TLS private key path |

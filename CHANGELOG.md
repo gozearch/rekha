@@ -84,6 +84,16 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `placement.json` now records the shard owner table explicitly (`owners`), and a
+  decided owner set is recorded as a committed `SetShardOwners` entry instead of
+  being recomputed. Ownership was previously a pure function of the voter set,
+  which is only sound while the cluster never changes shape: after a shard moves,
+  re-deriving it would silently revert the move. Old placement files without the
+  field still open and are interpreted as "derive", which is what they meant.
+  **Downgrade note:** the document is read with `deny_unknown_fields`, so an
+  older binary refuses a file written by this one — keep the previous data
+  directory if a rollback is planned, as the README already advises.
+
 - Enabling `REKHA_SNAPSHOT_EVERY_N_LOGS` in a cluster now warns that membership
   is reconstructed from the placement document after a purge, which is correct
   only while nodes are not added or removed; the default remains "never snapshot"

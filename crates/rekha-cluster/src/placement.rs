@@ -55,6 +55,13 @@ pub enum PlacementError {
     /// Replication factor zero means no node holds the data.
     #[error("replication factor must be at least 1")]
     ZeroReplication,
+    /// An explicitly supplied owner table is not a valid placement.
+    ///
+    /// This is refused rather than repaired: the table decides which nodes hold
+    /// which data, and "fixing" a malformed one would move replicas that a node
+    /// may already have written.
+    #[error("invalid shard owners: {detail}")]
+    BadOwners { detail: String },
 }
 
 /// FNV-1a over `bytes`, then a splitmix64 finalizer.
@@ -167,6 +174,83 @@ impl Placement {
             voters,
             owners,
         })
+    }
+
+    /// Build a placement from an explicit owner table.
+    ///
+    /// The table is validated, not trusted: every shard must name exactly
+    /// `min(replication_factor, voters)` distinct voters. A shorter list would
+    /// create a consensus group that cannot reach the quorum its replication
+    /// factor claims; an unknown node id would make the group wait for a peer
+    /// that is not a voter.
+    ///
+    /// This exists because ownership stops being a pure function of the voter
+    /// set as soon as it can change: after a shard is moved, or a replica is
+    /// re-created elsewhere, re-deriving would silently undo the move.
+    pub fn from_owners(
+        shard_count: u32,
+        replication_factor: usize,
+        voters: impl IntoIterator<Item = u64>,
+        owners: Vec<Vec<u64>>,
+    ) -> Result<Self, PlacementError> {
+        // `new` validates the scalars and gives the canonical voter set and the
+        // effective replication factor, which is clamped to the voter count.
+        let derived = Self::new(shard_count, replication_factor, voters)?;
+        let expected = derived.owners.first().map_or(0, |o| o.len());
+
+        if owners.len() != derived.shard_count as usize {
+            return Err(PlacementError::BadOwners {
+                detail: format!(
+                    "{} shards are declared but {} owner lists were supplied",
+                    derived.shard_count,
+                    owners.len()
+                ),
+            });
+        }
+
+        let voters: std::collections::HashSet<u64> = derived.voters.iter().copied().collect();
+        for (shard, set) in owners.iter().enumerate() {
+            if set.len() != expected {
+                return Err(PlacementError::BadOwners {
+                    detail: format!(
+                        "shard {shard} has {} owners; replication factor {} (clamped to {} \
+                         voters) requires {expected}",
+                        set.len(),
+                        replication_factor,
+                        derived.voters.len()
+                    ),
+                });
+            }
+            let mut seen = std::collections::HashSet::with_capacity(set.len());
+            for &node in set {
+                if !voters.contains(&node) {
+                    return Err(PlacementError::BadOwners {
+                        detail: format!("shard {shard} lists node {node}, which is not a voter"),
+                    });
+                }
+                if !seen.insert(node) {
+                    return Err(PlacementError::BadOwners {
+                        detail: format!("shard {shard} lists node {node} twice"),
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            shard_count: derived.shard_count,
+            replication_factor: derived.replication_factor,
+            voters: derived.voters,
+            owners: owners
+                .into_iter()
+                .map(|set| set.into_boxed_slice())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+    }
+
+    /// The owner table, in the form it is persisted.
+    pub fn owner_table(&self) -> Vec<Vec<u64>> {
+        self.owners.iter().map(|set| set.to_vec()).collect()
     }
 
     /// Shard count a cluster of `nodes` should start with.
@@ -504,6 +588,19 @@ pub struct PlacementConfig {
     pub replication_factor: usize,
     /// The voters placement was computed for, ascending.
     pub voters: Vec<u64>,
+    /// `owners[shard]`, in replica order.
+    ///
+    /// `Option` so a document written before this field existed still opens: an
+    /// absent table means "derive it from the voters", which is exactly what
+    /// every existing directory recorded implicitly. A present table is the
+    /// authority, because once shard ownership can change (removal, promotion,
+    /// re-replication) it is no longer a function of the voter set alone.
+    ///
+    /// `#[serde(default)]` is what makes the old form readable; `deny_unknown_fields`
+    /// on the struct still rejects a *misspelled* field, which is the failure
+    /// worth catching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<Vec<Vec<u64>>>,
 }
 
 impl PlacementConfig {
@@ -645,9 +742,20 @@ impl Placement {
             });
         }
 
-        Self::new(config.shard_count, config.replication_factor, config.voters)
-            .map(Some)
-            .map_err(PlacementOpenError::Invalid)
+        let placement = match config.owners {
+            // A present table is the authority. Deriving owners from the voters
+            // would silently revert a shard move that was committed.
+            Some(owners) => Self::from_owners(
+                config.shard_count,
+                config.replication_factor,
+                config.voters.iter().copied(),
+                owners,
+            ),
+            // Written before this field existed: derive, which is what the file
+            // meant.
+            None => Self::new(config.shard_count, config.replication_factor, config.voters),
+        };
+        placement.map(Some).map_err(PlacementOpenError::Invalid)
     }
 
     /// Write the first placement document for a directory.
@@ -675,6 +783,7 @@ impl Placement {
             shard_count: placement.shard_count(),
             replication_factor: placement.replication_factor(),
             voters: placement.voters().to_vec(),
+            owners: Some(placement.owner_table()),
         };
         let json = serde_json::to_vec_pretty(&config).map_err(|e| PlacementOpenError::Write {
             path: path.to_path_buf(),
@@ -713,6 +822,105 @@ mod placement_config_tests {
         assert_eq!(config.shard_count, placement.shard_count());
         assert_eq!(config.replication_factor, placement.replication_factor());
         assert_eq!(config.voters, VOTERS, "the voter set must be persisted");
+    }
+
+    /// An explicit table is the authority, even when it differs from what the
+    /// voters would derive. This is the property a shard move depends on: if a
+    /// restart re-derived ownership, every committed move would silently revert.
+    #[test]
+    fn an_explicit_owner_table_is_authoritative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let derived = Placement::new(8, 2, VOTERS).expect("placement");
+
+        // A valid table that the derivation would never produce: swap the two
+        // replicas of shard 0 (order is replica precedence, not identity).
+        let mut owners = derived.owner_table();
+        owners[0].swap(0, 1);
+        assert_ne!(
+            owners,
+            derived.owner_table(),
+            "the fixture must differ from the derived table"
+        );
+
+        let config = PlacementConfig {
+            shard_count: 8,
+            replication_factor: 2,
+            voters: VOTERS.to_vec(),
+            owners: Some(owners.clone()),
+        };
+        std::fs::write(
+            dir.path().join(PlacementConfig::FILE),
+            serde_json::to_vec_pretty(&config).expect("encode"),
+        )
+        .expect("write");
+
+        let opened = Placement::open(dir.path(), 8, 2, &VOTERS)
+            .expect("open")
+            .expect("placement");
+        assert_eq!(
+            opened.owner_table(),
+            owners,
+            "the persisted table must be used as written"
+        );
+        assert_eq!(opened.owners(ShardId(0)), owners[0].as_slice());
+    }
+
+    /// A document written before the table existed records the same thing
+    /// implicitly: derive it. Refusing those would make the upgrade a migration.
+    #[test]
+    fn a_document_without_an_owner_table_is_derived() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No `owners` field at all, which is exactly what older builds wrote.
+        let json = format!(
+            r#"{{"shard_count": 16, "replication_factor": 3, "voters": {}}}"#,
+            serde_json::to_string(&VOTERS).expect("voters")
+        );
+        std::fs::write(dir.path().join(PlacementConfig::FILE), json).expect("write");
+
+        let opened = Placement::open(dir.path(), 16, 3, &VOTERS)
+            .expect("open")
+            .expect("placement");
+        let derived = Placement::new(16, 3, VOTERS).expect("placement");
+        assert_eq!(
+            opened, derived,
+            "an absent table must mean exactly what derivation produces"
+        );
+    }
+
+    #[test]
+    fn an_owner_table_naming_a_non_voter_is_refused() {
+        let derived = Placement::new(4, 2, VOTERS).expect("placement");
+        let mut owners = derived.owner_table();
+        owners[1][1] = 99; // not a voter
+        let error = Placement::from_owners(4, 2, VOTERS, owners)
+            .expect_err("an unknown node must be refused");
+        assert!(
+            error.to_string().contains("not a voter"),
+            "error must name the cause: {error}"
+        );
+    }
+
+    #[test]
+    fn an_owner_table_with_the_wrong_replica_count_is_refused() {
+        let derived = Placement::new(4, 2, VOTERS).expect("placement");
+        let mut owners = derived.owner_table();
+        owners[2].pop(); // one replica instead of two
+        let error = Placement::from_owners(4, 2, VOTERS, owners)
+            .expect_err("a shard with fewer replicas must be refused");
+        assert!(
+            error.to_string().contains("requires 2"),
+            "error must name the requirement: {error}"
+        );
+    }
+
+    #[test]
+    fn an_owner_table_listing_a_node_twice_is_refused() {
+        let derived = Placement::new(4, 2, VOTERS).expect("placement");
+        let mut owners = derived.owner_table();
+        owners[0][1] = owners[0][0];
+        let error = Placement::from_owners(4, 2, VOTERS, owners)
+            .expect_err("a duplicated replica must be refused");
+        assert!(error.to_string().contains("twice"), "{error}");
     }
 
     #[test]

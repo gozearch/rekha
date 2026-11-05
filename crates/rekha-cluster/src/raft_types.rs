@@ -15,6 +15,22 @@ pub enum ClusterOperation {
     RemoveNode {
         node_id: u64,
     },
+    /// Replace one shard's owner set.
+    ///
+    /// Placement used to be a pure function of the voter set, computed
+    /// identically on every node from three inputs in `placement.json`. That is
+    /// enough while the cluster never changes shape, and it stops being enough
+    /// the moment a shard can move: re-deriving after a move would silently
+    /// revert it, because derivation cannot know about a decision.
+    ///
+    /// So the decision is recorded as a log entry, in the metadata group, and
+    /// every node applies the same table. The file becomes a cache of this, not
+    /// an authority.
+    SetShardOwners {
+        shard: ShardId,
+        /// Node ids that hold this shard, in replica order.
+        owners: Vec<u64>,
+    },
     /// Create a tenant namespace.
     ///
     /// A namespace is a cluster fact, not a node fact: a tenant created on one

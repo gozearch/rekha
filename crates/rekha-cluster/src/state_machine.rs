@@ -135,6 +135,18 @@ pub struct ClusterStateMachine {
     /// Not derived from the id: the leader chose the shard for node load, and a
     /// hash cannot reproduce a decision.
     pub placements: HashMap<Uuid, ShardId>,
+    /// Owner sets that were decided rather than derived.
+    ///
+    /// Absent for a shard means "derive it from the voter set", which is what
+    /// every cluster that has never moved a shard does. A present entry
+    /// overrides derivation, because after a move the voter set no longer
+    /// determines who holds what.
+    ///
+    /// Replicated and snapshotted: this is the record, and a node that
+    /// recomputed ownership instead of reading it would route to a replica that
+    /// does not have the data.
+    #[serde(default)]
+    pub shard_owners: std::collections::BTreeMap<u32, Vec<u64>>,
     pub clock_map: ClockMap,
     pub last_applied: Option<LogId<u64>>,
     pub membership: StoredMembership<u64, u64>,
@@ -432,6 +444,25 @@ impl ClusterStateMachine {
                 if let Some(addresses) = &self.addresses {
                     addresses.remove(*node_id);
                 }
+            }
+            ClusterOperation::SetShardOwners { shard, owners } => {
+                // A malformed table is a programming error in the proposer, not
+                // a request that could be retried: every replica has the same
+                // entry and would reach the same verdict, and recording it
+                // anyway would make routing depend on an impossible
+                // configuration. Empty or duplicated owners are refused; the
+                // count and membership checks belong to the proposer, which
+                // knows the replication factor and the voter set.
+                let mut seen = std::collections::HashSet::with_capacity(owners.len());
+                if owners.is_empty() || !owners.iter().all(|node| seen.insert(*node)) {
+                    eprintln!(
+                        "cluster: refused an owner set for shard {}: empty or containing \
+                         duplicates ({owners:?})",
+                        shard.0
+                    );
+                    return;
+                }
+                self.shard_owners.insert(shard.0, owners.clone());
             }
             ClusterOperation::AddCollection { config, shard } => {
                 if let Some(shard) = shard {
@@ -1445,6 +1476,72 @@ mod tests {
             vec!["checkpoint_all"],
             "nothing may be archived when the checkpoint failed"
         );
+    }
+
+    /// A decided owner set replicates, and rides in a snapshot.
+    ///
+    /// Ownership used to be derived from the voter set on every node. That is
+    /// only sound while ownership never changes: after a shard moves, deriving
+    /// it again silently reverts the move. So the decision is a log entry, and
+    /// this asserts it is recorded identically on a node that received the log
+    /// by snapshot rather than by replay.
+    #[tokio::test]
+    async fn a_decided_owner_set_travels_in_a_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut source = ClusterStateMachine::for_metadata(1);
+        source.set_engine(Arc::new(RecordingProvider::default()));
+        source.set_snapshot_store(Arc::new(
+            SnapshotStore::open(dir.path(), "metadata").expect("store"),
+        ));
+        source.last_applied = Some(make_log_id(3));
+
+        source.apply_operation(&ClusterOperation::SetShardOwners {
+            shard: ShardId(7),
+            owners: vec![3, 1, 2],
+        });
+        assert_eq!(source.shard_owners.get(&7), Some(&vec![3, 1, 2]));
+
+        let mut builder = source.get_snapshot_builder().await;
+        builder.build_snapshot().await.expect("build");
+        let served = source
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("a snapshot");
+
+        let target_dir = tempfile::tempdir().expect("tempdir");
+        let mut target = ClusterStateMachine::for_metadata(2);
+        target.set_engine(Arc::new(RecordingProvider::default()));
+        target.set_snapshot_store(Arc::new(
+            SnapshotStore::open(target_dir.path(), "metadata").expect("store"),
+        ));
+        target
+            .install_snapshot(&served.meta, served.snapshot)
+            .await
+            .expect("install");
+
+        assert_eq!(
+            target.shard_owners.get(&7),
+            Some(&vec![3, 1, 2]),
+            "the owner table must arrive with the snapshot, not be derived"
+        );
+    }
+
+    /// A duplicated or empty owner list is refused, not recorded. It is a
+    /// proposer bug, and storing it would make routing depend on a
+    /// configuration no replica could satisfy.
+    #[test]
+    fn a_malformed_owner_set_is_not_recorded() {
+        let mut sm = ClusterStateMachine::for_metadata(1);
+        sm.apply_operation(&ClusterOperation::SetShardOwners {
+            shard: ShardId(1),
+            owners: vec![1, 1, 2],
+        });
+        sm.apply_operation(&ClusterOperation::SetShardOwners {
+            shard: ShardId(2),
+            owners: vec![],
+        });
+        assert!(sm.shard_owners.is_empty(), "{:?}", sm.shard_owners);
     }
 
     /// A snapshot has to outlive the call that built it. openraft drops the

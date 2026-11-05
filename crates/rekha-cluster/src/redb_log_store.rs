@@ -7,11 +7,8 @@ use std::ops::RangeBounds;
 use std::path::Path;
 use std::sync::Arc;
 
-use openraft::storage::{LogFlushed, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder};
-use openraft::{
-    CommittedLeaderId, Entry, LogId, LogState, Snapshot, SnapshotMeta, StorageError,
-    StoredMembership, Vote,
-};
+use openraft::storage::{LogFlushed, RaftLogReader, RaftLogStorage};
+use openraft::{CommittedLeaderId, Entry, LogId, LogState, StorageError, Vote};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -494,35 +491,16 @@ impl RaftLogStorage<RaftTypeConfig> for RedbLogStore {
     }
 }
 
-pub struct RedbSnapshotBuilder {
-    db: Arc<Database>,
-    inner: Arc<Mutex<RedbLogStoreInner>>,
-}
-
-impl RaftSnapshotBuilder<RaftTypeConfig> for RedbSnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<RaftTypeConfig>, StorageError<u64>> {
-        let inner = self.inner.lock().await;
-        let last_purged = inner.last_purged;
-        drop(inner);
-
-        let last_log_id = find_last_log_id(&self.db)?.or(last_purged);
-
-        let snapshot_id = uuid::Uuid::new_v4().to_string();
-        let data = vec![];
-        let cursor = std::io::Cursor::new(data);
-
-        let meta = SnapshotMeta {
-            last_log_id,
-            last_membership: StoredMembership::default(),
-            snapshot_id,
-        };
-
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(cursor),
-        })
-    }
-}
+// A snapshot builder belonged here, and it was removed rather than fixed.
+//
+// It returned `vec![]` as the snapshot body with `StoredMembership::default()`,
+// which is a *valid* snapshot as far as openraft is concerned: a follower would
+// accept it, install an empty state machine, and report success. The log store
+// has no access to the engine, so no implementation of this trait here could
+// ever produce a real one. The state machine's `ClusterSnapshotBuilder` is the
+// only correct producer, and `RaftStateMachine::SnapshotBuilder` is the only
+// hook openraft uses. Leaving a second, wrong builder in the public API was one
+// wiring mistake away from silent total data loss on a replica.
 
 #[cfg(test)]
 mod tests {

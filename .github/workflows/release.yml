@@ -12,8 +12,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A tag is the only thing that cannot be corrected after the fact, so the
+  # suite runs here even though CI already ran on the branch it points at. The
+  # failure mode this prevents is a release cut from a commit whose tests were
+  # never run — a merged-but-red branch, a re-tagged commit, a CI outage.
+  test:
+    name: test before publishing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build tooling
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake
+      - name: Test
+        run: cargo test --workspace --locked
+
   build:
     name: build ${{ matrix.target }}
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

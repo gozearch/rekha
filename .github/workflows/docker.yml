@@ -10,7 +10,26 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # An image is what people deploy, and a tag push is unrepeatable once pulled.
+  # Testing here, rather than trusting the branch that produced the tag, is the
+  # difference between "CI was green at some commit" and "this image's tests
+  # passed".
+  test:
+    name: test before publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build tooling
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake
+      - name: Test
+        run: cargo test --workspace --locked
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

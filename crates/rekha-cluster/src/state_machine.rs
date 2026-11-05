@@ -905,6 +905,20 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         // wrong: openraft calls this during `Raft::new`, so every start would
         // checkpoint every collection and archive the whole corpus before the
         // node accepted a single request.
+        //
+        // Returning `None` is expensive in a different way, and the log line is
+        // the warning: openraft's replication asks for this only when a follower
+        // is behind the leader's purged prefix, and a missing snapshot there is
+        // not recoverable — replication stops with "snapshot not found" and the
+        // follower never catches up. An operator who sees this line is looking
+        // at a replica that has to be rebuilt from a backup, which is why it
+        // names the cause rather than leaving it to the transport.
+        eprintln!(
+            "cluster: a replica needs a snapshot but this node has none: it is behind a purged \
+             log prefix and cannot catch up by replay alone. Rebuild its data directory from a \
+             backup. (Snapshot transfer is not implemented yet; snapshotting is disabled by \
+             default for this reason.)"
+        );
         Ok(None)
     }
 }

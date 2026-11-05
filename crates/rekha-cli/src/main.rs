@@ -830,18 +830,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Snapshotting is what purges the Raft log, and purging shortens the
-            // history a restarted node can replay. The resume path above makes
-            // that safe for a single node (a purged log now restarts and keeps
-            // committing), but the equivalent path for a shard group has not
-            // been exercised end to end, and the state machine still rebuilds
-            // its boundary from the purge watermark rather than a persisted
-            // snapshot.
+            // history a node can replay. A *restarting* node is safe: its applied
+            // state is in durable storage and the resume path above continues from
+            // the purge watermark. A node that merely *fell behind* is not. It
+            // needs the leader to ship a snapshot, and this state machine cannot
+            // produce one that survives the call — the builder's archive is
+            // returned to openraft and dropped, and `get_current_snapshot` has
+            // nothing to serve. openraft then stops replication for that follower
+            // with "snapshot not found", permanently.
             //
-            // So the default is still to never snapshot: disk growth is
-            // observable and recoverable, whereas a group that cannot restart is
-            // not. `REKHA_SNAPSHOT_EVERY_N_LOGS` opts in, and is also how the
-            // restart regression test exercises the purge path without creating
-            // thousands of collections.
+            // So the default is to never snapshot: disk growth is observable and
+            // recoverable, whereas a replica that can never rejoin is not.
+            // `REKHA_SNAPSHOT_EVERY_N_LOGS` opts in, and is how the restart
+            // regression tests exercise the purge path without writing thousands
+            // of entries.
             let snapshot_every: u64 = match std::env::var("REKHA_SNAPSHOT_EVERY_N_LOGS") {
                 Ok(raw) => raw.trim().parse().map_err(|e| {
                     format!(
@@ -864,6 +866,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 openraft::SnapshotPolicy::LogsSinceLast(n) => {
                     println!("Raft snapshots: every {n} log entries, keeping {n}");
+                    if topology.is_clustered() {
+                        eprintln!(
+                            "warning: snapshotting is enabled in a cluster, but Raft snapshots \
+                             are not transferable in this build. A node that is offline long \
+                             enough for the log to be purged cannot catch up and has to be \
+                             rebuilt from a backup. Single-node use is unaffected; this is a \
+                             known gap, tracked as the snapshot-transfer milestone."
+                        );
+                    }
                 }
             }
 

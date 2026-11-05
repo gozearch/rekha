@@ -8,6 +8,11 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `LICENSE` (Apache-2.0, matching the `license` field the workspace has been
+  declaring without the file).
+- A test gate in the release and Docker workflows: both jobs now depend on
+  `cargo test --workspace --locked`, so a tag or image cannot be published from
+  a commit whose suite does not pass.
 - A `cluster-smoke` CI job that starts the documented three-node compose file,
   writes through one node, reads through another, and keeps serving after the
   bootstrap node stops.
@@ -28,7 +33,23 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shard log. With compaction disabled by default the logs grow, and unmeasured
   growth is a disk-full outage.
 
+### Removed
+
+- `RedbSnapshotBuilder`. It returned an empty body with a default membership,
+  which is a *valid* snapshot to openraft: a follower would have installed an
+  empty state machine and reported success. The log store cannot see the engine,
+  so no implementation there could ever be correct, and leaving it in the public
+  API was one wiring mistake away from silent data loss on a replica.
+
 ### Changed
+
+- Enabling `REKHA_SNAPSHOT_EVERY_N_LOGS` in a cluster prints an explicit warning
+  that Raft snapshots are not transferable in this build: a node offline long
+  enough for the log to be purged cannot catch up and must be rebuilt from a
+  backup, while a node that merely restarts is unaffected.
+- A replica asking for a snapshot it cannot have now logs the cause (behind a
+  purged prefix, rebuild from backup) instead of leaving openraft's generic
+  "snapshot not found" as the only signal.
 
 - Clustered startup no longer requires `REKHA_KEY_PEPPER`. A bootstrap
   `REKHA_API_KEY` must be at least 32 characters instead: the stored hash is

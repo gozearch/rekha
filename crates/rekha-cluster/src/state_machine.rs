@@ -95,6 +95,19 @@ pub enum GroupRole {
     Shard(ShardId),
 }
 
+/// Whether a catalog error means "the request itself could never succeed".
+///
+/// These are deterministic verdicts: the same entry applied to the same state
+/// yields the same error on every replica, so they are not evidence that this
+/// node diverged from the log. Infrastructure failures are, and are handled
+/// separately by the callers.
+fn is_application_rejection(e: &rekha_storage::CatalogError) -> bool {
+    matches!(
+        e,
+        rekha_storage::CatalogError::NotFound | rekha_storage::CatalogError::InvalidArgument(_)
+    )
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ClusterStateMachine {
     /// This node's id, used to decide whether a collection is materialized here.
@@ -319,15 +332,30 @@ impl ClusterStateMachine {
 
     /// Apply a catalog write that a committed entry asked for.
     ///
-    /// `AlreadyExists` is the expected result of replaying an entry, so it is
-    /// success. Every other error means this node's catalog refused something
-    /// the log committed: the node has diverged from the log it reports, and it
-    /// must stop serving rather than answer from a state nobody voted for. The
-    /// arms this replaces discarded the result, so a failed apply on one node
-    /// was indistinguishable from a successful one.
+    /// Two kinds of failure reach here and they must not be conflated:
+    ///
+    /// * **The application refused the write** (`NotFound`, `InvalidArgument`).
+    ///   This is deterministic — every replica has the same state and reaches
+    ///   the same verdict — so it is a bad request that got committed, not
+    ///   divergence. It is logged, and the node keeps serving: a replica that
+    ///   agreed with the rest of the cluster is not a replica that lost data.
+    /// * **The store failed** (`Storage`, `Serialization`). This node did not
+    ///   take an entry the log committed, so it has diverged and must stop
+    ///   answering.
+    ///
+    /// The previous version treated only `AlreadyExists` as expected, so a
+    /// `POST /auth/users/{id}/keys` for a user that does not exist made every
+    /// node report `ready:false` until someone restarted the cluster.
     fn apply_write(&self, what: &str, result: rekha_storage::CatalogResult<()>) {
         match result {
             Ok(()) | Err(rekha_storage::CatalogError::AlreadyExists) => {}
+            Err(e) if is_application_rejection(&e) => {
+                // `AlreadyExists` is the expected replay; the other two mean the
+                // request could never have succeeded on any node. The leader
+                // rejects these before proposing, so reaching here means a race
+                // with a concurrent change or a replay of an older entry.
+                eprintln!("cluster: {what} was rejected: {e}");
+            }
             Err(e) => {
                 eprintln!("cluster: {what} did not apply: {e}");
                 self.note_apply_failure();
@@ -335,11 +363,15 @@ impl ClusterStateMachine {
         }
     }
 
-    /// The same, for an entry that removes a row: a replayed removal finds
-    /// nothing to delete, which is not a divergence.
+    /// The same, for an entry that removes a row so a replayed removal is not a
+    /// divergence. `InvalidArgument` is included for operations that refuse to
+    /// remove something built in: that verdict is identical on every node.
     fn apply_removal(&self, what: &str, result: rekha_storage::CatalogResult<()>) {
         match result {
             Ok(()) | Err(rekha_storage::CatalogError::NotFound) => {}
+            Err(e) if is_application_rejection(&e) => {
+                eprintln!("cluster: {what} was rejected: {e}");
+            }
             Err(e) => {
                 eprintln!("cluster: {what} did not apply: {e}");
                 self.note_apply_failure();
@@ -811,6 +843,13 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         let engine_handle = self.engine.clone();
         let catalog = self.catalog.clone();
         let addresses = self.addresses.clone();
+        // Readiness is a property of *this process*, not of the snapshot. A node
+        // that had already failed to apply a committed entry must not become
+        // ready just because it installed one: the snapshot cannot prove the
+        // divergence that raised the flag is gone. Preserving it keeps the
+        // failure visible until an operator restarts the node.
+        let apply_failure = self.apply_failure.clone();
+        let bootstrap_ready = self.bootstrap_ready.clone();
 
         // The registry first, through the *local* handle. A node that joins from
         // a snapshot has none of these rows, and until they are written it can
@@ -847,6 +886,8 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         self.engine = engine_handle;
         self.catalog = catalog;
         self.addresses = addresses;
+        self.apply_failure = apply_failure;
+        self.bootstrap_ready = bootstrap_ready;
 
         self.last_applied = meta.last_log_id;
         self.membership = meta.last_membership.clone();
@@ -898,6 +939,52 @@ mod tests {
         });
         sm.apply_operation(&ClusterOperation::RemoveNode { node_id: 1 });
         assert!(sm.nodes.is_empty());
+    }
+
+    /// A committed request the application rejects is not divergence.
+    ///
+    /// Every replica has the same state and reaches the same verdict, so the
+    /// node has not lost an entry. Treating it as divergence made a single
+    /// RBAC call referencing an unknown user or role mark the whole cluster
+    /// not-ready until restart.
+    #[tokio::test]
+    async fn a_rejected_rbac_write_does_not_take_the_node_out_of_service() {
+        use rekha_storage::RedbCatalog;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog =
+            Arc::new(RedbCatalog::open(dir.path().join("catalog.redb")).expect("catalog"));
+
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut sm = ClusterStateMachine::for_metadata(1);
+        sm.set_catalog(catalog);
+        sm.set_apply_failure_flag(flag);
+
+        // A key for a user that does not exist.
+        sm.apply_operation(&ClusterOperation::CreateApiKey {
+            user_id: "nobody".into(),
+            key_hash: [7u8; 32],
+            label: "test".into(),
+        });
+        assert!(
+            !sm.apply_failed(),
+            "a user-input rejection must not mark the node not-ready"
+        );
+
+        // A permission on a role that does not exist.
+        sm.apply_operation(&ClusterOperation::AddPermission {
+            role_id: "no-such-role".into(),
+            permission: rekha_core::auth::Permission {
+                id: "p1".into(),
+                action: "collection.read".into(),
+                tenant: None,
+                database: None,
+            },
+        });
+        assert!(
+            !sm.apply_failed(),
+            "a role-input rejection must not mark the node not-ready"
+        );
     }
 
     #[test]

@@ -44,6 +44,58 @@ fn require(auth: &AuthContext, action: &str) -> Result<(), (StatusCode, Json<ser
     }
 }
 
+fn not_found(what: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": format!("{what} not found") })),
+    )
+}
+
+fn conflict(message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": message.into() })),
+    )
+}
+
+/// Reject a request that could never commit successfully, before proposing it.
+///
+/// In cluster mode the handler's write is a Raft entry, so a request naming an
+/// unknown user or role commits and then fails to apply everywhere. The apply
+/// path no longer treats that as divergence, but the client would still get a
+/// 200 for a key that was never created. Validating here turns it into the 404
+/// it always was on a single node.
+///
+/// This reads applied state, not the committed head, so a concurrent delete can
+/// still slip through; that case is a harmless no-op at apply time rather than a
+/// failed node.
+fn ensure_user_exists(
+    state: &AppState,
+    user_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let found = state
+        .engine
+        .catalog()
+        .get_user(user_id)
+        .map_err(catalog_status)?;
+    match found {
+        Some(_) => Ok(()),
+        None => Err(not_found("user")),
+    }
+}
+
+fn ensure_role_exists(
+    state: &AppState,
+    role_id: &str,
+) -> Result<RoleRecord, (StatusCode, Json<serde_json::Value>)> {
+    let found = state
+        .engine
+        .catalog()
+        .get_role(role_id)
+        .map_err(catalog_status)?;
+    found.ok_or_else(|| not_found("role"))
+}
+
 // ---------------------------------------------------------------------------
 // Request / response DTOs
 // ---------------------------------------------------------------------------
@@ -144,6 +196,18 @@ async fn create_user(
         ));
     }
     let id = uuid::Uuid::new_v4().to_string();
+    // A duplicate name is rejected by the catalog, but in cluster mode that
+    // rejection happens on apply — after the client already has a 200 and a key
+    // that will never authenticate. Answer it here instead.
+    if state
+        .engine
+        .catalog()
+        .get_user_by_name(&req.name)
+        .map_err(catalog_status)?
+        .is_some()
+    {
+        return Err(conflict(format!("user `{}` already exists", req.name)));
+    }
     let user = UserRecord {
         id: id.clone(),
         name: req.name.clone(),
@@ -258,6 +322,9 @@ async fn create_api_key(
             Json(serde_json::json!({ "error": "key name must not be empty" })),
         ));
     }
+    // A key for a user that does not exist can never apply. Check before
+    // proposing, so the answer is a 404 rather than a committed no-op.
+    ensure_user_exists(&state, &user_id)?;
     let api_key = generate_api_key();
     let hash = hash_api_key_with_pepper(&api_key, &state.pepper);
     if let Some(ref raft) = state.raft {
@@ -369,6 +436,18 @@ async fn create_role(
             Json(serde_json::json!({ "error": "role name must not be empty" })),
         ));
     }
+    // Same reasoning as `create_user`: a duplicate name only fails at apply
+    // time in a cluster, so check it here.
+    if state
+        .engine
+        .catalog()
+        .list_roles()
+        .map_err(catalog_status)?
+        .iter()
+        .any(|r| r.name == req.name)
+    {
+        return Err(conflict(format!("role `{}` already exists", req.name)));
+    }
     let role = RoleRecord {
         id: uuid::Uuid::new_v4().to_string(),
         name: req.name,
@@ -412,6 +491,17 @@ async fn delete_role(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     require(&auth, "role.delete")?;
+    // Built-in roles are the ones the permission model is defined against;
+    // removing one would leave every assignment to it dangling. The catalog
+    // refuses it, but only at apply time in a cluster, which would commit a
+    // no-op. Refuse it here where the client can see it.
+    let role = ensure_role_exists(&state, &id)?;
+    if role.built_in {
+        return Err(conflict(format!(
+            "role `{}` is built in and cannot be deleted",
+            role.name
+        )));
+    }
     if let Some(ref raft) = state.raft {
         let op = ClusterOperation::DeleteRole {
             role_id: id.clone(),
@@ -445,6 +535,7 @@ async fn add_permission(
             Json(serde_json::json!({ "error": "action must not be empty" })),
         ));
     }
+    ensure_role_exists(&state, &role_id)?;
     let perm = Permission {
         id: uuid::Uuid::new_v4().to_string(),
         action: req.action,
@@ -524,6 +615,8 @@ async fn assign_role(
     Json(req): Json<AssignRoleRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     require(&auth, "role.assign")?;
+    ensure_user_exists(&state, &user_id)?;
+    ensure_role_exists(&state, &req.role_id)?;
     if let Some(ref raft) = state.raft {
         let op = ClusterOperation::AssignRole {
             user_id: user_id.clone(),

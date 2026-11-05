@@ -62,6 +62,17 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- An RBAC request referencing a user or role that does not exist committed a
+  Raft entry that failed to apply on every node, and the apply path treated that
+  as divergence — so one authenticated call marked the whole cluster
+  `ready:false` until it was restarted. Application-level rejections
+  (`NotFound`, `InvalidArgument`) are deterministic and are no longer counted as
+  divergence; only store failures are. The handlers now also validate before
+  proposing, so the caller gets a 404/409 instead of a 200 for work that was
+  never done.
+- Installing a snapshot no longer clears a node's apply-failure and
+  bootstrap-ready flags. A snapshot cannot prove an earlier divergence is gone,
+  so the failure stays visible until an operator restarts the node.
 - A checkpoint after any delete or flushed-vector upsert failed forever: the
   staged-generation validator required the segment vector count to equal the
   live count, but incremental generations hard-link earlier segments that still

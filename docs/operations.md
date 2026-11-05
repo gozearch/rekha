@@ -22,6 +22,24 @@ gone.
 `200` means "can serve", not "is caught up". A replica that is still installing a
 snapshot reports ready. Use the lag metrics for progress, not readiness.
 
+## Read consistency
+
+Data reads (`query`, `get`, `count`) are served by the shard's leader, after it
+confirms leadership with a quorum and waits for its own applied state to cover
+the read. A write that returned 200 is therefore visible to the next read, from
+any node.
+
+Two consequences worth planning for:
+
+- read traffic lands on one node per shard, like write traffic;
+- if the leader cannot confirm leadership within five seconds, reads return
+  `503` rather than a stale `200`.
+
+`?consistency=local` asks the receiving replica to answer immediately from what
+it has applied. It is appropriate for analytics and backfills, where a stale
+answer is fine. It is not appropriate for read-your-writes. The response header
+`x-rekha-served-by` names the node that actually answered.
+
 ## Alerts worth having
 
 | Metric / signal | Why | Threshold |
@@ -73,10 +91,12 @@ What to check if it does not converge:
 
 - **`install_snapshot` returning 404** — the chunked route is not mounted on the
   internal listener; this build's transport and this build's API must match.
-- **"a replica needs a snapshot but this node has none"** in the leader's log —
-  its `wal/snapshots/` is empty or was deleted. A node that purged its log always
-  had a snapshot when it purged (purging only follows a successful build), so
-  this means the directory was removed. Rebuild that node from a backup instead.
+- **"no snapshot store is attached"** — this node cannot build one at all. Only
+  single-node deployments without compaction are configured that way.
+- **"the snapshot store is unreadable"** — corruption under
+  `wal/snapshots/<group>/`. The install is refused before any write; recover the
+  directory from a backup rather than deleting it (deleting it makes the next
+  request rebuild the archive, which is slow but not wrong).
 - **"snapshot is for group `shard:2`, but this node asked for `metadata`"** — a
   snapshot addressed to the wrong group. The install is refused before any write;
   nothing is corrupted. This indicates a routing bug, so keep the log line.

@@ -662,12 +662,23 @@ struct SnapshotPayload {
     registry: Option<crate::registry::RegistrySnapshot>,
 }
 
+/// A snapshot's meta and its bytes, as produced by the builder.
+type BuiltSnapshot = (SnapshotMeta<u64, u64>, Vec<u8>);
+
+/// Build a snapshot archive, returning its meta and bytes.
+///
+/// Does not persist. Persisting is the caller's decision because the two cases
+/// differ: openraft's builder must persist (otherwise the archive cannot be
+/// served later), while `get_current_snapshot` may be producing one on demand
+/// for an embedder that has no store at all.
+///
+/// This is blocking: it checkpoints every collection in scope and reads every
+/// segment. Callers run it on a worker that can afford to block, and it is
+/// bounded by the snapshot policy interval.
 // The error type is `openraft::StorageError`, imposed by the `RaftSnapshotBuilder`
 // impl this feeds; boxing it here would only have to be unboxed one line later.
 #[allow(clippy::result_large_err)]
-fn assemble_snapshot(
-    sm: &ClusterStateMachine,
-) -> Result<Snapshot<RaftTypeConfig>, StorageError<u64>> {
+fn assemble_archive(sm: &ClusterStateMachine) -> Result<BuiltSnapshot, StorageError<u64>> {
     // Capture the boundary FIRST. The state machine is a clone, but the engine
     // sits behind an `Arc` and applies keep running while the archive is built.
     // A snapshot ahead of its boundary is harmless — replay re-applies those
@@ -738,45 +749,53 @@ fn assemble_snapshot(
         ),
     };
 
-    // Persist before returning. openraft drops the returned reader as soon as it
-    // has read the meta, so a snapshot that only exists in this return value is
-    // gone by the time a follower asks for one — and a follower that asks is by
-    // definition the one that cannot catch up any other way.
-    //
-    // This ordering also carries the invariant the rest of the recovery path
-    // depends on: openraft purges only after a build succeeds, so **a purged log
-    // implies a persisted snapshot**. If publishing fails, the build fails, and
-    // nothing is purged. That is why a node resuming from a purge watermark does
-    // not have to build a replacement snapshot at startup — it already has one,
-    // unless an operator deleted the directory.
+    Ok((meta, archive))
+}
+
+/// Persist a built snapshot in this group's store.
+///
+/// The builder persists before returning. openraft drops the returned reader as
+/// soon as it has read the meta, so a snapshot that only exists in a return value
+/// is gone by the time a follower asks for one — and a follower that asks is by
+/// definition the one that cannot catch up any other way.
+///
+/// This also carries the invariant the rest of the recovery path depends on:
+/// openraft purges only after a build succeeds, so **a purged log implies a
+/// persisted snapshot**. If publishing fails, the build fails, and nothing is
+/// purged.
+#[allow(clippy::result_large_err)]
+fn persist_snapshot(
+    sm: &ClusterStateMachine,
+    meta: &SnapshotMeta<u64, u64>,
+    archive: &[u8],
+) -> Result<(), StorageError<u64>> {
     let store = sm.snapshots.as_ref().ok_or_else(|| StorageError::IO {
         source: openraft::StorageIOError::write(&std::io::Error::other(
             "no snapshot store is attached: this node can build a snapshot but has nowhere \
              to keep it, so a follower that falls behind could never be repaired",
         )),
     })?;
-    store
-        .publish(&meta, &archive)
-        .map_err(|e| StorageError::IO {
-            source: openraft::StorageIOError::write(&std::io::Error::other(format!(
-                "publishing the snapshot failed: {e}"
-            ))),
-        })?;
+    store.publish(meta, archive).map_err(|e| StorageError::IO {
+        source: openraft::StorageIOError::write(&std::io::Error::other(format!(
+            "publishing the snapshot failed: {e}"
+        ))),
+    })?;
     // Retention is best-effort: the snapshot that was just published is the one
     // the cluster needs, and failing to delete an old one must not fail it.
     if let Err(e) = store.prune(crate::snapshot_store::KEEP) {
         eprintln!("cluster: pruning old snapshots failed: {e}");
     }
-
-    Ok(Snapshot {
-        meta,
-        snapshot: Box::new(std::io::Cursor::new(archive)),
-    })
+    Ok(())
 }
 
 impl RaftSnapshotBuilder<RaftTypeConfig> for ClusterSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<RaftTypeConfig>, StorageError<u64>> {
-        assemble_snapshot(&self.sm)
+        let (meta, archive) = assemble_archive(&self.sm)?;
+        persist_snapshot(&self.sm, &meta, &archive)?;
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(std::io::Cursor::new(archive)),
+        })
     }
 }
 
@@ -1028,47 +1047,65 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<RaftTypeConfig>>, StorageError<u64>> {
-        // Serve what was persisted, never a freshly assembled one. openraft asks
-        // this when a follower's next_index has fallen below the purged prefix,
-        // and rebuilding the archive here would checkpoint every collection
-        // while the replication task waits — turning "a replica is behind" into
-        // "every write on the leader is blocked".
-        let Some(store) = self.snapshots.clone() else {
-            eprintln!(
-                "cluster: a replica needs a snapshot but this node has no snapshot store \
-                 configured; it cannot catch up by replay alone and must be rebuilt from a \
-                 backup"
-            );
-            return Ok(None);
-        };
-
-        match store.read_current() {
-            Ok(Some((meta, data))) => Ok(Some(Snapshot {
-                meta,
-                snapshot: Box::new(std::io::Cursor::new(data)),
-            })),
-            Ok(None) => {
-                // The only correct reason to be here: no snapshot has been built
-                // yet, which cannot happen once one has been installed or built
-                // on this node. A follower that needs one now is stuck until the
-                // leader takes a new one, so this is worth saying out loud.
-                eprintln!(
-                    "cluster: a replica needs a snapshot and no snapshot has been built yet; \
-                     it will catch up when the next one is taken, or must be rebuilt from a \
-                     backup if the log prefix it needs is already purged"
-                );
-                Ok(None)
+        // Serve what was persisted when there is one. That is the cheap and
+        // common path: the builder persists, so a node that has ever taken a
+        // snapshot answers from disk without rebuilding anything.
+        if let Some(store) = self.snapshots.clone() {
+            match store.read_current() {
+                Ok(Some((meta, data))) => {
+                    return Ok(Some(Snapshot {
+                        meta,
+                        snapshot: Box::new(std::io::Cursor::new(data)),
+                    }));
+                }
+                Ok(None) => {}
+                // Corruption is not absence. Reporting `None` here would tell
+                // openraft "this node has no snapshot", which is the same answer
+                // a healthy node that has not built one gives, and would hide a
+                // disk problem behind a topology behaviour.
+                Err(e) => {
+                    return Err(StorageError::IO {
+                        source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                            "the snapshot store is unreadable: {e}"
+                        ))),
+                    });
+                }
             }
-            // Corruption is not absence. Reporting `None` here would tell
-            // openraft "this node has no snapshot", which is the same answer as
-            // a healthy node that has not built one, and would hide a disk
-            // problem behind a topology behaviour.
-            Err(e) => Err(StorageError::IO {
-                source: openraft::StorageIOError::read(&std::io::Error::other(format!(
-                    "the snapshot store is unreadable: {e}"
-                ))),
-            }),
         }
+
+        // Nothing applied means nothing to snapshot. This is also the call
+        // `Raft::new` makes while initialising, before any entry has been
+        // replayed: answering `None` there costs nothing, while building an
+        // archive would checkpoint every collection before the process accepts a
+        // request — on every restart.
+        if self.last_applied.is_none() {
+            return Ok(None);
+        }
+
+        // Nothing persisted, but this node has applied state: build one now.
+        //
+        // Returning `None` here is not a deferral. openraft treats "no snapshot"
+        // as a storage error and *ends* that replica's replication stream, so the
+        // replica it was trying to repair stops making progress — observed as a
+        // learner that never catches up while `add_learner(blocking)` waits
+        // forever. Producing an archive is expensive, but it is the only answer
+        // that lets the replica recover.
+        //
+        // This blocks the apply worker for the duration of the checkpoint and the
+        // archive. That is acceptable because it only happens when no archive
+        // exists at all; once one does, the branch above serves it from disk.
+        let (meta, archive) = assemble_archive(self)?;
+        if let Some(store) = self.snapshots.clone()
+            && let Err(e) = store.publish(&meta, &archive)
+        {
+            // The snapshot is still valid for this transfer; failing to keep a
+            // copy only means the next request builds another one.
+            eprintln!("cluster: could not persist the on-demand snapshot: {e}");
+        }
+        Ok(Some(Snapshot {
+            meta,
+            snapshot: Box::new(std::io::Cursor::new(archive)),
+        }))
     }
 }
 

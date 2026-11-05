@@ -109,9 +109,12 @@ async fn a_voter_whose_disk_was_wiped_catches_up_again() {
     }
 
     // And the collection reads back, from the node that has just relearned it.
+    // `consistency=local` keeps this about that node's own state: reads now
+    // default to the group's leader, which would answer whether or not the
+    // replacement had learned anything.
     let (status, body) = post_json_retrying(
         &restarted,
-        &format!("/api/v2/collections/{collection}/count"),
+        &format!("/api/v2/collections/{collection}/count?consistency=local"),
         json!({}),
     )
     .await;

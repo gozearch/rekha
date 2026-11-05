@@ -361,6 +361,37 @@ pub struct AppState {
     pub snapshot_staging: tokio::sync::Mutex<()>,
 }
 
+/// The process-wide HTTP client.
+///
+/// Two problems, one setting:
+///
+/// * `reqwest::Client::new()` reads the system proxy configuration, which on
+///   macOS goes through `SCDynamicStoreCreate`. That call deadlocks when several
+///   threads construct a client at the same time (`_dispatch_once_wait` never
+///   returns), observed as a test suite that reports every test passed and then
+///   hangs.
+/// * More importantly, this client talks to *peers*, not to the internet. A
+///   system or `HTTP_PROXY` proxy would silently route Raft RPCs and forwarded
+///   writes through an intermediary that cannot speak the protocol.
+///
+/// `no_proxy()` disables the matcher entirely, so neither applies. One client
+/// for the process also means one connection pool rather than one per `AppState`.
+fn shared_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| match reqwest::Client::builder().no_proxy().build() {
+            Ok(client) => client,
+            Err(e) => {
+                // TLS backend initialisation. There is no safer fallback that
+                // does not reintroduce the proxy matcher; report and continue so
+                // a node without TLS still serves plain HTTP.
+                eprintln!("http client: proxy-free client could not be built ({e})");
+                reqwest::Client::new()
+            }
+        })
+        .clone()
+}
+
 impl AppState {
     pub fn new(
         engine: Arc<Engine>,
@@ -377,7 +408,7 @@ impl AppState {
             pepper: config.pepper,
             allow_open_mode: config.allow_open_mode,
             peers: rekha_cluster::PeerDirectory::default(),
-            http: reqwest::Client::new(),
+            http: shared_http_client(),
             leader: None,
             apply_failure: Arc::new(AtomicBool::new(false)),
             bootstrap_ready: Arc::new(AtomicBool::new(true)),

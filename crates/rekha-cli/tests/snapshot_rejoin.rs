@@ -82,9 +82,13 @@ fn has_snapshot(dir: &std::path::Path) -> bool {
 }
 
 async fn count(node: &Node, collection: uuid::Uuid) -> Option<u64> {
+    // `consistency=local` on purpose: this reads *this replica's* applied state.
+    // Reads default to the group leader now, and a count answered by the leader
+    // would say nothing about whether the restarted node has caught up, which is
+    // the entire point of this test.
     let (status, body) = post_json_retrying(
         node,
-        &format!("/api/v2/collections/{collection}/count"),
+        &format!("/api/v2/collections/{collection}/count?consistency=local"),
         json!({}),
     )
     .await;

@@ -58,6 +58,35 @@ pub struct RaftNetworkImpl {
     cluster_secret: Option<String>,
 }
 
+/// The process-wide HTTP client for Raft RPCs.
+///
+/// A client per peer per group meant a connection pool per replication stream,
+/// created at runtime. Two reasons not to do that:
+///
+/// * `reqwest::Client::new()` reads the system proxy configuration, which on
+///   macOS deadlocks when several threads construct one at the same time
+///   (`_dispatch_once_wait` inside `SCDynamicStoreCreate`).
+/// * Raft RPCs must never take a proxy. An `HTTP_PROXY` in the environment would
+///   send consensus traffic to something that cannot parse it, and the cluster
+///   would lose quorum for a reason nobody would guess.
+///
+/// Per-RPC deadlines are applied by the caller, not by client defaults.
+fn shared_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| match reqwest::Client::builder().no_proxy().build() {
+            Ok(client) => client,
+            Err(e) => {
+                eprintln!(
+                    "raft network: proxy-free client could not be built ({e}); falling back \
+                     to defaults, which may consult a system proxy"
+                );
+                reqwest::Client::new()
+            }
+        })
+        .clone()
+}
+
 impl RaftNetworkImpl {
     fn new(
         target: u64,
@@ -69,7 +98,7 @@ impl RaftNetworkImpl {
             target,
             addr: addr.map(|a| normalize_peer_url(&a)),
             group,
-            client: reqwest::Client::new(),
+            client: shared_http_client(),
             cluster_secret,
         }
     }

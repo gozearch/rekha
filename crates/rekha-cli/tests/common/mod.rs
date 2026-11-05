@@ -158,10 +158,21 @@ pub fn spawn_cluster(dirs: &[PathBuf], ports: &[u16]) -> Vec<Node> {
 }
 
 pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("client")
+    // One client for the whole test binary: building one per request meant a
+    // connection pool per call, and concurrent construction deadlocks in
+    // macOS proxy detection. `no_proxy()` also keeps a developer's `HTTP_PROXY`
+    // from redirecting requests meant for a node on localhost, which is a
+    // genuinely confusing way for a test to fail.
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .no_proxy()
+                .build()
+                .expect("client")
+        })
+        .clone()
 }
 
 pub async fn wait_ready(nodes: &[Node]) {

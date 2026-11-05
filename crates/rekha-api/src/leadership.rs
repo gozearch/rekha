@@ -17,6 +17,13 @@
 //! - no leader yet          → `503` with `Retry-After`; never a local apply
 //! - already forwarded once → `503` with `x-rekha-leader`; never loop
 //!
+//! Reads follow the same rule as writes: they run on the group's leader, after
+//! a barrier that confirms leadership and waits for the leader's applied state
+//! to cover the read index. A replica can be behind by an unbounded amount, so
+//! serving a read from one makes "write, then read on another node" return the
+//! old value with no way for the client to know. `?consistency=local` opts out
+//! for workloads that prefer a fast, possibly stale answer.
+//!
 //! Forwarding is preferred over rejecting because Chroma clients do not retry
 //! against a different host on their own, so a `503` at the "wrong" node would
 //! surface as a client error for a cluster that is entirely healthy.
@@ -73,6 +80,10 @@ pub fn requires_leader(method: &Method, path: &str) -> bool {
         return false;
     }
     // Read endpoints that happen to be POST.
+    //
+    // They are still routed by [`require_leader`]; this function answers only
+    // "is this a mutation", because the remaining decision — where a read runs —
+    // is made by the same placement and leadership routing that handles writes.
     if path.ends_with("/query") || path.ends_with("/get") || path.ends_with("/count") {
         return false;
     }
@@ -125,6 +136,103 @@ fn data_target(state: &AppState, path: &str) -> Option<uuid::Uuid> {
         .ok()
         .flatten()
         .map(|record| record.config.id)
+}
+
+/// Request header naming the node that actually answered, for data reads.
+///
+/// A read on any node is routed to the shard's leader, so a client that wants to
+/// verify routing (or a test that wants evidence rather than a timing
+/// assumption) can read this instead of inferring it.
+pub const SERVED_BY_HEADER: &str = "x-rekha-served-by";
+
+/// Whether this request asked to be served from the local replica.
+///
+/// `?consistency=local` is an explicit trade: the answer is whatever this node
+/// has applied, which may be behind by an unbounded amount. Everything else is
+/// linearizable.
+fn reads_locally(request: &Request) -> bool {
+    request
+        .uri()
+        .query()
+        .map(|query| {
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .any(|(key, value)| key == "consistency" && value == "local")
+        })
+        .unwrap_or(false)
+}
+
+/// How long a read may wait for the leadership check before it is refused.
+///
+/// A read that cannot confirm leadership must fail, not hang: the client can
+/// retry against another node, but it cannot time out of a request that never
+/// returns.
+const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Confirm this node still leads the collection's group, and that its applied
+/// state has reached the read index.
+///
+/// `ensure_linearizable` sends heartbeats to a quorum and waits for the state
+/// machine to catch up, so a read that follows it observes every write that
+/// committed before the request arrived. Without it a replica answers from
+/// whatever it has applied, which is why a write followed by an immediate read
+/// on another node could return the *old* value — the failure this replaces.
+async fn read_barrier(state: &AppState, collection: &uuid::Uuid) -> Result<(), Response> {
+    let raft = match state.shards.as_ref() {
+        Some(shards) => state
+            .shard_of(collection)
+            .and_then(|shard| shards.raft(shard)),
+        None => state.raft.clone(),
+    };
+    let Some(raft) = raft else {
+        // No consensus at all: single-node, and the local state is the truth.
+        return Ok(());
+    };
+
+    // One voter is its own quorum, and there is no second copy that could be
+    // ahead of it, so the barrier would only add a round trip through the Raft
+    // core to every read on a single-node deployment.
+    let single_voter = {
+        let metrics = raft.metrics();
+        let m = metrics.borrow();
+        m.membership_config.membership().voter_ids().count() <= 1
+    };
+    if single_voter {
+        return Ok(());
+    }
+
+    match tokio::time::timeout(READ_BARRIER_TIMEOUT, raft.ensure_linearizable()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => {
+            // Leadership moved, or a quorum is unreachable. A retry will be
+            // routed to the new leader; answering from this node would be the
+            // stale read the barrier exists to prevent.
+            tracing::warn!(%err, "rejecting a read: this node can no longer prove it leads");
+            Err(no_leader())
+        }
+        Err(_) => {
+            // openraft's check waits for a quorum ack, and a partition makes
+            // that wait unbounded from the caller's point of view. A read has to
+            // fail so the client can retry; a request that never returns cannot
+            // be retried.
+            tracing::warn!(
+                timeout_ms = READ_BARRIER_TIMEOUT.as_millis(),
+                "rejecting a read: no quorum confirmation within the deadline"
+            );
+            Err(no_leader())
+        }
+    }
+}
+
+fn tag_served_by(state: &AppState, mut response: Response) -> Response {
+    let node_id = state.raft.as_ref().map(|raft| raft.metrics().borrow().id);
+    if let Some(id) = node_id
+        && let Ok(value) = axum::http::HeaderValue::from_str(&id.to_string())
+    {
+        response.headers_mut().insert(SERVED_BY_HEADER, value);
+    }
+    response
 }
 
 /// Middleware: send each request to the node that holds the data and, for a
@@ -181,12 +289,28 @@ pub async fn require_leader(
                 .into_response();
         }
 
-        if !requires_leader(&method, &path) {
-            return next.run(request).await;
+        let mutating = requires_leader(&method, &path);
+
+        // An explicit opt-out, for workloads that would rather have a fast,
+        // possibly stale answer (analytics over a large collection). It is not
+        // the default because a replica has no bound on how stale it may be:
+        // the client that wrote a record and immediately reads it can see it
+        // missing, and there is no lag figure it could check to know.
+        if !mutating && reads_locally(&request) {
+            return tag_served_by(&state, next.run(request).await);
         }
-        // On a replica: route the write to this group's leader.
+
+        // Reads and writes both run on the group's leader. For a read the
+        // leader then confirms its leadership with a quorum and waits for its
+        // own applied state to reach the read index, which is what makes
+        // read-after-write on any node return the write.
         return match shard_route(&state, collection).await {
-            Route::Here => next.run(request).await,
+            Route::Here => {
+                if !mutating && let Err(response) = read_barrier(&state, &collection).await {
+                    return response;
+                }
+                tag_served_by(&state, next.run(request).await)
+            }
             Route::Forward(leader) => {
                 if hops >= MAX_FORWARD_HOPS {
                     return too_many_hops();

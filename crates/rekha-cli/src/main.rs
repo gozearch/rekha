@@ -421,6 +421,9 @@ async fn fetch_placement(
     );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        // Cluster-internal traffic: a system or `HTTP_PROXY` proxy would send
+        // the placement request to something that cannot answer it.
+        .no_proxy()
         .build()?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);

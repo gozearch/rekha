@@ -127,7 +127,7 @@ async fn a_shard_owner_restarts_after_its_log_is_purged() {
     // consequence of having reconstructed membership and placement.
     let (status, body) = post_json_retrying(
         &nodes[index],
-        &format!("/api/v2/collections/{collection}/count"),
+        &format!("/api/v2/collections/{collection}/count?consistency=local"),
         json!({}),
     )
     .await;
@@ -167,7 +167,7 @@ async fn a_shard_owner_restarts_after_its_log_is_purged() {
     wait_ready(&nodes).await;
     let (status, body) = post_json_retrying(
         &nodes[index],
-        &format!("/api/v2/collections/{collection}/count"),
+        &format!("/api/v2/collections/{collection}/count?consistency=local"),
         json!({}),
     )
     .await;

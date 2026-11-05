@@ -8,6 +8,21 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Reads are linearizable. `query`, `get` and `count` are routed to the shard's
+  leader and answered only after a barrier that confirms leadership with a
+  quorum and waits for the leader's applied state to reach the read index. Before
+  this, any replica answered them from whatever it had applied, so a client that
+  wrote a record and immediately read it from another node could see the old
+  value with no way to know it was stale. `?consistency=local` opts out for
+  workloads that prefer a fast, possibly stale answer, and `x-rekha-served-by`
+  reports which node actually answered.
+- A leader with no persisted snapshot builds one on demand when replication asks
+  for it. openraft treats "no snapshot" as a storage error and ends that
+  replica's replication stream, so a learner could previously stop making
+  progress and never catch up. The build is gated on having applied state, so
+  `Raft::new`'s snapshot probe — which happens before any replay — still costs
+  nothing.
+
 - Raft snapshots are now persisted, served and transferred, so a replica that
   falls behind the purged log prefix can rejoin. Previously `get_current_snapshot`
   returned `None` unconditionally and `build_snapshot`'s archive was dropped when
@@ -109,6 +124,13 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Cluster HTTP clients no longer consult a system proxy, and there is one per
+  process rather than one per `AppState` and one per replication stream. Two
+  reasons: `reqwest::Client::new()` reads the system proxy configuration, which
+  on macOS deadlocks when several threads construct a client at once (observed as
+  a test binary that reports every test passed and then never exits); and
+  internal Raft/forwarding traffic must never be routed through `HTTP_PROXY`,
+  which cannot speak the protocol and would cost the cluster quorum.
 - A replica that fails to open a collection it owns now marks itself not-ready
   instead of continuing to serve empty reads for records it is supposed to hold
   and to build snapshots that silently omit the collection (the snapshot scope

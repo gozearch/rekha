@@ -133,7 +133,11 @@ struct Chunk<'a> {
 impl Harness {
     async fn post(&self, chunk: Chunk<'_>) -> (u16, String) {
         let url = format!("{}/internal/raft/0/snapshot/{}", self.base, chunk.id);
-        let resp = reqwest::Client::new()
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let resp = client
             .post(&url)
             .header("x-rekha-cluster-secret", SECRET)
             .header("content-type", "application/octet-stream")

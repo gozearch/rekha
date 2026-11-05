@@ -299,6 +299,9 @@ Before exposing a node to real traffic:
   when the transfer becomes a stream.
 - Run `rekha verify` against a stopped data directory, take backups with
   `rekha backup`, and rehearse `rekha restore` before you need it.
+- Reads are linearizable by default and are answered by the shard's leader, so
+  size read throughput per shard rather than per node. Use `?consistency=local`
+  for analytics, where a stale answer is acceptable.
 - Scrape `REKHA_METRICS_PORT` from loopback only, and alert on `/ready`
   returning non-200, `rekha_raft_quorum_age_ms`, apply lag, and disk.
 - Pin the image tag and keep the previous data directory until a rollback has

@@ -38,13 +38,18 @@ pub trait EngineSnapshotProvider: Send + Sync + 'static {
     /// Every collection in scope must already have a published generation;
     /// callers run [`EngineSnapshotProvider::checkpoint_all`] first so the
     /// snapshot covers the boundary the log is about to be purged to.
-    fn snapshot_bytes(&self, state: &[u8], collections: &[uuid::Uuid]) -> Result<Vec<u8>, String>;
+    fn snapshot_bytes(
+        &self,
+        state: &[u8],
+        shard: Option<ShardId>,
+        collections: &[uuid::Uuid],
+    ) -> Result<Vec<u8>, String>;
 
     /// Replace local state from an archive, returning the embedded state blob.
     ///
     /// Only the collections the archive contains are replaced; a collection
     /// outside it is left alone, so restoring one shard cannot wipe another.
-    fn restore_bytes(&self, archive: &[u8]) -> Result<Vec<u8>, String>;
+    fn restore_bytes(&self, shard: Option<ShardId>, archive: &[u8]) -> Result<Vec<u8>, String>;
 
     /// The state blob embedded in an archive, without restoring anything.
     ///
@@ -55,7 +60,11 @@ pub trait EngineSnapshotProvider: Send + Sync + 'static {
 
     /// Checkpoint every collection in scope, so a snapshot is never behind its
     /// boundary.
-    fn checkpoint_all(&self, collections: &[uuid::Uuid]) -> Result<usize, String>;
+    fn checkpoint_all(
+        &self,
+        shard: Option<ShardId>,
+        collections: &[uuid::Uuid],
+    ) -> Result<usize, String>;
 
     /// Record a collection's metadata on this node without opening its data.
     ///
@@ -68,10 +77,18 @@ pub trait EngineSnapshotProvider: Send + Sync + 'static {
     ) -> Result<(), String>;
 
     /// Open a recorded collection's data on this node. Idempotent.
-    fn materialize_collection(&self, collection_id: &uuid::Uuid) -> Result<(), String>;
+    fn materialize_collection(
+        &self,
+        collection_id: &uuid::Uuid,
+        shard: Option<ShardId>,
+    ) -> Result<(), String>;
 
     /// Remove a collection the log says is gone. Idempotent.
-    fn drop_collection(&self, collection_id: &uuid::Uuid) -> Result<(), String>;
+    fn drop_collection(
+        &self,
+        collection_id: &uuid::Uuid,
+        shard: Option<ShardId>,
+    ) -> Result<(), String>;
 
     /// Apply a committed data batch at `index`.
     ///
@@ -82,6 +99,7 @@ pub trait EngineSnapshotProvider: Send + Sync + 'static {
     fn apply_batch(
         &self,
         collection_id: &uuid::Uuid,
+        shard: Option<ShardId>,
         ops: &[rekha_core::op::Operation],
         index: u64,
         dimension: usize,
@@ -464,6 +482,7 @@ impl ClusterStateMachine {
                 }
                 self.shard_owners.insert(shard.0, owners.clone());
             }
+            ClusterOperation::SetVoters { .. } => {}
             ClusterOperation::AddCollection { config, shard } => {
                 if let Some(shard) = shard {
                     self.placements.insert(config.id, *shard);
@@ -489,13 +508,17 @@ impl ClusterStateMachine {
                     // the entry's owners against this node's id was the wrong
                     // test: a node is a replica of some shards and not others,
                     // and the group it applied the entry in already says which.
+                    let shard_id = match self.role {
+                        GroupRole::Shard(s) => Some(s),
+                        GroupRole::Metadata => None,
+                    };
                     let owned = match (self.role, *shard) {
                         (GroupRole::Shard(hosted), Some(shard)) => hosted == shard,
-                        // No shards at all: the single group holds everything.
+                        // No shards or intra-collection sharded: all shard groups hold a partition.
                         (GroupRole::Shard(_), None) => true,
                         (GroupRole::Metadata, _) => false,
                     };
-                    if owned && let Err(e) = engine.materialize_collection(&config.id) {
+                    if owned && let Err(e) = engine.materialize_collection(&config.id, shard_id) {
                         // The data is this node's responsibility and it could not
                         // be opened. Continuing would serve empty reads from a
                         // replica that is supposed to hold records, and — worse —
@@ -545,8 +568,12 @@ impl ClusterStateMachine {
             }
             ClusterOperation::RemoveCollection { collection_id } => {
                 self.placements.remove(collection_id);
+                let shard_id = match self.role {
+                    GroupRole::Shard(s) => Some(s),
+                    GroupRole::Metadata => None,
+                };
                 if let Some(engine) = &self.engine
-                    && let Err(e) = engine.drop_collection(collection_id)
+                    && let Err(e) = engine.drop_collection(collection_id, shard_id)
                 {
                     eprintln!("cluster: failed to drop replicated collection {collection_id}: {e}");
                 }
@@ -729,8 +756,12 @@ fn assemble_archive(sm: &ClusterStateMachine) -> Result<BuiltSnapshot, StorageEr
     // purges the log up to `last_log_id`; a stale generation would leave the
     // receiver needing entries that no longer exist.
     let scope = sm.snapshot_scope();
+    let shard_id = match sm.role {
+        GroupRole::Shard(s) => Some(s),
+        GroupRole::Metadata => None,
+    };
     engine
-        .checkpoint_all(&scope)
+        .checkpoint_all(shard_id, &scope)
         .map_err(|e| StorageError::IO {
             source: openraft::StorageIOError::read(&std::io::Error::other(format!(
                 "checkpoint before snapshot failed: {e}"
@@ -763,7 +794,7 @@ fn assemble_archive(sm: &ClusterStateMachine) -> Result<BuiltSnapshot, StorageEr
     })?;
 
     let archive = engine
-        .snapshot_bytes(&state, &scope)
+        .snapshot_bytes(&state, shard_id, &scope)
         .map_err(|e| StorageError::IO {
             source: openraft::StorageIOError::read(&std::io::Error::other(format!(
                 "engine snapshot failed: {e}"
@@ -873,8 +904,12 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
                             let collection_id = *collection_id;
                             let ops: Arc<[rekha_core::op::Operation]> = Arc::from(ops.as_slice());
                             let dimension = *dimension;
+                            let shard_id = match self.role {
+                                GroupRole::Shard(s) => Some(s),
+                                GroupRole::Metadata => None,
+                            };
                             match tokio::task::spawn_blocking(move || {
-                                engine.apply_batch(&collection_id, &ops, index, dimension)
+                                engine.apply_batch(&collection_id, shard_id, &ops, index, dimension)
                             })
                             .await
                             {
@@ -982,11 +1017,17 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
 
         // Restore the engine first. If it fails, this node's metadata is left
         // untouched rather than describing collections whose data did not land.
-        let state = engine.restore_bytes(&data).map_err(|e| StorageError::IO {
-            source: openraft::StorageIOError::read(&std::io::Error::other(format!(
-                "engine restore failed: {e}"
-            ))),
-        })?;
+        let shard_id = match self.role {
+            GroupRole::Shard(s) => Some(s),
+            GroupRole::Metadata => None,
+        };
+        let state = engine
+            .restore_bytes(shard_id, &data)
+            .map_err(|e| StorageError::IO {
+                source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                    "engine restore failed: {e}"
+                ))),
+            })?;
 
         let restored: SnapshotPayload =
             bincode::deserialize(&state).map_err(|e| StorageError::IO {
@@ -1328,19 +1369,28 @@ mod tests {
         fn snapshot_bytes(
             &self,
             state: &[u8],
+            _shard: Option<ShardId>,
             _collections: &[uuid::Uuid],
         ) -> Result<Vec<u8>, String> {
             self.events.lock().unwrap().push("snapshot_bytes");
             Ok(state.to_vec())
         }
-        fn restore_bytes(&self, archive: &[u8]) -> Result<Vec<u8>, String> {
+        fn restore_bytes(
+            &self,
+            _shard: Option<ShardId>,
+            archive: &[u8],
+        ) -> Result<Vec<u8>, String> {
             self.events.lock().unwrap().push("restore_bytes");
             Ok(archive.to_vec())
         }
         fn snapshot_state(&self, archive: &[u8]) -> Result<Vec<u8>, String> {
             Ok(archive.to_vec())
         }
-        fn checkpoint_all(&self, _collections: &[uuid::Uuid]) -> Result<usize, String> {
+        fn checkpoint_all(
+            &self,
+            _shard: Option<ShardId>,
+            _collections: &[uuid::Uuid],
+        ) -> Result<usize, String> {
             self.events.lock().unwrap().push("checkpoint_all");
             if self
                 .fail_checkpoint
@@ -1359,7 +1409,11 @@ mod tests {
             Ok(())
         }
 
-        fn materialize_collection(&self, _collection_id: &uuid::Uuid) -> Result<(), String> {
+        fn materialize_collection(
+            &self,
+            _collection_id: &uuid::Uuid,
+            _shard: Option<ShardId>,
+        ) -> Result<(), String> {
             self.events.lock().unwrap().push("materialize_collection");
             if self
                 .fail_materialize
@@ -1369,12 +1423,17 @@ mod tests {
             }
             Ok(())
         }
-        fn drop_collection(&self, _collection_id: &uuid::Uuid) -> Result<(), String> {
+        fn drop_collection(
+            &self,
+            _collection_id: &uuid::Uuid,
+            _shard: Option<ShardId>,
+        ) -> Result<(), String> {
             Ok(())
         }
         fn apply_batch(
             &self,
             _collection_id: &uuid::Uuid,
+            _shard: Option<ShardId>,
             ops: &[rekha_core::op::Operation],
             _index: u64,
             _dimension: usize,

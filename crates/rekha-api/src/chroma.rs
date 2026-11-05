@@ -161,6 +161,8 @@ pub struct ChromaCreateCollectionRequest {
     /// Takes precedence over the legacy `metadata["hnsw:space"]` key.
     #[serde(default)]
     pub configuration: Option<serde_json::Value>,
+    #[serde(default)]
+    pub partitioned: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -469,7 +471,8 @@ pub(crate) async fn create_collection_chroma(
         m
     });
 
-    let record = crate::create_collection_clustered(&state, &config).await?;
+    let partitioned = crate::is_partitioned_requested(req.partitioned, config.metadata.as_ref());
+    let record = crate::create_collection_clustered(&state, &config, partitioned).await?;
     Ok((StatusCode::CREATED, Json(chroma_response(&record))))
 }
 
@@ -590,6 +593,58 @@ pub(crate) async fn add_records_chroma(
     let metadatas: Option<Vec<Option<Metadata>>> = req
         .metadatas
         .map(|list| list.into_iter().map(convert_metadata).collect());
+
+    if crate::is_partitioned(&state, &id) {
+        let Some(shards) = state.shards.as_ref() else {
+            return Err(ChromaError::Engine(EngineError::Unavailable(
+                "no shards configured".into(),
+            )));
+        };
+        let placement = shards.placement();
+        let mut sub_batches: std::collections::HashMap<rekha_cluster::ShardId, crate::SubBatchAdd> =
+            std::collections::HashMap::new();
+        for (i, record_id) in req.ids.iter().enumerate() {
+            let shard = placement.shard_for_record(record_id);
+            let entry = sub_batches.entry(shard).or_insert_with(|| {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    metadatas.as_ref().map(|_| Vec::new()),
+                    req.documents.as_ref().map(|_| Vec::new()),
+                )
+            });
+            entry.0.push(record_id.clone());
+            entry.1.push(embeddings[i].to_vec());
+            if let Some(ref mut metas) = entry.2 {
+                metas.push(metadatas.as_ref().and_then(|m| m.get(i).cloned()).flatten());
+            }
+            if let Some(ref mut docs) = entry.3 {
+                docs.push(
+                    req.documents
+                        .as_ref()
+                        .and_then(|d| d.get(i).cloned())
+                        .flatten(),
+                );
+            }
+        }
+        let mut futures = Vec::new();
+        for (shard, (ids, embs, metas, docs)) in sub_batches {
+            let dim = embs.first().map(|e| e.len()).unwrap_or(0);
+            let embs_vec: Vec<Embedding> = embs.into_iter().map(Embedding::from).collect();
+            let ops = rekha_engine::add_ops(&ids, &embs_vec, metas.as_deref(), docs.as_deref());
+            let batch_req = crate::ShardBatchRequest {
+                collection_id: id,
+                ops,
+                dimension: dim,
+            };
+            let state = state.clone();
+            futures
+                .push(async move { crate::dispatch_shard_batch(&state, shard, batch_req).await });
+        }
+        let _ = futures::future::try_join_all(futures).await?;
+        return Ok((StatusCode::CREATED, Json(serde_json::json!({}))));
+    }
+
     let engine = state.engine.clone();
     let collection = id;
     let ids = req.ids;
@@ -626,6 +681,71 @@ pub(crate) async fn upsert_records_chroma(
         .map(Into::into)
         .collect();
     let metadatas = convert_metadata_patches(req.metadatas);
+
+    if crate::is_partitioned(&state, &id) {
+        let Some(shards) = state.shards.as_ref() else {
+            return Err(ChromaError::Engine(EngineError::Unavailable(
+                "no shards configured".into(),
+            )));
+        };
+        let placement = shards.placement();
+        let mut sub_batches: std::collections::HashMap<
+            rekha_cluster::ShardId,
+            crate::SubBatchUpsert,
+        > = std::collections::HashMap::new();
+        for (i, record_id) in req.ids.iter().enumerate() {
+            let shard = placement.shard_for_record(record_id);
+            let entry = sub_batches.entry(shard).or_insert_with(|| {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    metadatas.as_ref().map(|_| Vec::new()),
+                    req.documents.as_ref().map(|_| Vec::new()),
+                )
+            });
+            entry.0.push(record_id.clone());
+            entry.1.push(embeddings[i].to_vec());
+            if let Some(ref mut metas) = entry.2 {
+                metas.push(metadatas.as_ref().and_then(|m| m.get(i).cloned()).flatten());
+            }
+            if let Some(ref mut docs) = entry.3 {
+                docs.push(
+                    req.documents
+                        .as_ref()
+                        .and_then(|d| d.get(i).cloned())
+                        .flatten(),
+                );
+            }
+        }
+        let mut futures = Vec::new();
+        for (shard, (ids, embs, metas, docs)) in sub_batches {
+            let dim = embs.first().map(|e| e.len()).unwrap_or(0);
+            let embs_vec: Vec<Embedding> = embs.into_iter().map(Embedding::from).collect();
+            let engine = state.engine.clone();
+            let batch = crate::offload(move || {
+                engine.prepare_upsert_partition(
+                    &id,
+                    Some(shard),
+                    &ids,
+                    &embs_vec,
+                    metas.as_deref(),
+                    docs.as_deref(),
+                )
+            })
+            .await?;
+            let batch_req = crate::ShardBatchRequest {
+                collection_id: id,
+                ops: batch.ops,
+                dimension: dim,
+            };
+            let state = state.clone();
+            futures
+                .push(async move { crate::dispatch_shard_batch(&state, shard, batch_req).await });
+        }
+        let _ = futures::future::try_join_all(futures).await?;
+        return Ok((StatusCode::OK, Json(serde_json::json!({}))));
+    }
+
     let engine = state.engine.clone();
     let collection = id;
     let ids = req.ids;
@@ -667,6 +787,71 @@ pub(crate) async fn update_records_chroma(
         .filter(|e| !e.is_empty())
         .map(|e| e.into_iter().map(Into::into).collect());
     let metadatas = convert_metadata_patches(req.metadatas);
+
+    if crate::is_partitioned(&state, &id) {
+        let Some(shards) = state.shards.as_ref() else {
+            return Err(ChromaError::Engine(EngineError::Unavailable(
+                "no shards configured".into(),
+            )));
+        };
+        let placement = shards.placement();
+        let mut sub_batches: std::collections::HashMap<
+            rekha_cluster::ShardId,
+            crate::SubBatchUpdate,
+        > = std::collections::HashMap::new();
+        for (i, record_id) in req.ids.iter().enumerate() {
+            let shard = placement.shard_for_record(record_id);
+            let entry = sub_batches.entry(shard).or_insert_with(|| {
+                (
+                    Vec::new(),
+                    embeddings.as_ref().map(|_| Vec::new()),
+                    metadatas.as_ref().map(|_| Vec::new()),
+                    req.documents.as_ref().map(|_| Vec::new()),
+                )
+            });
+            entry.0.push(record_id.clone());
+            if let (Some(embs), Some(src_embs)) = (&mut entry.1, &embeddings) {
+                embs.push(src_embs[i].clone());
+            }
+            if let Some(ref mut metas) = entry.2 {
+                metas.push(metadatas.as_ref().and_then(|m| m.get(i).cloned()).flatten());
+            }
+            if let Some(ref mut docs) = entry.3 {
+                docs.push(
+                    req.documents
+                        .as_ref()
+                        .and_then(|d| d.get(i).cloned())
+                        .flatten(),
+                );
+            }
+        }
+        let mut futures = Vec::new();
+        for (shard, (sub_ids, embs, metas, docs)) in sub_batches {
+            let engine = state.engine.clone();
+            let batch = crate::offload(move || {
+                engine.prepare_update_partition(
+                    &id,
+                    Some(shard),
+                    &sub_ids,
+                    embs.as_deref(),
+                    metas.as_deref(),
+                    docs.as_deref(),
+                )
+            })
+            .await?;
+            let batch_req = crate::ShardBatchRequest {
+                collection_id: id,
+                ops: batch.ops,
+                dimension: batch.dimension,
+            };
+            let state = state.clone();
+            futures
+                .push(async move { crate::dispatch_shard_batch(&state, shard, batch_req).await });
+        }
+        let _ = futures::future::try_join_all(futures).await?;
+        return Ok((StatusCode::OK, Json(serde_json::json!({}))));
+    }
+
     let engine = state.engine.clone();
     let collection = id;
     let ids = req.ids;
@@ -727,8 +912,42 @@ pub(crate) async fn delete_records_chroma(
                 ids.truncate(limit);
             }
             let n = ids.len();
-            let engine = state.engine.clone();
-            crate::write_batch(&state, id, move || engine.prepare_delete(&id, &ids)).await?;
+            if crate::is_partitioned(&state, &id) {
+                let Some(shards) = state.shards.as_ref() else {
+                    return Err(ChromaError::Engine(EngineError::Unavailable(
+                        "no shards configured".into(),
+                    )));
+                };
+                let placement = shards.placement();
+                let mut sub_batches: std::collections::HashMap<
+                    rekha_cluster::ShardId,
+                    Vec<String>,
+                > = std::collections::HashMap::new();
+                for item_id in &ids {
+                    let shard = placement.shard_for_record(item_id);
+                    sub_batches.entry(shard).or_default().push(item_id.clone());
+                }
+                let mut futures = Vec::new();
+                for (shard, shard_ids) in sub_batches {
+                    let ops: Vec<rekha_core::op::Operation> = shard_ids
+                        .into_iter()
+                        .map(|id| rekha_core::op::Operation::Delete { id })
+                        .collect();
+                    let batch_req = crate::ShardBatchRequest {
+                        collection_id: id,
+                        ops,
+                        dimension: 0,
+                    };
+                    let state = state.clone();
+                    futures.push(async move {
+                        crate::dispatch_shard_batch(&state, shard, batch_req).await
+                    });
+                }
+                let _ = futures::future::try_join_all(futures).await?;
+            } else {
+                let engine = state.engine.clone();
+                crate::write_batch(&state, id, move || engine.prepare_delete(&id, &ids)).await?;
+            }
             n
         }
         // Every other shape is a *selection*: ids and/or filters, intersected.
@@ -819,17 +1038,60 @@ pub(crate) async fn query_records_chroma(
     //
     // A query is CPU-bound (scan, distance, rank) and runs on the blocking pool
     // so a large query cannot starve Raft heartbeats on the async workers.
-    let engine = state.engine.clone();
-    let all_results = crate::offload(move || {
-        engine.query_many(
-            &id,
-            &query_embeddings,
-            req.n_results,
-            &opts,
-            include_embeddings,
-        )
-    })
-    .await?;
+    let all_results: Vec<Vec<rekha_engine::ScoredPoint>> = if crate::is_partitioned(&state, &id) {
+        let Some(shards) = state.shards.as_ref() else {
+            return Err(ChromaError::Engine(EngineError::Unavailable(
+                "no shards configured".into(),
+            )));
+        };
+        let shard_count = shards.placement().shard_count();
+        let mut futures = Vec::new();
+        for s in 0..shard_count {
+            let shard = rekha_cluster::ShardId(s);
+            let state = state.clone();
+            let query_req = crate::ShardQueryRequest {
+                collection_id: id,
+                query_embeddings: req.query_embeddings.clone(),
+                n_results: req.n_results,
+                where_filter: req.where_filter.clone(),
+                where_document: req.where_document.clone(),
+                with_embeddings: include_embeddings,
+            };
+            futures
+                .push(async move { crate::dispatch_shard_query(&state, shard, query_req).await });
+        }
+        let shard_results = futures::future::try_join_all(futures).await?;
+        let n_queries = req.query_embeddings.len();
+        let mut merged_queries = Vec::with_capacity(n_queries);
+        for q in 0..n_queries {
+            let mut hits = Vec::new();
+            for shard_res in &shard_results {
+                if let Some(shard_hits) = shard_res.get(q) {
+                    hits.extend(shard_hits.iter().cloned());
+                }
+            }
+            hits.sort_by(|a, b| {
+                a.distance
+                    .total_cmp(&b.distance)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            hits.truncate(req.n_results);
+            merged_queries.push(hits);
+        }
+        merged_queries
+    } else {
+        let engine = state.engine.clone();
+        crate::offload(move || {
+            engine.query_many(
+                &id,
+                &query_embeddings,
+                req.n_results,
+                &opts,
+                include_embeddings,
+            )
+        })
+        .await?
+    };
 
     let mut ids = Vec::with_capacity(all_results.len());
     let mut distances = include_distances.then(Vec::new);
@@ -921,24 +1183,105 @@ pub(crate) async fn get_records_chroma(
     let include_documents = include_refs.contains(&"documents");
     let include_uris = include_refs.contains(&"uris");
 
-    let engine = state.engine.clone();
     let ids = req.ids;
     let where_filter = req.where_filter;
     let where_document = req.where_document;
     let limit = req.limit;
     let offset = req.offset.unwrap_or(0);
     // A filtered `get` scans the collection; keep it off the async workers.
-    let records = crate::offload(move || {
-        engine.get_records(
-            &id,
-            ids.as_deref(),
-            where_filter.as_ref(),
-            where_document.as_ref(),
-            limit,
-            offset,
-        )
-    })
-    .await?;
+    let records: Vec<rekha_engine::Record> = if crate::is_partitioned(&state, &id) {
+        if let Some(ref list_ids) = ids {
+            if list_ids.is_empty() {
+                Vec::new()
+            } else {
+                let Some(shards) = state.shards.as_ref() else {
+                    return Err(ChromaError::Engine(EngineError::Unavailable(
+                        "no shards configured".into(),
+                    )));
+                };
+                let placement = shards.placement();
+                let mut by_shard: std::collections::HashMap<rekha_cluster::ShardId, Vec<String>> =
+                    std::collections::HashMap::new();
+                for item_id in list_ids {
+                    let shard = placement.shard_for_record(item_id);
+                    by_shard.entry(shard).or_default().push(item_id.clone());
+                }
+                let mut futures = Vec::new();
+                for (shard, shard_ids) in by_shard {
+                    let state = state.clone();
+                    let get_req = crate::ShardGetRequest {
+                        collection_id: id,
+                        ids: Some(shard_ids),
+                        where_filter: where_filter.clone(),
+                        where_document: where_document.clone(),
+                        limit: None,
+                        offset: 0,
+                    };
+                    futures.push(
+                        async move { crate::dispatch_shard_get(&state, shard, get_req).await },
+                    );
+                }
+                let shard_records = futures::future::try_join_all(futures).await?;
+                let mut record_map: std::collections::HashMap<String, rekha_engine::Record> =
+                    std::collections::HashMap::new();
+                for list in shard_records {
+                    for r in list {
+                        record_map.insert(r.id.clone(), r);
+                    }
+                }
+                list_ids
+                    .iter()
+                    .filter_map(|item_id| record_map.remove(item_id))
+                    .collect()
+            }
+        } else {
+            let Some(shards) = state.shards.as_ref() else {
+                return Err(ChromaError::Engine(EngineError::Unavailable(
+                    "no shards configured".into(),
+                )));
+            };
+            let shard_count = shards.placement().shard_count();
+            let mut futures = Vec::new();
+            for s in 0..shard_count {
+                let shard = rekha_cluster::ShardId(s);
+                let state = state.clone();
+                let get_req = crate::ShardGetRequest {
+                    collection_id: id,
+                    ids: None,
+                    where_filter: where_filter.clone(),
+                    where_document: where_document.clone(),
+                    limit: None,
+                    offset: 0,
+                };
+                futures
+                    .push(async move { crate::dispatch_shard_get(&state, shard, get_req).await });
+            }
+            let shard_records = futures::future::try_join_all(futures).await?;
+            let mut all_recs = Vec::new();
+            for list in shard_records {
+                all_recs.extend(list);
+            }
+            all_recs.sort_by_key(|r| r.seq);
+            all_recs
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .collect()
+        }
+    } else {
+        let engine = state.engine.clone();
+        crate::offload(move || {
+            engine.get_records(
+                &id,
+                ids.as_deref(),
+                where_filter.as_ref(),
+                where_document.as_ref(),
+                limit,
+                offset,
+            )
+        })
+        .await?
+    };
 
     Ok(Json(ChromaGetResponse {
         ids: records.iter().map(|r| r.id.clone()).collect(),
@@ -974,6 +1317,23 @@ pub(crate) async fn count_records_chroma(
     Path((tenant, database, name)): Path<(String, String, String)>,
 ) -> Result<Json<u64>, ChromaError> {
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
+    if crate::is_partitioned(&state, &id) {
+        let Some(shards) = state.shards.as_ref() else {
+            return Err(ChromaError::Engine(EngineError::Unavailable(
+                "no shards configured".into(),
+            )));
+        };
+        let shard_count = shards.placement().shard_count();
+        let mut futures = Vec::new();
+        for s in 0..shard_count {
+            let shard = rekha_cluster::ShardId(s);
+            let state = state.clone();
+            futures.push(async move { crate::dispatch_shard_count(&state, shard, id).await });
+        }
+        let counts: Vec<u64> = futures::future::try_join_all(futures).await?;
+        let total: u64 = counts.into_iter().sum();
+        return Ok(Json(total));
+    }
     let count = state.engine.count(&id)?;
     Ok(Json(count))
 }

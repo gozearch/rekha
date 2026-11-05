@@ -373,6 +373,12 @@ impl Placement {
     pub fn voters(&self) -> &[u64] {
         &self.voters
     }
+
+    /// Map a record ID to a shard deterministically.
+    pub fn shard_for_record(&self, id: &str) -> ShardId {
+        let hash = stable_hash(id.as_bytes());
+        ShardId((hash % u64::from(self.shard_count)) as u32)
+    }
 }
 
 #[cfg(test)]

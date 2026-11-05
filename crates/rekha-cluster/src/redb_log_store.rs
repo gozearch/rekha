@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use crate::raft_types::RaftTypeConfig;
 
-const LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_log");
+const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const VOTE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_vote");
 const STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_state");
 
@@ -43,6 +43,9 @@ struct SerializedState {
     committed_term: Option<u64>,
     #[serde(default)]
     committed_node: Option<u64>,
+    /// Last committed membership configuration.
+    #[serde(default)]
+    last_membership: Option<openraft::StoredMembership<u64, u64>>,
 }
 
 /// The previous state blob: no committed log id, no purging node.
@@ -95,6 +98,7 @@ pub struct RedbLogStore {
 struct RedbLogStoreInner {
     last_purged: Option<LogId<u64>>,
     committed: Option<LogId<u64>>,
+    last_membership: Option<openraft::StoredMembership<u64, u64>>,
 }
 
 #[derive(Clone)]
@@ -130,8 +134,7 @@ fn read_log_entries(
 
     let mut entries = Vec::new();
     for idx in start..end {
-        let key = idx.to_string();
-        match table.get(key.as_str()) {
+        match table.get(idx) {
             Ok(Some(val)) => {
                 let entry =
                     bincode::deserialize::<Entry<RaftTypeConfig>>(val.value()).map_err(|e| {
@@ -175,20 +178,13 @@ fn find_last_log_id(db: &Database) -> Result<Option<LogId<u64>>, StorageError<u6
         Err(_) => return Ok(None),
     };
 
-    let mut max: Option<LogId<u64>> = None;
-    for entry in table.iter().map_err(io_error)? {
-        let (k, v) = entry.map_err(io_error)?;
-        if let Ok(idx) = k.value().parse::<u64>()
-            && let Ok(entry) = bincode::deserialize::<Entry<RaftTypeConfig>>(v.value())
-        {
-            if max.is_none_or(|m: LogId<u64>| entry.log_id.index > m.index) {
-                max = Some(entry.log_id);
-            }
-            // Also consider the parsed idx as fallback if entry deserialization yields older index
-            let _ = idx;
-        }
+    if let Some(entry) = table.iter().map_err(io_error)?.next_back() {
+        let (_k, v) = entry.map_err(io_error)?;
+        let entry = bincode::deserialize::<Entry<RaftTypeConfig>>(v.value())
+            .map_err(|e| io_error(format!("failed to deserialize last raft entry: {e}")))?;
+        return Ok(Some(entry.log_id));
     }
-    Ok(max)
+    Ok(None)
 }
 
 impl RedbLogStore {
@@ -209,15 +205,17 @@ impl RedbLogStore {
         // Read persisted state. A `state_v2` blob wins; a directory written by
         // an earlier build has only `state`, which carries the purge watermark
         // but no committed log id.
-        let (last_purged, committed) = {
+        let (last_purged, committed, last_membership) = {
             let read_txn = db.begin_read().map_err(io_error)?;
             let mut last_purged = None;
             let mut committed = None;
+            let mut last_membership = None;
             if let Ok(table) = read_txn.open_table(STATE_TABLE) {
                 if let Ok(Some(val)) = table.get(STATE_KEY) {
                     if let Ok(state) = bincode::deserialize::<SerializedState>(val.value()) {
                         last_purged = state.last_purged_log_id();
                         committed = state.committed_log_id();
+                        last_membership = state.last_membership;
                     }
                 } else if let Ok(Some(val)) = table.get(LEGACY_STATE_KEY)
                     && let Ok(state) = bincode::deserialize::<LegacySerializedState>(val.value())
@@ -228,7 +226,7 @@ impl RedbLogStore {
                         decode_log_id(state.last_purged_index, state.last_purged_term, None);
                 }
             }
-            (last_purged, committed)
+            (last_purged, committed, last_membership)
         };
 
         Ok(Self {
@@ -236,6 +234,7 @@ impl RedbLogStore {
             inner: Arc::new(Mutex::new(RedbLogStoreInner {
                 last_purged,
                 committed,
+                last_membership,
             })),
         })
     }
@@ -249,6 +248,7 @@ impl RedbLogStore {
             committed_index: inner.committed.map(|l| l.index),
             committed_term: inner.committed.map(|l| l.leader_id.term),
             committed_node: inner.committed.map(|l| l.leader_id.node_id),
+            last_membership: inner.last_membership.clone(),
         };
         bincode::serialize(&state).map_err(io_error)
     }
@@ -287,6 +287,21 @@ impl RedbLogStore {
     pub async fn purge_watermark(&mut self) -> Option<LogId<u64>> {
         self.inner.lock().await.last_purged
     }
+
+    /// The latest committed membership stored in the log store.
+    pub async fn last_membership(&mut self) -> Option<openraft::StoredMembership<u64, u64>> {
+        self.inner.lock().await.last_membership.clone()
+    }
+
+    /// Persist the latest membership configuration.
+    pub async fn save_membership(
+        &mut self,
+        membership: openraft::StoredMembership<u64, u64>,
+    ) -> Result<(), StorageError<u64>> {
+        let mut inner = self.inner.lock().await;
+        inner.last_membership = Some(membership);
+        self.save_state(&inner)
+    }
 }
 
 impl RaftLogReader<RaftTypeConfig> for RedbLogStore {
@@ -300,10 +315,15 @@ impl RaftLogReader<RaftTypeConfig> for RedbLogStore {
             std::ops::Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            std::ops::Bound::Included(&n) => n + 1,
+            std::ops::Bound::Included(&n) => n.saturating_add(1),
             std::ops::Bound::Excluded(&n) => n,
-            std::ops::Bound::Unbounded => 1_000_000,
+            std::ops::Bound::Unbounded => find_last_log_id(&self.db)?
+                .map(|l| l.index.saturating_add(1))
+                .unwrap_or(start),
         };
+        if end <= start {
+            return Ok(Vec::new());
+        }
         let last_purged = self.inner.lock().await.last_purged.map(|l| l.index);
         read_log_entries(&self.db, last_purged, start, end)
     }
@@ -320,10 +340,15 @@ impl RaftLogReader<RaftTypeConfig> for RedbLogReader {
             std::ops::Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            std::ops::Bound::Included(&n) => n + 1,
+            std::ops::Bound::Included(&n) => n.saturating_add(1),
             std::ops::Bound::Excluded(&n) => n,
-            std::ops::Bound::Unbounded => 1_000_000,
+            std::ops::Bound::Unbounded => find_last_log_id(&self.db)?
+                .map(|l| l.index.saturating_add(1))
+                .unwrap_or(start),
         };
+        if end <= start {
+            return Ok(Vec::new());
+        }
         read_log_entries(&self.db, self.last_purged, start, end)
     }
 }
@@ -382,18 +407,33 @@ impl RaftLogStorage<RaftTypeConfig> for RedbLogStore {
         I::IntoIter: Send,
     {
         let entries: Vec<_> = entries.into_iter().collect();
+        let mut last_membership = None;
+        for entry in &entries {
+            if let openraft::EntryPayload::Membership(m) = &entry.payload {
+                last_membership = Some(openraft::StoredMembership::new(
+                    Some(entry.log_id),
+                    m.clone(),
+                ));
+            }
+        }
+
         let write_txn = self.db.begin_write().map_err(io_error)?;
         {
             let mut table = write_txn.open_table(LOG_TABLE).map_err(io_error)?;
             for entry in &entries {
-                let key = entry.log_id.index.to_string();
+                let key = entry.log_id.index;
                 let bytes = bincode::serialize(entry).map_err(io_error)?;
-                table
-                    .insert(key.as_str(), bytes.as_slice())
-                    .map_err(io_error)?;
+                table.insert(key, bytes.as_slice()).map_err(io_error)?;
             }
         }
         write_txn.commit().map_err(io_error)?;
+
+        if let Some(m) = last_membership {
+            let mut inner = self.inner.lock().await;
+            inner.last_membership = Some(m);
+            self.save_state(&inner)?;
+        }
+
         callback.log_io_completed(Ok(()));
         Ok(())
     }
@@ -402,22 +442,13 @@ impl RaftLogStorage<RaftTypeConfig> for RedbLogStore {
         let write_txn = self.db.begin_write().map_err(io_error)?;
         {
             let mut table = write_txn.open_table(LOG_TABLE).map_err(io_error)?;
-            // Collect keys with index >= log_id.index (numeric comparison).
-            let keys_to_remove: Vec<String> = table
-                .iter()
+            let keys_to_remove: Vec<u64> = table
+                .range(log_id.index..)
                 .map_err(io_error)?
-                .filter_map(|e| {
-                    let (k, _) = e.ok()?;
-                    let idx = k.value().parse::<u64>().ok()?;
-                    if idx >= log_id.index {
-                        Some(k.value().to_owned())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|e| e.ok().map(|(k, _)| k.value()))
                 .collect();
             for key in keys_to_remove {
-                let _ = table.remove(key.as_str());
+                let _ = table.remove(key);
             }
         }
         write_txn.commit().map_err(io_error)?;
@@ -444,21 +475,13 @@ impl RaftLogStorage<RaftTypeConfig> for RedbLogStore {
         let write_txn = self.db.begin_write().map_err(io_error)?;
         {
             let mut table = write_txn.open_table(LOG_TABLE).map_err(io_error)?;
-            let keys_to_remove: Vec<String> = table
-                .iter()
+            let keys_to_remove: Vec<u64> = table
+                .range(..=log_id.index)
                 .map_err(io_error)?
-                .filter_map(|e| {
-                    let (k, _) = e.ok()?;
-                    let idx = k.value().parse::<u64>().ok()?;
-                    if idx <= log_id.index {
-                        Some(k.value().to_owned())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|e| e.ok().map(|(k, _)| k.value()))
                 .collect();
             for key in keys_to_remove {
-                let _ = table.remove(key.as_str());
+                let _ = table.remove(key);
             }
         }
         {
@@ -743,7 +766,7 @@ mod tests {
             let write_txn = store.db.begin_write().unwrap();
             {
                 let mut table = write_txn.open_table(LOG_TABLE).unwrap();
-                table.remove("2").unwrap();
+                table.remove(2u64).unwrap();
             }
             write_txn.commit().unwrap();
         }
@@ -812,5 +835,30 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let state = rt.block_on(store.get_log_state()).unwrap();
         assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(9));
+    }
+
+    #[test]
+    fn membership_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft_log.redb");
+        let members: std::collections::BTreeSet<u64> = [1, 2, 3].into_iter().collect();
+        let membership = openraft::StoredMembership::new(
+            Some(make_log_id(5)),
+            openraft::Membership::new(vec![members], ()),
+        );
+
+        {
+            let mut store = RedbLogStore::open(&path).unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(store.save_membership(membership.clone()))
+                .unwrap();
+        }
+
+        {
+            let mut store = RedbLogStore::open(&path).unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let loaded = rt.block_on(store.last_membership());
+            assert_eq!(loaded, Some(membership));
+        }
     }
 }

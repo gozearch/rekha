@@ -23,11 +23,11 @@ use crate::raft_types::RaftTypeConfig;
 
 /// The consensus groups this node runs.
 pub struct ShardCluster {
-    placement: Arc<Placement>,
+    placement: parking_lot::RwLock<Arc<Placement>>,
     /// Only groups this node votes on. A node that is not an owner of a shard
     /// has no instance for it, which is what makes "not my data" structural
     /// rather than a check that could be forgotten.
-    groups: HashMap<ShardId, Arc<Raft<RaftTypeConfig>>>,
+    groups: parking_lot::RwLock<HashMap<ShardId, Arc<Raft<RaftTypeConfig>>>>,
     /// Collections this process has already ensured exist in their shard
     /// group's log.
     ///
@@ -49,20 +49,35 @@ impl ShardCluster {
     /// A registry with no groups yet.
     pub fn new(placement: Arc<Placement>) -> Self {
         Self {
-            placement,
-            groups: HashMap::new(),
+            placement: parking_lot::RwLock::new(placement),
+            groups: parking_lot::RwLock::new(HashMap::new()),
             ensured: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
     /// Register an instance for `shard`.
-    pub fn insert(&mut self, shard: ShardId, raft: Arc<Raft<RaftTypeConfig>>) {
-        self.groups.insert(shard, raft);
+    pub fn insert(&self, shard: ShardId, raft: Arc<Raft<RaftTypeConfig>>) {
+        self.groups.write().insert(shard, raft);
+    }
+
+    /// Remove an instance for `shard`.
+    pub fn remove(&self, shard: ShardId) -> Option<Arc<Raft<RaftTypeConfig>>> {
+        self.groups.write().remove(&shard)
     }
 
     /// The placement this cluster runs by.
-    pub fn placement(&self) -> &Arc<Placement> {
-        &self.placement
+    pub fn placement(&self) -> Arc<Placement> {
+        self.placement.read().clone()
+    }
+
+    /// Update the placement dynamically.
+    pub fn set_placement(&self, placement: Arc<Placement>) {
+        *self.placement.write() = placement;
+    }
+
+    /// The owners of `shard`.
+    pub fn owners(&self, shard: ShardId) -> Vec<u64> {
+        self.placement.read().owners(shard).to_vec()
     }
 
     /// The group id used on the wire for `shard`.
@@ -73,17 +88,17 @@ impl ShardCluster {
 
     /// Whether this node runs a consensus group for `shard`.
     pub fn hosts(&self, shard: ShardId) -> bool {
-        self.groups.contains_key(&shard)
+        self.groups.read().contains_key(&shard)
     }
 
     /// This node's `Raft` instance for `shard`, if it hosts one.
     pub fn raft(&self, shard: ShardId) -> Option<Arc<Raft<RaftTypeConfig>>> {
-        self.groups.get(&shard).cloned()
+        self.groups.read().get(&shard).cloned()
     }
 
     /// Shards this node hosts, ascending, for metrics and status.
     pub fn shards(&self) -> Vec<ShardId> {
-        let mut shards: Vec<ShardId> = self.groups.keys().copied().collect();
+        let mut shards: Vec<ShardId> = self.groups.read().keys().copied().collect();
         shards.sort_unstable();
         shards
     }
@@ -94,7 +109,7 @@ impl ShardCluster {
     /// loss. Callers must treat that as "retry later", never as "use a default
     /// node".
     pub fn leader(&self, shard: ShardId) -> Option<u64> {
-        let raft = self.groups.get(&shard)?;
+        let raft = self.groups.read().get(&shard)?.clone();
         let metrics = raft.metrics();
         let m = metrics.borrow();
         m.current_leader

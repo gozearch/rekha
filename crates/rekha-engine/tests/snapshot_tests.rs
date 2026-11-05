@@ -322,7 +322,7 @@ fn restoring_replaces_a_divergent_collection() {
 
     assert_eq!(target.count(&cid).unwrap(), 5);
     assert!(
-        !target.get(&cid, &["stale".to_string()]).unwrap()[0].is_some(),
+        target.get(&cid, &["stale".to_string()]).unwrap()[0].is_none(),
         "the stale record must be gone after a restore"
     );
 }

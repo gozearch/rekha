@@ -355,6 +355,13 @@ async fn shard_route(state: &AppState, collection: uuid::Uuid) -> Route {
     // A collection's shard comes from its catalog row, not from its id. The
     // metadata leader chose it for load, so no hash can reproduce it.
     let Some(shard) = state.shard_of(&collection) else {
+        if let Ok(Some(rec)) = state.engine.get_collection_by_id(&collection)
+            && rec.shard.is_none()
+        {
+            // An intra-collection partitioned collection: any node can coordinate
+            // fan-out writes and scatter-gather queries across all shards.
+            return Route::Here;
+        }
         return Route::Nowhere;
     };
     let Some(raft) = shards.raft(shard) else {
@@ -447,17 +454,18 @@ async fn forward_to_replica(
     collection: uuid::Uuid,
     next_hop: u8,
 ) -> Response {
-    let owners: &[u64] = match state.shards.as_ref() {
+    let owners_owned: Vec<u64> = match state.shards.as_ref() {
         // The owners of the shard the collection was placed on. Unknown shard
         // (the create has not reached this node yet) is not a guess: it is
         // "retry", which is what the caller's 503 means.
         Some(shards) => state
             .shard_of(&collection)
-            .map_or(&[], |shard| shards.placement().owners(shard)),
+            .map_or(Vec::new(), |shard| shards.owners(shard)),
         // No placement information: one group, and `hosts_collection` already
         // said this node is not in it. That cannot be routed.
-        None => &[],
+        None => Vec::new(),
     };
+    let owners = owners_owned.as_slice();
     let Some(first) = owners.first().copied() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

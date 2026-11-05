@@ -464,6 +464,20 @@ impl WhereDocument {
     }
 }
 
+impl Serialize for WhereDocument {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Contains(s) => map.serialize_entry("$contains", s)?,
+            Self::NotContains(s) => map.serialize_entry("$not_contains", s)?,
+            Self::And(v) => map.serialize_entry("$and", v)?,
+            Self::Or(v) => map.serialize_entry("$or", v)?,
+        }
+        map.end()
+    }
+}
+
 impl<'de> Deserialize<'de> for WhereDocument {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]

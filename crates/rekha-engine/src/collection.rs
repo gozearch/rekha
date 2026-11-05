@@ -33,6 +33,7 @@ use crate::{
 /// are all derived from.
 pub(crate) struct Collection {
     pub(crate) config: CollectionConfig,
+    pub(crate) shard: Option<rekha_core::cluster::ShardId>,
     pub(crate) wal: Wal,
     /// All live records (metadata + document + current embedding).
     pub(crate) records: HashMap<Id, Record>,
@@ -397,28 +398,33 @@ impl Collection {
     /// checkpointed and its generation is now missing".
     pub(crate) fn open(
         id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
         config: CollectionConfig,
         wal_dir: &Path,
         epoch: Epoch,
         fsync: bool,
         durable_seq: u64,
     ) -> EngineResult<Self> {
-        let checkpoint_dir = wal_dir.join(format!("{id}.checkpoint"));
+        let stem = match shard {
+            Some(s) => format!("{id}.shard-{}", s.0),
+            None => id.to_string(),
+        };
+        let checkpoint_dir = wal_dir.join(format!("{stem}.checkpoint"));
 
         // Inspect before anything is opened for writing. Opening the log used to
         // repair (truncate) it before the checkpoint was even read, so the
         // decision to discard records was taken without knowing whether the
         // checkpoint already covered them.
-        let inspection = Wal::inspect(wal_dir, id)?;
+        let inspection = Wal::inspect_named(wal_dir, &stem)?;
         let load = Self::read_generation(&checkpoint_dir, &config);
 
         // Decide, from all the evidence together, how the log may be treated and
         // where replay must resume.
         let (repair, replay_after) = Self::recovery_plan(id, durable_seq, &inspection, &load)?;
 
-        let wal = Wal::open(
+        let wal = Wal::open_named(
             wal_dir,
-            id,
+            &stem,
             epoch,
             WalOptions {
                 fsync,
@@ -426,7 +432,7 @@ impl Collection {
             },
             repair,
         )?;
-        let mut coll = Self::with_wal(config, wal_dir, fsync, wal)?;
+        let mut coll = Self::with_wal(config, shard, wal_dir, fsync, wal)?;
 
         match load {
             CheckpointLoad::Loaded(generation) => {
@@ -457,14 +463,20 @@ impl Collection {
     /// one had already modified.
     fn with_wal(
         config: CollectionConfig,
+        shard: Option<rekha_core::cluster::ShardId>,
         wal_dir: &Path,
         fsync: bool,
         wal: Wal,
     ) -> EngineResult<Self> {
-        let checkpoint_dir = wal_dir.join(format!("{}.checkpoint", config.id));
+        let stem = match shard {
+            Some(s) => format!("{}.shard-{}", config.id, s.0),
+            None => config.id.to_string(),
+        };
+        let checkpoint_dir = wal_dir.join(format!("{stem}.checkpoint"));
         let index = UsearchIndex::with_hnsw(config.space, config.dimension, &config.hnsw)?;
         Ok(Self {
             config,
+            shard,
             wal,
             records: HashMap::new(),
             buffer: Vec::new(),
@@ -944,9 +956,13 @@ impl Collection {
         // empty and must continue appending where the checkpoint left off).
         let epoch = Epoch(self.wal.epoch());
         let id = self.config.id;
-        self.wal = Wal::open(
+        let stem = match self.shard {
+            Some(s) => format!("{id}.shard-{}", s.0),
+            None => id.to_string(),
+        };
+        self.wal = Wal::open_named(
             &self.wal_dir,
-            &id,
+            &stem,
             epoch,
             WalOptions {
                 fsync: self.fsync,

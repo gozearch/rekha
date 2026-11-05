@@ -86,7 +86,6 @@ pub mod segment;
 mod snapshot;
 
 use std::collections::HashMap;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -356,7 +355,7 @@ pub struct Record {
 
 /// One query result. Distances follow Chroma semantics: **lower = closer**
 /// (L2 = squared Euclidean, IP = `1 - dot`, Cosine = `1 - cos_sim`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoredPoint {
     /// Record id.
     pub id: Id,
@@ -371,6 +370,11 @@ pub struct ScoredPoint {
     /// Only populated when the caller asked for embeddings. Fetching it in a
     /// second call after the lock was released allowed a concurrent write to
     /// pair a distance from one vector version with an embedding from another.
+    #[serde(
+        default,
+        serialize_with = "rekha_core::types::embedding_serde::serialize_opt",
+        deserialize_with = "rekha_core::types::embedding_serde::deserialize_opt"
+    )]
     pub embedding: Option<Embedding>,
 }
 
@@ -540,7 +544,20 @@ pub struct Engine {
     /// `{collection_id}.checkpoint/` directory per collection.
     wal_dir: PathBuf,
     config: EngineConfig,
-    collections: RwLock<HashMap<Uuid, Arc<Mutex<Collection>>>>,
+    collections: RwLock<HashMap<PartitionKey, Arc<Mutex<Collection>>>>,
+}
+
+/// Key identifying a partition of a collection on a specific shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PartitionKey {
+    pub id: Uuid,
+    pub shard: Option<rekha_core::cluster::ShardId>,
+}
+
+impl PartitionKey {
+    pub fn new(id: Uuid, shard: Option<rekha_core::cluster::ShardId>) -> Self {
+        Self { id, shard }
+    }
 }
 
 impl Engine {
@@ -591,24 +608,54 @@ impl Engine {
         let wal_dir = wal_dir.as_ref().to_path_buf();
         let mut collections = HashMap::new();
         for record in catalog.list_collections_all()? {
-            // Placement decides what lives on this node. A row for a collection
-            // this node does not replicate is metadata: it is needed to answer
-            // "does this collection exist" and to route, and opening it here
-            // would put the data on every node, which is the thing sharding
-            // removes.
-            if !config.scope.owns(record.shard) {
-                continue;
-            }
             let id = record.config.id;
-            let collection = Collection::open(
-                &id,
-                record.config,
-                &wal_dir,
-                config.epoch,
-                config.durability.is_durable(),
-                record.max_seq_id,
-            )?;
-            collections.insert(id, Arc::new(Mutex::new(collection)));
+            match &config.scope {
+                EngineScope::All => {
+                    let key = PartitionKey::new(id, record.shard);
+                    let collection = Collection::open(
+                        &id,
+                        record.shard,
+                        record.config,
+                        &wal_dir,
+                        config.epoch,
+                        config.durability.is_durable(),
+                        record.max_seq_id,
+                    )?;
+                    collections.insert(key, Arc::new(Mutex::new(collection)));
+                }
+                EngineScope::Shards(hosted) => {
+                    if let Some(shard) = record.shard {
+                        if hosted.contains(&shard) {
+                            let key = PartitionKey::new(id, Some(shard));
+                            let collection = Collection::open(
+                                &id,
+                                Some(shard),
+                                record.config,
+                                &wal_dir,
+                                config.epoch,
+                                config.durability.is_durable(),
+                                record.max_seq_id,
+                            )?;
+                            collections.insert(key, Arc::new(Mutex::new(collection)));
+                        }
+                    } else {
+                        // Intra-collection sharded across all shards: open partition for each hosted shard
+                        for &shard in hosted {
+                            let key = PartitionKey::new(id, Some(shard));
+                            let collection = Collection::open(
+                                &id,
+                                Some(shard),
+                                record.config.clone(),
+                                &wal_dir,
+                                config.epoch,
+                                config.durability.is_durable(),
+                                record.max_seq_id,
+                            )?;
+                            collections.insert(key, Arc::new(Mutex::new(collection)));
+                        }
+                    }
+                }
+            }
         }
         Ok(Self {
             catalog,
@@ -647,9 +694,37 @@ impl Engine {
     /// Idempotent: already-open is a no-op. Reads the catalog row rather than
     /// taking a config so a replica materializes exactly what was recorded.
     pub fn materialize_collection(&self, id: &Uuid) -> EngineResult<()> {
+        match &self.config.scope {
+            EngineScope::All => self.materialize_collection_partition(id, None),
+            EngineScope::Shards(hosted) => {
+                let record = self
+                    .catalog
+                    .get_collection_by_id(id)?
+                    .ok_or_else(|| EngineError::CollectionNotFound(id.to_string()))?;
+                if let Some(shard) = record.shard {
+                    if hosted.contains(&shard) {
+                        self.materialize_collection_partition(id, Some(shard))?;
+                    }
+                } else {
+                    for &shard in hosted {
+                        self.materialize_collection_partition(id, Some(shard))?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Open a specific partition of a recorded collection on this node.
+    pub fn materialize_collection_partition(
+        &self,
+        id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+    ) -> EngineResult<()> {
+        let key = PartitionKey::new(*id, shard);
         {
             let map = self.collections.read();
-            if map.contains_key(id) {
+            if map.contains_key(&key) {
                 return Ok(());
             }
         }
@@ -657,22 +732,58 @@ impl Engine {
             .catalog
             .get_collection_by_id(id)?
             .ok_or_else(|| EngineError::CollectionNotFound(id.to_string()))?;
-        // Recheck under the write lock: two concurrent readers can both pass the
-        // check above, and the loser must not replace a live collection (which
-        // would drop its in-memory state and re-open the WAL underneath it).
         let mut map = self.collections.write();
-        if map.contains_key(id) {
+        if map.contains_key(&key) {
             return Ok(());
         }
         let collection = Collection::open(
             id,
+            shard,
             record.config,
             &self.wal_dir,
             self.config.epoch,
             self.config.durability.is_durable(),
             record.max_seq_id,
         )?;
-        map.insert(*id, Arc::new(Mutex::new(collection)));
+        map.insert(key, Arc::new(Mutex::new(collection)));
+        Ok(())
+    }
+
+    /// Drop a specific partition from memory and remove its files.
+    pub fn drop_collection_partition(
+        &self,
+        id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+    ) -> EngineResult<()> {
+        let key = PartitionKey::new(*id, shard);
+        {
+            let mut map = self.collections.write();
+            map.remove(&key);
+        }
+        let stem = match shard {
+            Some(s) => format!("{id}.shard-{}", s.0),
+            None => id.to_string(),
+        };
+        let wal_path = self.wal_dir.join(format!("{stem}.wal"));
+        let _ = std::fs::remove_file(&wal_path);
+        let checkpoint_path = self.wal_dir.join(format!("{stem}.checkpoint"));
+        let _ = std::fs::remove_dir_all(&checkpoint_path);
+        Ok(())
+    }
+
+    /// Materialize all collection partitions for a newly hosted shard.
+    pub fn materialize_shard(&self, shard: rekha_core::cluster::ShardId) -> EngineResult<()> {
+        for record in self.catalog.list_collections_all()? {
+            self.materialize_collection_partition(&record.config.id, Some(shard))?;
+        }
+        Ok(())
+    }
+
+    /// Drop all collection partitions for a decommissioned or moved shard.
+    pub fn drop_shard(&self, shard: rekha_core::cluster::ShardId) -> EngineResult<()> {
+        for record in self.catalog.list_collections_all()? {
+            self.drop_collection_partition(&record.config.id, Some(shard))?;
+        }
         Ok(())
     }
 
@@ -713,30 +824,39 @@ impl Engine {
             Ok(()) | Err(CatalogError::NotFound) => {}
             Err(e) => return Err(e.into()),
         }
-        {
-            let mut map = self.collections.write();
-            map.remove(id);
+        let to_drop: Vec<PartitionKey> = {
+            let map = self.collections.read();
+            map.keys().filter(|k| k.id == *id).copied().collect()
+        };
+        for key in to_drop {
+            self.drop_collection_partition(&key.id, key.shard)?;
         }
-        let wal_path = self.wal_dir.join(format!("{id}.wal"));
-        match std::fs::remove_file(&wal_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(EngineError::Wal(e.into())),
-        }
-        let checkpoint_path = self.wal_dir.join(format!("{id}.checkpoint"));
-        match std::fs::remove_dir_all(&checkpoint_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(EngineError::Io(e)),
-        }
+        let _ = self.drop_collection_partition(id, None);
         Ok(())
     }
 
-    /// Number of live records in the collection.
+    /// Number of live records in the collection across all local partitions.
     pub fn count(&self, collection_id: &Uuid) -> EngineResult<u64> {
-        let coll = self.collection(collection_id)?;
-        let coll = coll.lock();
-        Ok(coll.records.len() as u64)
+        let partitions = self.collection_partitions(collection_id);
+        if partitions.is_empty() {
+            let coll = self.collection(collection_id)?;
+            return Ok(coll.lock().records.len() as u64);
+        }
+        let mut total = 0u64;
+        for (_, p) in partitions {
+            total += p.lock().records.len() as u64;
+        }
+        Ok(total)
+    }
+
+    /// Number of live records in a specific partition.
+    pub fn count_partition(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+    ) -> EngineResult<u64> {
+        let coll = self.collection_partition(collection_id, shard)?;
+        Ok(coll.lock().records.len() as u64)
     }
 
     /// Number of live records, or `None` when this node is not a replica.
@@ -745,15 +865,21 @@ impl Engine {
     /// copy cannot count, and answering `0` there is a wrong answer that looks
     /// like an empty collection. Callers that need a number must route instead.
     pub fn count_local(&self, collection_id: &Uuid) -> EngineResult<Option<u64>> {
-        if !self.collections.read().contains_key(collection_id) {
+        let partitions = self.collection_partitions(collection_id);
+        if partitions.is_empty() {
             let Some(record) = self.catalog.get_collection_by_id(collection_id)? else {
                 return Err(EngineError::CollectionNotFound(collection_id.to_string()));
             };
             if !self.config.scope.owns(record.shard) {
                 return Ok(None);
             }
+            return Ok(Some(0));
         }
-        Ok(Some(self.count(collection_id)?))
+        let mut total = 0u64;
+        for (_, part) in partitions {
+            total += part.lock().records.len() as u64;
+        }
+        Ok(Some(total))
     }
 
     /// Add brand-new records. The whole batch is validated first (counts match,
@@ -906,9 +1032,6 @@ impl Engine {
     // complete values instead.
 
     /// Build the operations an `add` would produce, without applying them.
-    ///
-    /// Validates exactly as [`Engine::add`] does, and infers the vector width if
-    /// the collection has not fixed one yet.
     pub fn prepare_add(
         &self,
         collection_id: &Uuid,
@@ -922,6 +1045,24 @@ impl Engine {
         coll.validate_add(ids, embeddings, metadatas, documents)?;
         let dimension = self.infer_dimension(&mut coll, collection_id, embeddings)?;
         let ops = add_ops(ids, embeddings, metadatas, documents);
+        Ok(PreparedBatch { ops, dimension })
+    }
+
+    /// Build the operations an `upsert` would produce on a specific partition.
+    pub fn prepare_upsert_partition(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        ids: &[Id],
+        embeddings: &[Embedding],
+        metadatas: Option<&[Option<MetadataPatch>]>,
+        documents: Option<&[Option<Document>]>,
+    ) -> EngineResult<PreparedBatch> {
+        let coll = self.collection_partition(collection_id, shard)?;
+        let mut coll = coll.lock();
+        coll.validate_upsert(ids, embeddings, metadatas, documents)?;
+        let dimension = self.infer_dimension(&mut coll, collection_id, embeddings)?;
+        let ops = resolve_upsert_ops(&coll, ids, embeddings, metadatas, documents);
         Ok(PreparedBatch { ops, dimension })
     }
 
@@ -939,6 +1080,36 @@ impl Engine {
         coll.validate_upsert(ids, embeddings, metadatas, documents)?;
         let dimension = self.infer_dimension(&mut coll, collection_id, embeddings)?;
         let ops = resolve_upsert_ops(&coll, ids, embeddings, metadatas, documents);
+        Ok(PreparedBatch { ops, dimension })
+    }
+
+    /// Build the operations an `update` would produce on a specific partition.
+    pub fn prepare_update_partition(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        ids: &[Id],
+        embeddings: Option<&[Embedding]>,
+        metadatas: Option<&[Option<MetadataPatch>]>,
+        documents: Option<&[Option<Document>]>,
+    ) -> EngineResult<PreparedBatch> {
+        let coll = self.collection_partition(collection_id, shard)?;
+        let coll = coll.lock();
+        if let Some(embeddings) = embeddings
+            && embeddings.len() != ids.len()
+        {
+            return Err(EngineError::Validation(format!(
+                "update: {} ids but {} embeddings",
+                ids.len(),
+                embeddings.len()
+            )));
+        }
+        coll.validate_update(ids, metadatas, documents)?;
+        if let Some(embeddings) = embeddings {
+            crate::collection::check_dimensions("update", embeddings, coll.config.dimension)?;
+        }
+        let dimension = coll.config.dimension;
+        let ops = resolve_update_ops(&coll, ids, embeddings, metadatas, documents);
         Ok(PreparedBatch { ops, dimension })
     }
 
@@ -987,13 +1158,6 @@ impl Engine {
 
     /// Prepare a delete whose target set is chosen by filters rather than
     /// listed by the caller.
-    ///
-    /// Selection and preparation happen under **one** collection lock. Doing it
-    /// in two steps — read the matching ids, then delete them — leaves a window
-    /// in which a concurrent write lands and is either deleted by a filter that
-    /// no longer describes the state, or spared from one that does. Returns a
-    /// batch containing one delete per id that exists and matches, so the caller
-    /// can report the count it actually removed.
     pub fn prepare_delete_where(
         &self,
         collection_id: &Uuid,
@@ -1005,10 +1169,6 @@ impl Engine {
         let coll = self.collection(collection_id)?;
         let coll = coll.lock();
         let mut ids = coll.select(ids, filter, document);
-        // Chroma's `delete` takes a `limit`. Ignoring it deleted every match,
-        // which turns a "delete one matching record" call into a bulk removal.
-        // The truncation happens under the same lock as the selection so the
-        // limit counts records, not whatever survived a concurrent write.
         if let Some(limit) = limit {
             ids.truncate(limit);
         }
@@ -1028,13 +1188,16 @@ impl Engine {
     /// A per-collection failure is logged and skipped so one bad shard does
     /// not stop the others.
     pub fn checkpoint_if_due(&self) -> EngineResult<usize> {
-        let handles: Vec<(Uuid, Arc<Mutex<Collection>>)> = {
+        let handles: Vec<(PartitionKey, Arc<Mutex<Collection>>)> = {
             let collections = self.collections.read();
-            collections.iter().map(|(id, c)| (*id, c.clone())).collect()
+            collections
+                .iter()
+                .map(|(key, c)| (*key, c.clone()))
+                .collect()
         };
 
         let mut ran = 0;
-        for (id, handle) in handles {
+        for (key, handle) in handles {
             let mut collection = handle.lock();
             if !collection.checkpoint_due() {
                 continue;
@@ -1042,10 +1205,10 @@ impl Engine {
             match collection.checkpoint(self.catalog.as_ref()) {
                 Ok(_) => {
                     ran += 1;
-                    tracing::debug!(%id, "background checkpoint complete");
+                    tracing::debug!(?key, "background checkpoint complete");
                 }
                 Err(e) => {
-                    tracing::warn!(%id, "background checkpoint failed; WAL tail retained: {e}");
+                    tracing::warn!(?key, "background checkpoint failed; WAL tail retained: {e}");
                 }
             }
         }
@@ -1183,30 +1346,21 @@ impl Engine {
             .collect())
     }
 
-    /// Unified record read used by the compatibility layer: optional explicit
-    /// ids, optional metadata filter, optional offset/limit.
-    ///
-    /// * `ids = Some(..)` preserves the caller's order; unknown ids are dropped
-    ///   (the positional `get` API keeps `None` for missing ids instead).
-    /// * `ids = None` scans every live record in insertion order.
-    /// * `filter` is applied last, using the same predicate the postings index
-    ///   is compiled from, so results agree with `query`.
-    pub fn get_records(
+    /// Fetch records from a specific partition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_records_partition(
         &self,
         collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
         ids: Option<&[Id]>,
         filter: Option<&WhereFilter>,
         document: Option<&WhereDocument>,
         limit: Option<usize>,
         offset: usize,
     ) -> EngineResult<Vec<Record>> {
-        let coll = self.collection(collection_id)?;
+        let coll = self.collection_partition(collection_id, shard)?;
         let coll = coll.lock();
 
-        // Chroma returns records in **insertion order**, including for an
-        // explicit id list: `get(ids=["b","z","a"])` yields `z,a,b` order, not
-        // the order the caller listed. Callers that want their own ordering
-        // re-order the response themselves.
         let mut selected: Vec<Id> = match ids {
             Some(ids) => {
                 let mut wanted: Vec<Id> = ids
@@ -1245,6 +1399,86 @@ impl Engine {
             .collect())
     }
 
+    /// Unified record read used by the compatibility layer: optional explicit
+    /// ids, optional metadata filter, optional offset/limit.
+    ///
+    /// * `ids = Some(..)` preserves the caller's order; unknown ids are dropped
+    ///   (the positional `get` API keeps `None` for missing ids instead).
+    /// * `ids = None` scans every live record in insertion order.
+    /// * `filter` is applied last, using the same predicate the postings index
+    ///   is compiled from, so results agree with `query`.
+    pub fn get_records(
+        &self,
+        collection_id: &Uuid,
+        ids: Option<&[Id]>,
+        filter: Option<&WhereFilter>,
+        document: Option<&WhereDocument>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> EngineResult<Vec<Record>> {
+        let partitions = self.collection_partitions(collection_id);
+        if partitions.is_empty() || partitions.len() == 1 {
+            return self.get_records_partition(
+                collection_id,
+                None,
+                ids,
+                filter,
+                document,
+                limit,
+                offset,
+            );
+        }
+
+        // Multi-partition local read: merge records across all partitions
+        let mut all_records = Vec::new();
+        for (shard, _) in partitions {
+            let recs =
+                self.get_records_partition(collection_id, shard, ids, filter, document, None, 0)?;
+            all_records.extend(recs);
+        }
+        all_records.sort_by_key(|r| r.seq);
+        all_records.dedup_by(|a, b| a.id == b.id);
+        let paged: Vec<Record> = all_records
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect();
+        Ok(paged)
+    }
+
+    /// k-NN search on a specific partition.
+    pub fn query_partition(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        embedding: &Embedding,
+        k: usize,
+        options: &QueryOptions,
+    ) -> EngineResult<Vec<ScoredPoint>> {
+        let coll = self.collection_partition(collection_id, shard)?;
+        let coll = coll.lock();
+        coll.query(embedding, k, options, false)
+    }
+
+    /// Run several query vectors against **one** read view of a partition.
+    pub fn query_many_partition(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        embeddings: &[Embedding],
+        k: usize,
+        options: &QueryOptions,
+        with_embedding: bool,
+    ) -> EngineResult<Vec<Vec<ScoredPoint>>> {
+        let coll = self.collection_partition(collection_id, shard)?;
+        let coll = coll.lock();
+        let mut out = Vec::with_capacity(embeddings.len());
+        for embedding in embeddings {
+            out.push(coll.query(embedding, k, options, with_embedding)?);
+        }
+        Ok(out)
+    }
+
     /// k-NN search. `k` is clamped to `>= 1`; `ef` of `0` selects
     /// `config.hnsw.ef_search`. With `options.where_filter` set, only records
     /// whose metadata matches are candidates (eligibility, not ranking); the
@@ -1260,9 +1494,24 @@ impl Engine {
         k: usize,
         options: &QueryOptions,
     ) -> EngineResult<Vec<ScoredPoint>> {
-        let coll = self.collection(collection_id)?;
-        let coll = coll.lock();
-        coll.query(embedding, k, options, false)
+        let partitions = self.collection_partitions(collection_id);
+        if partitions.is_empty() || partitions.len() == 1 {
+            let coll = self.collection(collection_id)?;
+            let coll = coll.lock();
+            return coll.query(embedding, k, options, false);
+        }
+        let mut all_hits = Vec::new();
+        for (shard, _) in partitions {
+            let hits = self.query_partition(collection_id, shard, embedding, k, options)?;
+            all_hits.extend(hits);
+        }
+        all_hits.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        all_hits.truncate(k);
+        Ok(all_hits)
     }
 
     /// Run several query vectors against **one** read view.
@@ -1332,23 +1581,24 @@ impl Engine {
     /// openraft treats an error from the state machine as fatal for the store.
     /// Everything that can be rejected (dimension, duplicates, batch size) is
     /// validated by the leader before the entry is proposed.
-    pub fn apply_committed(
+    /// Apply a batch of operations that are already durable elsewhere into a specific partition.
+    pub fn apply_committed_partition(
         &self,
         collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
         ops: &[Operation],
         seq: u64,
         dimension: usize,
     ) -> EngineResult<()> {
         if self.config.apply_mode != ApplyMode::Committed {
             return Err(EngineError::Validation(format!(
-                "collection {collection_id}: apply_committed requires ApplyMode::Committed;                  this engine is its own durable record, so skipping the WAL would lose                  acknowledged writes"
+                "collection {collection_id}: apply_committed requires ApplyMode::Committed; \
+                 this engine is its own durable record, so skipping the WAL would lose \
+                 acknowledged writes"
             )));
         }
-        let coll = self.collection(collection_id)?;
+        let coll = self.collection_partition(collection_id, shard)?;
         let mut coll = coll.lock();
-        // A collection created without an explicit dimension infers it from the
-        // first write. The leader inferred it before proposing; adopt the same
-        // width here so the index is built identically on every node.
         if coll.config.dimension == 0 && dimension > 0 {
             coll.adopt_dimension(dimension)?;
         }
@@ -1360,18 +1610,60 @@ impl Engine {
         Ok(())
     }
 
-    /// Clone the collection handle, releasing the map read lock before any
-    /// collection mutex is taken (lock ordering: never nest collection locks).
-    fn collection(&self, id: &Uuid) -> EngineResult<Arc<Mutex<Collection>>> {
-        if let Some(collection) = self.collections.read().get(id).cloned() {
+    /// Apply a batch of operations that are already durable elsewhere.
+    pub fn apply_committed(
+        &self,
+        collection_id: &Uuid,
+        ops: &[Operation],
+        seq: u64,
+        dimension: usize,
+    ) -> EngineResult<()> {
+        self.apply_committed_partition(collection_id, None, ops, seq, dimension)
+    }
+
+    /// Clone the collection handle for a specific partition.
+    pub(crate) fn collection_partition(
+        &self,
+        id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+    ) -> EngineResult<Arc<Mutex<Collection>>> {
+        let key = PartitionKey::new(*id, shard);
+        if let Some(collection) = self.collections.read().get(&key).cloned() {
             return Ok(collection);
         }
 
-        // Not open. Three cases, and they must not be confused:
-        //  - no catalog row          -> the collection does not exist
-        //  - row, this node owns it  -> a replica that has not materialized yet;
-        //                               open it, it is simply empty so far
-        //  - row, this node does not -> a routing bug; say so
+        let Some(record) = self.catalog.get_collection_by_id(id)? else {
+            return Err(EngineError::CollectionNotFound(id.to_string()));
+        };
+        if !self.config.scope.owns(shard.or(record.shard)) {
+            return Err(EngineError::NotReplica {
+                collection: id.to_string(),
+                shard: shard.or(record.shard),
+            });
+        }
+        self.materialize_collection_partition(id, shard)?;
+        self.collections
+            .read()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| EngineError::CollectionNotFound(id.to_string()))
+    }
+
+    /// Clone all partition handles for a collection on this node.
+    pub(crate) fn collection_partitions(
+        &self,
+        id: &Uuid,
+    ) -> Vec<(Option<rekha_core::cluster::ShardId>, Arc<Mutex<Collection>>)> {
+        let map = self.collections.read();
+        map.iter()
+            .filter(|(k, _)| k.id == *id)
+            .map(|(k, v)| (k.shard, v.clone()))
+            .collect()
+    }
+
+    /// Clone the collection handle, releasing the map read lock before any
+    /// collection mutex is taken (lock ordering: never nest collection locks).
+    fn collection(&self, id: &Uuid) -> EngineResult<Arc<Mutex<Collection>>> {
         let Some(record) = self.catalog.get_collection_by_id(id)? else {
             return Err(EngineError::CollectionNotFound(id.to_string()));
         };
@@ -1381,12 +1673,25 @@ impl Engine {
                 shard: record.shard,
             });
         }
+        let key = PartitionKey::new(*id, record.shard);
+        if let Some(collection) = self.collections.read().get(&key).cloned() {
+            return Ok(collection);
+        }
+        for (k, c) in self.collections.read().iter() {
+            if k.id == *id {
+                return Ok(c.clone());
+            }
+        }
         self.materialize_collection(id)?;
-        self.collections
-            .read()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| EngineError::CollectionNotFound(id.to_string()))
+        if let Some(collection) = self.collections.read().get(&key).cloned() {
+            return Ok(collection);
+        }
+        for (k, c) in self.collections.read().iter() {
+            if k.id == *id {
+                return Ok(c.clone());
+            }
+        }
+        Err(EngineError::CollectionNotFound(id.to_string()))
     }
 
     /// The directory this engine owns: collection WALs, checkpoint generations,
@@ -1400,29 +1705,21 @@ impl Engine {
         &self.wal_dir
     }
 
-    /// Create a snapshot of all collection state for replication.
-    ///
-    /// Produces a framed archive of each collection's *active checkpoint
-    /// generation* plus its catalog row, with `state` embedded verbatim. See
-    /// [`crate::snapshot`] for the format and why it copies bytes instead of
-    /// describing records.
-    ///
-    /// The reason is not stylistic. Once a vector is flushed into a segment the
-    /// in-memory record map drops its copy (`collection.rs`, "Vectors now live
-    /// in the segment; drop the inline copies"), so a records-only snapshot
-    /// restores a collection that can list ids and answer no query. Reading the
-    /// segment files is the only way to get the vectors back.
-    ///
-    /// Every collection must already have a published generation: call
-    /// [`Engine::checkpoint_all`] first. A snapshot older than the log prefix
-    /// openraft is about to purge would leave a follower needing entries that no
-    /// longer exist.
-    pub fn snapshot_bytes(&self, state: &[u8], scope: &[Uuid]) -> EngineResult<Vec<u8>> {
+    /// Create a snapshot of collection partition state for replication.
+    pub fn snapshot_bytes_partition(
+        &self,
+        state: &[u8],
+        shard: Option<rekha_core::cluster::ShardId>,
+        scope: &[Uuid],
+    ) -> EngineResult<Vec<u8>> {
         let handles: Vec<(Uuid, Arc<Mutex<Collection>>)> = {
             let collections = self.collections.read();
             let mut handles: Vec<_> = scope
                 .iter()
-                .filter_map(|id| collections.get(id).map(|c| (*id, c.clone())))
+                .filter_map(|id| {
+                    let key = PartitionKey::new(*id, shard);
+                    collections.get(&key).map(|c| (*id, c.clone()))
+                })
                 .collect();
             // Deterministic order: the same state must produce the same archive.
             handles.sort_by_key(|(id, _)| *id);
@@ -1450,6 +1747,11 @@ impl Engine {
         crate::snapshot::encode(state, entries)
     }
 
+    /// Create a snapshot of all collection state for replication.
+    pub fn snapshot_bytes(&self, state: &[u8], scope: &[Uuid]) -> EngineResult<Vec<u8>> {
+        self.snapshot_bytes_partition(state, None, scope)
+    }
+
     /// The state blob a snapshot archive carries, without restoring it.
     ///
     /// Used by the receiver to decide whether an archive belongs to this group
@@ -1458,23 +1760,25 @@ impl Engine {
         crate::snapshot::peek_state(archive)
     }
 
-    /// Checkpoint every collection.
-    ///
-    /// This is the step that makes a snapshot safe to pair with a log purge: it
-    /// guarantees each generation covers at least the caller's boundary.
-    pub fn checkpoint_all(&self, scope: &[Uuid]) -> EngineResult<usize> {
+    /// Checkpoint partitions in scope.
+    pub fn checkpoint_all_partition(
+        &self,
+        shard: Option<rekha_core::cluster::ShardId>,
+        scope: &[Uuid],
+    ) -> EngineResult<usize> {
         let handles: Vec<(Uuid, Arc<Mutex<Collection>>)> = {
             let collections = self.collections.read();
             scope
                 .iter()
-                .filter_map(|id| collections.get(id).map(|c| (*id, c.clone())))
+                .filter_map(|id| {
+                    let key = PartitionKey::new(*id, shard);
+                    collections.get(&key).map(|c| (*id, c.clone()))
+                })
                 .collect()
         };
 
         let mut count = 0;
         for (id, handle) in handles {
-            // One collection lock at a time, never nested, matching the engine's
-            // lock-order rule.
             let mut collection = handle.lock();
             collection.checkpoint(self.catalog.as_ref()).map_err(|e| {
                 tracing::error!(%id, "snapshot: checkpoint before snapshot failed: {e}");
@@ -1485,17 +1789,17 @@ impl Engine {
         Ok(count)
     }
 
-    /// Replace this node's collections with the contents of `archive`.
-    ///
-    /// Returns the state blob the caller embedded, so a caller can restore its
-    /// own metadata from the same archive.
-    ///
-    /// Two phases: every collection is staged and validated in a private
-    /// directory first, and only then is anything live touched. A failure in
-    /// phase one leaves the node exactly as it was. In phase two the existing
-    /// checkpoint directory and WAL are moved aside rather than deleted, so a
-    /// failure mid-commit is recoverable by hand instead of being a loss.
-    pub fn restore_bytes(&self, archive: &[u8]) -> EngineResult<(Vec<u8>, RestoreReport)> {
+    /// Checkpoint every collection.
+    pub fn checkpoint_all(&self, scope: &[Uuid]) -> EngineResult<usize> {
+        self.checkpoint_all_partition(None, scope)
+    }
+
+    /// Replace partitions with the contents of `archive`.
+    pub fn restore_bytes_partition(
+        &self,
+        shard: Option<rekha_core::cluster::ShardId>,
+        archive: &[u8],
+    ) -> EngineResult<(Vec<u8>, RestoreReport)> {
         let decoded = crate::snapshot::decode(archive)?;
         let report = RestoreReport {
             collections: decoded.collections.len(),
@@ -1554,19 +1858,23 @@ impl Engine {
 
             for (entry, staged_base) in staged {
                 let id = entry.record.config.id;
+                let key = PartitionKey::new(id, shard);
 
                 // Close the live handle before its files move.
-                collections.remove(&id);
+                collections.remove(&key);
 
-                let live_base = self.wal_dir.join(format!("{id}.checkpoint"));
+                let stem = match shard {
+                    Some(s) => format!("{id}.shard-{}", s.0),
+                    None => id.to_string(),
+                };
+
+                let live_base = self.wal_dir.join(format!("{stem}.checkpoint"));
                 if live_base.exists() {
-                    std::fs::rename(&live_base, aside.join(format!("{id}.checkpoint")))?;
+                    std::fs::rename(&live_base, aside.join(format!("{stem}.checkpoint")))?;
                 }
-                // An old WAL replayed on top of a restored generation would
-                // re-apply operations the generation already contains.
-                let live_wal = self.wal_dir.join(format!("{id}.wal"));
+                let live_wal = self.wal_dir.join(format!("{stem}.wal"));
                 if live_wal.exists() {
-                    std::fs::rename(&live_wal, aside.join(format!("{id}.wal")))?;
+                    std::fs::rename(&live_wal, aside.join(format!("{stem}.wal")))?;
                 }
 
                 std::fs::rename(&staged_base, &live_base)?;
@@ -1583,13 +1891,14 @@ impl Engine {
 
                 let collection = Collection::open(
                     &id,
+                    shard,
                     entry.record.config.clone(),
                     &self.wal_dir,
                     self.config.epoch,
                     self.config.durability.is_durable(),
                     entry.record.max_seq_id,
                 )?;
-                collections.insert(id, Arc::new(Mutex::new(collection)));
+                collections.insert(key, Arc::new(Mutex::new(collection)));
             }
         }
 
@@ -1604,11 +1913,21 @@ impl Engine {
 
         Ok((decoded.state, report))
     }
+
+    /// Replace this node's collections with the contents of `archive`.
+    pub fn restore_bytes(&self, archive: &[u8]) -> EngineResult<(Vec<u8>, RestoreReport)> {
+        self.restore_bytes_partition(None, archive)
+    }
 }
 
 impl rekha_cluster::EngineSnapshotProvider for Engine {
-    fn snapshot_bytes(&self, state: &[u8], collections: &[Uuid]) -> Result<Vec<u8>, String> {
-        Engine::snapshot_bytes(self, state, collections).map_err(|e| e.to_string())
+    fn snapshot_bytes(
+        &self,
+        state: &[u8],
+        shard: Option<rekha_core::cluster::ShardId>,
+        collections: &[Uuid],
+    ) -> Result<Vec<u8>, String> {
+        Engine::snapshot_bytes_partition(self, state, shard, collections).map_err(|e| e.to_string())
     }
 
     fn record_collection(
@@ -1621,12 +1940,21 @@ impl rekha_cluster::EngineSnapshotProvider for Engine {
             .map_err(|e| e.to_string())
     }
 
-    fn materialize_collection(&self, collection_id: &Uuid) -> Result<(), String> {
-        Engine::materialize_collection(self, collection_id).map_err(|e| e.to_string())
+    fn materialize_collection(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+    ) -> Result<(), String> {
+        Engine::materialize_collection_partition(self, collection_id, shard)
+            .map_err(|e| e.to_string())
     }
 
-    fn restore_bytes(&self, archive: &[u8]) -> Result<Vec<u8>, String> {
-        Engine::restore_bytes(self, archive)
+    fn restore_bytes(
+        &self,
+        shard: Option<rekha_core::cluster::ShardId>,
+        archive: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        Engine::restore_bytes_partition(self, shard, archive)
             .map(|(state, _report)| state)
             .map_err(|e| e.to_string())
     }
@@ -1635,29 +1963,37 @@ impl rekha_cluster::EngineSnapshotProvider for Engine {
         Engine::snapshot_state(self, archive).map_err(|e| e.to_string())
     }
 
-    fn checkpoint_all(&self, collections: &[Uuid]) -> Result<usize, String> {
-        Engine::checkpoint_all(self, collections).map_err(|e| e.to_string())
+    fn checkpoint_all(
+        &self,
+        shard: Option<rekha_core::cluster::ShardId>,
+        collections: &[Uuid],
+    ) -> Result<usize, String> {
+        Engine::checkpoint_all_partition(self, shard, collections).map_err(|e| e.to_string())
     }
 
     fn apply_batch(
         &self,
         collection_id: &uuid::Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
         ops: &[rekha_core::op::Operation],
         index: u64,
         dimension: usize,
     ) -> Result<(), String> {
-        Engine::apply_committed(self, collection_id, ops, index, dimension)
+        Engine::apply_committed_partition(self, collection_id, shard, ops, index, dimension)
             .map_err(|e| e.to_string())
     }
 
-    fn drop_collection(&self, collection_id: &uuid::Uuid) -> Result<(), String> {
-        // Not conditional on the in-memory map: a collection created but never
-        // written to has a catalog row and no entry here.
-        Engine::delete_collection(self, collection_id).map_err(|e| e.to_string())
+    fn drop_collection(
+        &self,
+        collection_id: &uuid::Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+    ) -> Result<(), String> {
+        let _ = self.catalog.delete_collection(collection_id);
+        Engine::drop_collection_partition(self, collection_id, shard).map_err(|e| e.to_string())
     }
 }
 
-fn add_ops(
+pub fn add_ops(
     ids: &[Id],
     embeddings: &[Embedding],
     metadatas: Option<&[Option<Metadata>]>,
@@ -1801,7 +2137,7 @@ mod lock_tests {
         let handle = engine
             .collections
             .read()
-            .get(&id)
+            .get(&PartitionKey::new(id, None))
             .cloned()
             .expect("collection handle");
 
@@ -1837,7 +2173,7 @@ mod lock_tests {
         let id = config.id;
         engine.record_collection(&config, None).expect("record");
 
-        engine.drop_collection(&id).expect("drop");
+        engine.drop_collection(&id, None).expect("drop");
 
         assert!(
             engine.get_collection_by_id(&id).unwrap().is_none(),

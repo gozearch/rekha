@@ -277,9 +277,20 @@ impl Wal {
         options: WalOptions,
         repair: TailRepair,
     ) -> WalResult<Self> {
+        Self::open_named(path, &collection_id.to_string(), epoch, options, repair)
+    }
+
+    /// Open (or create) the WAL for a named stream (e.g. partition) at `path` under `epoch`.
+    pub fn open_named(
+        path: impl AsRef<Path>,
+        name: &str,
+        epoch: Epoch,
+        options: WalOptions,
+        repair: TailRepair,
+    ) -> WalResult<Self> {
         let dir = path.as_ref();
         std::fs::create_dir_all(dir)?;
-        let file_path = dir.join(format!("{collection_id}.wal"));
+        let file_path = dir.join(format!("{name}.wal"));
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -346,7 +357,12 @@ impl Wal {
     ///
     /// A missing file is reported as `exists: false` rather than created.
     pub fn inspect(path: impl AsRef<Path>, collection_id: &Uuid) -> WalResult<WalInspection> {
-        let file_path = path.as_ref().join(format!("{collection_id}.wal"));
+        Self::inspect_named(path, &collection_id.to_string())
+    }
+
+    /// Inspect a named log **without modifying it**.
+    pub fn inspect_named(path: impl AsRef<Path>, name: &str) -> WalResult<WalInspection> {
+        let file_path = path.as_ref().join(format!("{name}.wal"));
         let mut file = match std::fs::File::open(&file_path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

@@ -2221,6 +2221,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-test",
+ "futures",
  "openraft",
  "parking_lot",
  "rekha-cluster",
@@ -2291,6 +2292,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

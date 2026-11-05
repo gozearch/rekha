@@ -31,6 +31,10 @@ pub enum ClusterOperation {
         /// Node ids that hold this shard, in replica order.
         owners: Vec<u64>,
     },
+    /// Update the authoritative voter set for the cluster.
+    SetVoters {
+        voters: Vec<u64>,
+    },
     /// Create a tenant namespace.
     ///
     /// A namespace is a cluster fact, not a node fact: a tenant created on one

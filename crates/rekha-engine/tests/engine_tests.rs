@@ -3910,8 +3910,12 @@ fn a_replica_opens_its_collections_and_a_non_replica_refuses_them() {
     // The owner did open a WAL on demand, which is how an empty shard answers
     // reads without a special case.
     let owner_wal = dir1.path().join("wal").join(format!("{}.wal", config.id));
+    let owner_shard_wal = dir1
+        .path()
+        .join("wal")
+        .join(format!("{}.shard-{}.wal", config.id, shard.0));
     assert!(
-        owner_wal.exists(),
+        owner_wal.exists() || owner_shard_wal.exists(),
         "the owner must have opened its data file"
     );
 }

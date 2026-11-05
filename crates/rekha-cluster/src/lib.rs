@@ -15,6 +15,7 @@ pub mod log_store;
 pub mod network;
 pub mod placement;
 pub mod raft_types;
+pub mod rebalancer;
 pub mod redb_log_store;
 pub mod registry;
 pub mod shard;

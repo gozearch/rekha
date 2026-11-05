@@ -20,6 +20,7 @@ openraft = { version = "0.9", features = ["storage-v2", "serde", "generic-snapsh
 redb = "4"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["sync", "rt"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

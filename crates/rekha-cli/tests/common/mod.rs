@@ -285,10 +285,20 @@ pub async fn shard_of(nodes: &[Node], collection: uuid::Uuid) -> Option<rekha_cl
 }
 
 pub fn has_data(node: &Node, collection: uuid::Uuid) -> bool {
-    node.data_dir
-        .join("wal")
-        .join(format!("{collection}.wal"))
-        .exists()
+    let wal = node.data_dir.join("wal").join(format!("{collection}.wal"));
+    if wal.exists() {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir(node.data_dir.join("wal")) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            if s.starts_with(&format!("{collection}")) && s.ends_with(".wal") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Wait until `condition` holds, so the assertion is about placement rather

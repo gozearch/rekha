@@ -1036,7 +1036,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let placement = placement.clone();
                     let log_dir = std::path::PathBuf::from(&data_dir).join("raft_log");
                     std::fs::create_dir_all(&log_dir)?;
-                    let mut cluster = ShardCluster::new(placement.clone());
+                    let cluster = ShardCluster::new(placement.clone());
                     for shard in &hosted_shards {
                         let index = shard.0;
                         let mut log_store =
@@ -1194,12 +1194,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_leader_tracker(tracker.clone())
             .with_apply_failure_flag(apply_failure.clone())
             .with_bootstrap_ready_flag(bootstrap_ready.clone())
-            .with_data_via_log(topology.is_clustered());
+            .with_data_via_log(topology.is_clustered())
+            .with_node_id(node_id)
+            .with_raft_config(raft_config.clone());
             let state = match shard_cluster.clone() {
                 Some(cluster) => state.with_shards(cluster),
                 None => state,
             };
             let state = Arc::new(state);
+
+            if let Some(ref sc) = shard_cluster {
+                rekha_cluster::rebalancer::spawn_auto_rebalancer(
+                    node_id,
+                    raft.clone(),
+                    sc.clone(),
+                    peer_dir.clone(),
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .build()
+                        .unwrap_or_default(),
+                    cluster_secret.clone(),
+                );
+            }
 
             // Data reaches this node as committed log entries, so there is no
             // replication loop to run. What remains is housekeeping: a
@@ -1262,6 +1278,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // dropped, and a gauge that is never set afterwards never registers
             // with the recorder at all.
             spawn_raft_metrics(raft.clone());
+            if let Some(ref sc) = shard_cluster {
+                spawn_shard_raft_metrics(sc.clone());
+            }
             spawn_raft_log_size_metrics(std::path::PathBuf::from(&data_dir));
 
             // If --internal-port is set, run separate listeners for public and
@@ -1901,6 +1920,41 @@ fn spawn_raft_metrics(raft: std::sync::Arc<openraft::Raft<rekha_cluster::RaftTyp
             }
             if metrics.changed().await.is_err() {
                 break;
+            }
+        }
+    });
+}
+
+fn spawn_shard_raft_metrics(shards: std::sync::Arc<rekha_cluster::ShardCluster>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            for shard in shards.shards() {
+                if let Some(raft) = shards.raft(shard) {
+                    let m = raft.metrics().borrow().clone();
+                    let last_log = m.last_log_index.unwrap_or(0);
+                    let applied = m.last_applied.map(|id| id.index).unwrap_or(0);
+                    let group_label = format!("shard-{}", shard.0);
+
+                    metrics::gauge!("rekha_raft_term", "group" => group_label.clone())
+                        .set(m.current_term as f64);
+                    metrics::gauge!("rekha_raft_is_leader", "group" => group_label.clone())
+                        .set(if m.state.is_leader() { 1.0 } else { 0.0 });
+                    metrics::gauge!("rekha_raft_last_log_index", "group" => group_label.clone())
+                        .set(last_log as f64);
+                    metrics::gauge!(
+                        "rekha_raft_last_applied_index",
+                        "group" => group_label.clone()
+                    )
+                    .set(applied as f64);
+                    metrics::gauge!(
+                        "rekha_raft_apply_lag_entries",
+                        "group" => group_label.clone()
+                    )
+                    .set(last_log.saturating_sub(applied) as f64);
+                    metrics::gauge!("rekha_raft_quorum_age_ms", "group" => group_label.clone())
+                        .set(m.millis_since_quorum_ack.unwrap_or(0) as f64);
+                }
             }
         }
     });

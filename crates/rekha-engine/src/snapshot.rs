@@ -153,11 +153,22 @@ pub(crate) fn encode(
     Ok(out)
 }
 
-/// Decode and verify an archive.
+/// Read the archive header without materialising the payload.
 ///
-/// Every file's length and CRC is checked before anything is returned, so a
-/// caller can never observe a partially-valid archive.
-pub(crate) fn decode(archive: &[u8]) -> EngineResult<Decoded<'_>> {
+/// A receiver has to inspect what a snapshot *is* before writing any of it: an
+/// archive carries the state machine that produced it, and installing a
+/// metadata snapshot into a shard group would replace that group's state with
+/// the registry. Checking the header first keeps the decision ahead of the first
+/// write, instead of discovering the mismatch after `restore` has already
+/// replaced files.
+pub(crate) fn peek_state(archive: &[u8]) -> EngineResult<Vec<u8>> {
+    let (meta, _) = parse_header(archive)?;
+    Ok(meta.state)
+}
+
+/// Parse and validate the fixed header, returning the meta and where the body
+/// starts.
+fn parse_header(archive: &[u8]) -> EngineResult<(ArchiveMeta, usize)> {
     if archive.len() < HEADER_LEN + 4 {
         return Err(malformed(format!(
             "{} bytes is shorter than the minimum archive",
@@ -190,6 +201,15 @@ pub(crate) fn decode(archive: &[u8]) -> EngineResult<Decoded<'_>> {
 
     let meta: ArchiveMeta = bincode::deserialize(&archive[HEADER_LEN..meta_end])
         .map_err(|e| malformed(format!("header is unreadable: {e}")))?;
+    Ok((meta, meta_end))
+}
+
+/// Decode and verify an archive.
+///
+/// Every file's length and CRC is checked before anything is returned, so a
+/// caller can never observe a partially-valid archive.
+pub(crate) fn decode(archive: &[u8]) -> EngineResult<Decoded<'_>> {
+    let (meta, meta_end) = parse_header(archive)?;
 
     let body = &archive[meta_end..archive.len() - 4];
     if &archive[archive.len() - 4..] != TRAILER {

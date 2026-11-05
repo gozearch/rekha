@@ -102,9 +102,10 @@ async fn a_shard_owner_restarts_after_its_log_is_purged() {
         assert_eq!(status, 200, "write {i}: {body}");
     }
 
-    // Restart an owner that was fully up to date. A node that merely lagged
-    // would need a snapshot install, which is a separate piece of work; this
-    // test is about a node whose own log was compacted underneath it.
+    // Restart an owner that was fully up to date. Its own log was compacted
+    // underneath it, so it resumes from the purge watermark instead of replaying.
+    // The other recovery — a node that was *offline* while the cluster purged
+    // past it and therefore needs a snapshot install — is `snapshot_rejoin.rs`.
     let victim = owners[0];
     let index = nodes
         .iter()

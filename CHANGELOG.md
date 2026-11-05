@@ -8,6 +8,32 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Raft snapshots are now persisted, served and transferred, so a replica that
+  falls behind the purged log prefix can rejoin. Previously `get_current_snapshot`
+  returned `None` unconditionally and `build_snapshot`'s archive was dropped when
+  the call returned, so openraft's replication stopped that follower with
+  "snapshot not found" and it never caught up. Snapshots are written atomically
+  under `<data-dir>/wal/snapshots/<group>/`, kept two deep, and returned from
+  disk.
+- Chunked snapshot transfer: 3 MiB raw `application/octet-stream` bodies staged
+  at an exact offset under `<data-dir>/wal/snapshots/.incoming`, instead of one
+  JSON body carrying a base64 archive under a 32 MiB limit. A retried or
+  reordered chunk is refused rather than appended into the wrong place, and a
+  chunk at offset zero discards a partial transfer so a retry starts clean.
+  Note the disk cost: two archives are retained per group, and an archive is a
+  copy of the collection data, so a compacting node needs up to three times its
+  data size. Retention drops to one when the transfer becomes a stream.
+- `install_snapshot` refuses an archive produced by a different group (a metadata
+  snapshot cannot be installed into a shard, and vice versa), checked from the
+  archive header before anything is written.
+- `install_snapshot_timeout` is 10 minutes instead of openraft's 200 ms default.
+- A three-node test where a replica is stopped, the cluster writes past the purge
+  point, and the replica restarts and recovers by snapshot — including the
+  assertion that it installed one rather than catching up by replay.
+- `docs/operations.md`: readiness semantics, alerts worth having, disk sizing
+  (including the snapshot multiplier), what to do when a replica falls behind,
+  restart and backup procedures, and which log lines mean "this node's state is
+  wrong" rather than "slow".
 - `LICENSE` (Apache-2.0, matching the `license` field the workspace has been
   declaring without the file).
 - A test gate in the release and Docker workflows: both jobs now depend on
@@ -43,12 +69,12 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Enabling `REKHA_SNAPSHOT_EVERY_N_LOGS` in a cluster prints an explicit warning
-  that Raft snapshots are not transferable in this build: a node offline long
-  enough for the log to be purged cannot catch up and must be rebuilt from a
-  backup, while a node that merely restarts is unaffected.
-- A replica asking for a snapshot it cannot have now logs the cause (behind a
-  purged prefix, rebuild from backup) instead of leaving openraft's generic
+- Enabling `REKHA_SNAPSHOT_EVERY_N_LOGS` in a cluster now warns that membership
+  is reconstructed from the placement document after a purge, which is correct
+  only while nodes are not added or removed; the default remains "never snapshot"
+  until promotion and removal land.
+- A replica asking for a snapshot it cannot have logs the cause (behind a purged
+  prefix, rebuild from backup) instead of leaving openraft's generic
   "snapshot not found" as the only signal.
 
 - Clustered startup no longer requires `REKHA_KEY_PEPPER`. A bootstrap
@@ -83,6 +109,13 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A replica that fails to open a collection it owns now marks itself not-ready
+  instead of continuing to serve empty reads for records it is supposed to hold
+  and to build snapshots that silently omit the collection (the snapshot scope
+  is filtered by what the engine has loaded). A metadata row that cannot be
+  recorded stays a logged warning: the engine returns a string, so a refusal
+  cannot be distinguished from a store error, and it is loud at routing and
+  snapshot time anyway.
 - An RBAC request referencing a user or role that does not exist committed a
   Raft entry that failed to apply on every node, and the apply path treated that
   as divergence — so one authenticated call marked the whole cluster

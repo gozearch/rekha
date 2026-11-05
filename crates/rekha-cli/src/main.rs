@@ -767,6 +767,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             sm.set_addresses(peer_dir.clone());
             let apply_failure = Arc::new(AtomicBool::new(false));
             sm.set_apply_failure_flag(apply_failure.clone());
+            // Where this group's snapshots live. A clustered node must have one:
+            // openraft only asks for a snapshot when a follower is behind the
+            // purged prefix, and a node that cannot answer that has no way to
+            // recover the follower.
+            // Under the engine's storage directory (beside the WALs and
+            // checkpoints), so the archive and the staging area are on the same
+            // filesystem as the data they describe.
+            let snapshot_root = wal_dir.join("snapshots");
+            sm.set_snapshot_store(Arc::new(rekha_cluster::SnapshotStore::open(
+                snapshot_root.join("metadata"),
+                sm.group_label(),
+            )?));
 
             // Resume from the compaction boundary. Without this, the state
             // machine reports "applied nothing" and openraft tries to replay
@@ -830,20 +842,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Snapshotting is what purges the Raft log, and purging shortens the
-            // history a node can replay. A *restarting* node is safe: its applied
-            // state is in durable storage and the resume path above continues from
-            // the purge watermark. A node that merely *fell behind* is not. It
-            // needs the leader to ship a snapshot, and this state machine cannot
-            // produce one that survives the call — the builder's archive is
-            // returned to openraft and dropped, and `get_current_snapshot` has
-            // nothing to serve. openraft then stops replication for that follower
-            // with "snapshot not found", permanently.
+            // history a node can replay. Two recoveries have to stay possible:
             //
-            // So the default is to never snapshot: disk growth is observable and
-            // recoverable, whereas a replica that can never rejoin is not.
-            // `REKHA_SNAPSHOT_EVERY_N_LOGS` opts in, and is how the restart
-            // regression tests exercise the purge path without writing thousands
-            // of entries.
+            // * a node that **restarts** resumes from the purge watermark, since
+            //   its applied state is in durable storage;
+            // * a node that **fell behind** is repaired by installing a snapshot
+            //   the leader persisted and streams in chunks.
+            //
+            // Both are implemented and tested. The default stays off anyway: with
+            // purge enabled, membership is reconstructed from the placement
+            // document at the watermark, which is sound only while membership is
+            // static — promotion and removal are not implemented yet. An operator
+            // who needs the disk bound back can enable it for a cluster that is
+            // not being resized.
             let snapshot_every: u64 = match std::env::var("REKHA_SNAPSHOT_EVERY_N_LOGS") {
                 Ok(raw) => raw.trim().parse().map_err(|e| {
                     format!(
@@ -865,14 +876,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                      REKHA_SNAPSHOT_EVERY_N_LOGS to enable stream compaction."
                 ),
                 openraft::SnapshotPolicy::LogsSinceLast(n) => {
-                    println!("Raft snapshots: every {n} log entries, keeping {n}");
+                    println!(
+                        "Raft snapshots: every {n} log entries, keeping {n}; a replica that \
+                         falls behind is repaired by a streamed snapshot"
+                    );
                     if topology.is_clustered() {
                         eprintln!(
-                            "warning: snapshotting is enabled in a cluster, but Raft snapshots \
-                             are not transferable in this build. A node that is offline long \
-                             enough for the log to be purged cannot catch up and has to be \
-                             rebuilt from a backup. Single-node use is unaffected; this is a \
-                             known gap, tracked as the snapshot-transfer milestone."
+                            "warning: snapshotting is enabled. Membership is reconstructed from \
+                             the placement document after a purge, which is correct only while \
+                             nodes are not added or removed. Keep --shards and the peer list \
+                             fixed for the life of this data directory."
                         );
                     }
                 }
@@ -884,6 +897,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 election_timeout_max: election_max_ms,
                 replication_lag_threshold: 10000,
                 snapshot_policy,
+                // A snapshot is the one RPC whose cost is a function of corpus
+                // size, and openraft's default is 200 ms. That value is a
+                // sensible bound for a heartbeat and a permanent barrier to
+                // recovery for an archive: a lagging replica would time out on
+                // every attempt, forever. Ten minutes covers a multi-gigabyte
+                // transfer on a slow link; the per-chunk requests still fail
+                // fast if the peer is gone.
+                install_snapshot_timeout: 10 * 60 * 1000,
                 // openraft keeps 1,000 entries *before* a snapshot by default,
                 // so a snapshot alone does not purge anything until the log is
                 // far past the threshold. The same knob bounds that history:
@@ -1024,6 +1045,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             engine.clone() as Arc<dyn rekha_cluster::EngineSnapshotProvider>
                         );
                         shard_sm.set_apply_failure_flag(apply_failure.clone());
+                        let snapshot_root = wal_dir.join("snapshots");
+                        shard_sm.set_snapshot_store(Arc::new(rekha_cluster::SnapshotStore::open(
+                            snapshot_root.join(format!("shard-{index}")),
+                            shard_sm.group_label(),
+                        )?));
                         // Same resume logic as the metadata group, and gated the
                         // same way: only a purged log needs its membership and
                         // placement reconstructed rather than replayed.

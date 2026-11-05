@@ -352,6 +352,13 @@ pub struct AppState {
     /// nothing in throughput because the log already totals-orders writes to a
     /// collection.
     write_locks: parking_lot::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serialises snapshot chunk appends.
+    ///
+    /// Chunks of one transfer must land in order and without interleaving: the
+    /// receiver appends at an exact offset, so two in-flight chunks would both
+    /// see the same length and one would overwrite the other. Snapshot transfers
+    /// are rare (a replica rejoining), so one lock for all of them is enough.
+    pub snapshot_staging: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -378,6 +385,7 @@ impl AppState {
             shards: None,
             placement_cache: tokio::sync::Mutex::new(None),
             write_locks: parking_lot::Mutex::new(HashMap::new()),
+            snapshot_staging: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1350,6 +1358,199 @@ async fn raft_install_snapshot(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Receive one chunk of a snapshot and, on the last, install it.
+///
+/// Raw bytes rather than JSON: the previous endpoint took the whole archive in a
+/// `Vec<u8>` field, base64-encoded, capped by the router's 32 MiB body limit,
+/// with a 200 ms deadline. A replica that had fallen behind could not send one,
+/// and this is the only path that repairs such a replica.
+///
+/// Staging is on disk under the data directory, at an exact offset, so a
+/// half-transferred snapshot costs disk rather than memory and a retried chunk
+/// is refused instead of being appended twice. The install itself still reads
+/// the archive into memory (`SnapshotData` is a `Cursor<Vec<u8>>`); removing
+/// that copy is the streaming follow-up, and is why this is chunked transport,
+/// not chunked restore.
+async fn raft_snapshot_chunk(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((group, snapshot_id)): axum::extract::Path<(u32, String)>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<openraft::raft::SnapshotResponse<u64>>, (StatusCode, Json<serde_json::Value>)> {
+    fn bad(detail: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": detail.into() })),
+        )
+    }
+
+    fn header_u64(
+        headers: &axum::http::HeaderMap,
+        name: &str,
+    ) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .ok_or_else(|| bad(format!("`{name}` is required and must be a whole number")))
+    }
+
+    // The id becomes part of a file name in the staging directory.
+    if snapshot_id.is_empty()
+        || snapshot_id.contains('/')
+        || snapshot_id.contains('\\')
+        || snapshot_id.contains("..")
+    {
+        return Err(bad("snapshot id is not a usable file name"));
+    }
+
+    let offset = header_u64(&headers, rekha_cluster::network::SNAPSHOT_OFFSET_HEADER)?;
+    let total = header_u64(&headers, rekha_cluster::network::SNAPSHOT_TOTAL_HEADER)?;
+    let is_final = headers
+        .get(rekha_cluster::network::SNAPSHOT_FINAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
+
+    let vote: openraft::Vote<u64> = headers
+        .get(rekha_cluster::network::SNAPSHOT_VOTE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or_else(|| bad("`x-rekha-snapshot-vote` is required and must be JSON"))?;
+    let meta: openraft::SnapshotMeta<u64, u64> = headers
+        .get(rekha_cluster::network::SNAPSHOT_META_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or_else(|| bad("`x-rekha-snapshot-meta` is required and must be JSON"))?;
+
+    let end = offset
+        .checked_add(body.len() as u64)
+        .ok_or_else(|| bad("chunk offset overflows"))?;
+    if end > total {
+        return Err(bad(format!(
+            "chunk covers bytes {offset}..{end}, beyond the declared total of {total}"
+        )));
+    }
+    if is_final && end != total {
+        return Err(bad(format!(
+            "the final chunk ends at byte {end}, but the snapshot is declared as {total} bytes"
+        )));
+    }
+
+    let raft = state.raft_for(group).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no Raft group {group} on this node") })),
+        )
+    })?;
+
+    let staging_dir = state
+        .engine
+        .storage_dir()
+        .join("snapshots")
+        .join(".incoming");
+    std::fs::create_dir_all(&staging_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "error": format!("cannot create the staging directory: {e}") }),
+            ),
+        )
+    })?;
+    let staged = staging_dir.join(format!("{group}-{snapshot_id}.part"));
+
+    // One transfer at a time: appends are offset-checked against the file, and
+    // two concurrent chunks would both observe the same length.
+    let _guard = state.snapshot_staging.lock().await;
+
+    let existing = std::fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+    // Offset zero is a sender starting over, which is exactly what openraft does
+    // after a failed transfer: discard the partial file rather than answering
+    // 409 and costing a whole extra attempt.
+    let existing = if offset == 0 && existing > 0 {
+        let _ = std::fs::remove_file(&staged);
+        0
+    } else {
+        existing
+    };
+    if offset != existing {
+        // Start over rather than splice a chunk into the wrong place. The next
+        // attempt begins at zero, which is what openraft does after a failure.
+        let _ = std::fs::remove_file(&staged);
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "chunk starts at byte {offset}, but {existing} bytes are already staged; \
+                     the transfer must restart from zero"
+                )
+            })),
+        ));
+    }
+
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&staged)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("cannot stage the chunk: {e}") })),
+                )
+            })?;
+        file.write_all(&body).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("cannot write the chunk: {e}") })),
+            )
+        })?;
+    }
+
+    if !is_final {
+        // No meta is returned for an intermediate chunk: openraft only reads the
+        // response to the last one.
+        return Ok(Json(openraft::raft::SnapshotResponse::new(vote)));
+    }
+
+    let read_path = staged.clone();
+    let data = tokio::task::spawn_blocking(move || std::fs::read(&read_path))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("staging task failed: {e}") })),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "error": format!("cannot read the staged snapshot: {e}") }),
+                ),
+            )
+        })?;
+
+    // The staged file is only needed until it is installed. Leaving it would
+    // double the disk a snapshot costs, permanently, because nothing else walks
+    // this directory.
+    let _ = std::fs::remove_file(&staged);
+
+    let snapshot = openraft::Snapshot {
+        meta,
+        snapshot: Box::new(std::io::Cursor::new(data)),
+    };
+    raft.install_full_snapshot(vote, snapshot)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("snapshot install failed: {e}") })),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2652,6 +2853,12 @@ fn internal_routes() -> Router<Arc<AppState>> {
         .route(
             "/internal/raft/{group}/install_snapshot",
             post(raft_install_snapshot),
+        )
+        // Chunked upload, used by this build's transport. The single-request
+        // endpoint above stays for older peers and for the in-process tests.
+        .route(
+            "/internal/raft/{group}/snapshot/{snapshot_id}",
+            post(raft_snapshot_chunk),
         )
         // Membership is a property of a whole group, not of a single RPC, and
         // these operate on the metadata group.

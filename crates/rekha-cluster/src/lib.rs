@@ -18,6 +18,7 @@ pub mod raft_types;
 pub mod redb_log_store;
 pub mod registry;
 pub mod shard;
+pub mod snapshot_store;
 pub mod state_machine;
 
 pub use cluster::{ClockMap, ClusterConfig};
@@ -32,6 +33,7 @@ pub use placement::{Placement, PlacementConfig, PlacementError, PlacementOpenErr
 pub use raft_types::{BatchResponse, ClusterOperation, NodeInfo, RaftTypeConfig};
 pub use redb_log_store::RedbLogStore;
 pub use shard::ShardCluster;
+pub use snapshot_store::{SnapshotStore, SnapshotStoreError, StoredSnapshot};
 pub use state_machine::{ClusterStateMachine, EngineSnapshotProvider, GroupRole};
 
 #[cfg(test)]

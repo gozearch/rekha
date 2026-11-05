@@ -284,6 +284,19 @@ Before exposing a node to real traffic:
   cannot be changed by a restart. A learner can be added, but elastic scale-out
   (promoting it to a voter and moving shards) is not supported yet; plan for the
   capacity you expect.
+- By default the Raft log is never purged, so it grows and a restart replays it.
+  Set `REKHA_SNAPSHOT_EVERY_N_LOGS=<n>` to compact it every `n` entries: a
+  restarted node resumes from the purge watermark, and a node that was offline
+  long enough to fall behind is repaired by a snapshot streamed from a replica
+  that still has one. Keep the peer list and `--shards` fixed for the life of the
+  data directory, because membership is reconstructed from the placement
+  document after a purge.
+- Size disk for snapshots. Each group keeps the last two archives under
+  `<data-dir>/wal/snapshots/<group>/`, and an archive is a copy of its
+  collection data — so a compacting node needs up to **three times** its data
+  size (live data plus two archives). Retention is deliberately two while the
+  transport still reads an archive into memory as one buffer; it drops to one
+  when the transfer becomes a stream.
 - Run `rekha verify` against a stopped data directory, take backups with
   `rekha backup`, and rehearse `rekha restore` before you need it.
 - Scrape `REKHA_METRICS_PORT` from loopback only, and alert on `/ready`

@@ -1389,6 +1389,17 @@ impl Engine {
             .ok_or_else(|| EngineError::CollectionNotFound(id.to_string()))
     }
 
+    /// The directory this engine owns: collection WALs, checkpoint generations,
+    /// and the restore staging area.
+    ///
+    /// The snapshot store and the API's snapshot staging area live here too, so
+    /// a multi-gigabyte archive is staged on the same filesystem as the data it
+    /// will replace rather than in `/tmp`, which is often a different mount and
+    /// usually smaller.
+    pub fn storage_dir(&self) -> &Path {
+        &self.wal_dir
+    }
+
     /// Create a snapshot of all collection state for replication.
     ///
     /// Produces a framed archive of each collection's *active checkpoint
@@ -1437,6 +1448,14 @@ impl Engine {
         }
 
         crate::snapshot::encode(state, entries)
+    }
+
+    /// The state blob a snapshot archive carries, without restoring it.
+    ///
+    /// Used by the receiver to decide whether an archive belongs to this group
+    /// before any of it is written.
+    pub fn snapshot_state(&self, archive: &[u8]) -> EngineResult<Vec<u8>> {
+        crate::snapshot::peek_state(archive)
     }
 
     /// Checkpoint every collection.
@@ -1610,6 +1629,10 @@ impl rekha_cluster::EngineSnapshotProvider for Engine {
         Engine::restore_bytes(self, archive)
             .map(|(state, _report)| state)
             .map_err(|e| e.to_string())
+    }
+
+    fn snapshot_state(&self, archive: &[u8]) -> Result<Vec<u8>, String> {
+        Engine::snapshot_state(self, archive).map_err(|e| e.to_string())
     }
 
     fn checkpoint_all(&self, collections: &[Uuid]) -> Result<usize, String> {

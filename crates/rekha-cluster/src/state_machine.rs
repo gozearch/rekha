@@ -46,6 +46,13 @@ pub trait EngineSnapshotProvider: Send + Sync + 'static {
     /// outside it is left alone, so restoring one shard cannot wipe another.
     fn restore_bytes(&self, archive: &[u8]) -> Result<Vec<u8>, String>;
 
+    /// The state blob embedded in an archive, without restoring anything.
+    ///
+    /// The receiver checks the archive's group identity with this before the
+    /// first write, so a snapshot addressed to the wrong group is refused
+    /// rather than half-installed.
+    fn snapshot_state(&self, archive: &[u8]) -> Result<Vec<u8>, String>;
+
     /// Checkpoint every collection in scope, so a snapshot is never behind its
     /// boundary.
     fn checkpoint_all(&self, collections: &[uuid::Uuid]) -> Result<usize, String>;
@@ -159,6 +166,13 @@ pub struct ClusterStateMachine {
     /// flaking cluster test, not a hypothetical.
     #[serde(skip)]
     pub bootstrap_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Where this group's snapshots are written and read.
+    ///
+    /// `None` means the node cannot serve or persist a snapshot. That is a
+    /// supported configuration only for a single node with compaction disabled;
+    /// a clustered node refuses to start without it (see the CLI).
+    #[serde(skip)]
+    pub snapshots: Option<Arc<crate::snapshot_store::SnapshotStore>>,
 }
 
 impl std::fmt::Debug for ClusterStateMachine {
@@ -213,6 +227,24 @@ impl ClusterStateMachine {
 
     pub fn set_catalog(&mut self, catalog: Arc<dyn Catalog>) {
         self.catalog = Some(catalog);
+    }
+
+    /// Attach the persisted-snapshot store for this group.
+    ///
+    /// Required in a cluster: without it `build_snapshot` still produces an
+    /// archive but has nowhere to keep it, and a follower that falls behind the
+    /// purge point can never be repaired.
+    pub fn set_snapshot_store(&mut self, store: Arc<crate::snapshot_store::SnapshotStore>) {
+        self.snapshots = Some(store);
+    }
+
+    /// A stable label for this group, used to reject a snapshot addressed to a
+    /// different one.
+    pub fn group_label(&self) -> String {
+        match self.role {
+            GroupRole::Metadata => "metadata".to_string(),
+            GroupRole::Shard(shard) => format!("shard:{}", shard.0),
+        }
     }
 
     /// Attach the engine used to produce and restore Raft snapshots.
@@ -410,6 +442,13 @@ impl ClusterStateMachine {
                     // to answer for a collection this node does not hold, and a
                     // 404 there would be a lie.
                     if let Err(e) = engine.record_collection(config, *shard) {
+                        // Not escalated to `apply_failure`: the engine returns a
+                        // string, so an application-level refusal cannot be told
+                        // apart from a store error here. A missing row is loud
+                        // anyway — routing 404s for the collection and the next
+                        // snapshot fails when it looks the record up — whereas
+                        // treating a refusal as divergence would take down a
+                        // healthy node.
                         eprintln!(
                             "cluster: failed to record replicated collection {}: {e}",
                             config.id
@@ -426,10 +465,17 @@ impl ClusterStateMachine {
                         (GroupRole::Metadata, _) => false,
                     };
                     if owned && let Err(e) = engine.materialize_collection(&config.id) {
+                        // The data is this node's responsibility and it could not
+                        // be opened. Continuing would serve empty reads from a
+                        // replica that is supposed to hold records, and — worse —
+                        // take a snapshot that silently omits it, because the
+                        // snapshot scope is filtered by what the engine has
+                        // loaded. Both are divergence; stop answering.
                         eprintln!(
                             "cluster: failed to materialize replicated collection {}: {e}",
                             config.id
                         );
+                        self.note_apply_failure();
                     }
                 }
             }
@@ -692,6 +738,36 @@ fn assemble_snapshot(
         ),
     };
 
+    // Persist before returning. openraft drops the returned reader as soon as it
+    // has read the meta, so a snapshot that only exists in this return value is
+    // gone by the time a follower asks for one — and a follower that asks is by
+    // definition the one that cannot catch up any other way.
+    //
+    // This ordering also carries the invariant the rest of the recovery path
+    // depends on: openraft purges only after a build succeeds, so **a purged log
+    // implies a persisted snapshot**. If publishing fails, the build fails, and
+    // nothing is purged. That is why a node resuming from a purge watermark does
+    // not have to build a replacement snapshot at startup — it already has one,
+    // unless an operator deleted the directory.
+    let store = sm.snapshots.as_ref().ok_or_else(|| StorageError::IO {
+        source: openraft::StorageIOError::write(&std::io::Error::other(
+            "no snapshot store is attached: this node can build a snapshot but has nowhere \
+             to keep it, so a follower that falls behind could never be repaired",
+        )),
+    })?;
+    store
+        .publish(&meta, &archive)
+        .map_err(|e| StorageError::IO {
+            source: openraft::StorageIOError::write(&std::io::Error::other(format!(
+                "publishing the snapshot failed: {e}"
+            ))),
+        })?;
+    // Retention is best-effort: the snapshot that was just published is the one
+    // the cluster needs, and failing to delete an old one must not fail it.
+    if let Err(e) = store.prune(crate::snapshot_store::KEEP) {
+        eprintln!("cluster: pruning old snapshots failed: {e}");
+    }
+
     Ok(Snapshot {
         meta,
         snapshot: Box::new(std::io::Cursor::new(archive)),
@@ -822,6 +898,38 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
             )),
         })?;
 
+        // Decide what this archive is before writing any of it. A metadata
+        // snapshot and a shard snapshot are both `SnapshotPayload`s to bincode,
+        // so without this check an archive addressed to the wrong group would
+        // deserialize cleanly and replace this group's state with the registry —
+        // a successful install of the wrong data, which no later validation can
+        // detect. The header carries the producing machine's role, so peeking at
+        // it is enough and costs no writes.
+        let state_blob = engine.snapshot_state(&data).map_err(|e| StorageError::IO {
+            source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                "the snapshot archive is unreadable: {e}"
+            ))),
+        })?;
+        let incoming: SnapshotPayload =
+            bincode::deserialize(&state_blob).map_err(|e| StorageError::IO {
+                source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                    "the snapshot's state blob is unreadable: {e}"
+                ))),
+            })?;
+        if incoming.machine.role != self.role {
+            let found = match incoming.machine.role {
+                GroupRole::Metadata => "metadata".to_string(),
+                GroupRole::Shard(shard) => format!("shard:{}", shard.0),
+            };
+            return Err(StorageError::IO {
+                source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                    "refusing to install a `{found}` snapshot into `{}`: the groups hold \
+                     different state, and installing it would replace this one",
+                    self.group_label()
+                ))),
+            });
+        }
+
         // Restore the engine first. If it fails, this node's metadata is left
         // untouched rather than describing collections whose data did not land.
         let state = engine.restore_bytes(&data).map_err(|e| StorageError::IO {
@@ -850,6 +958,7 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         // failure visible until an operator restarts the node.
         let apply_failure = self.apply_failure.clone();
         let bootstrap_ready = self.bootstrap_ready.clone();
+        let snapshots = self.snapshots.clone();
 
         // The registry first, through the *local* handle. A node that joins from
         // a snapshot has none of these rows, and until they are written it can
@@ -888,44 +997,85 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         self.addresses = addresses;
         self.apply_failure = apply_failure;
         self.bootstrap_ready = bootstrap_ready;
+        self.snapshots = snapshots;
 
         self.last_applied = meta.last_log_id;
         self.membership = meta.last_membership.clone();
+
+        // Keep the snapshot this node just installed. A node that received one
+        // is now a source for the next node that needs one; without this, every
+        // recovery would have to go back to the same leader.
+        if let Some(store) = self.snapshots.clone() {
+            match store.publish(meta, &data) {
+                Ok(_) => {
+                    if let Err(e) = store.prune(crate::snapshot_store::KEEP) {
+                        eprintln!("cluster: pruning old snapshots failed: {e}");
+                    }
+                }
+                // The install itself succeeded, so this is not a reason to fail
+                // it: the state is in memory and durable. It only means this
+                // node cannot yet hand the snapshot to someone else.
+                Err(e) => eprintln!(
+                    "cluster: installed a snapshot but could not persist it for later \
+                     transfers: {e}"
+                ),
+            }
+        }
+
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<RaftTypeConfig>>, StorageError<u64>> {
-        // This state machine keeps no snapshot cache: it is rebuilt by replaying
-        // the log at startup, and snapshots are produced on demand by the
-        // builder when openraft needs to ship one.
-        //
-        // Returning a freshly built snapshot here would be both expensive and
-        // wrong: openraft calls this during `Raft::new`, so every start would
-        // checkpoint every collection and archive the whole corpus before the
-        // node accepted a single request.
-        //
-        // Returning `None` is expensive in a different way, and the log line is
-        // the warning: openraft's replication asks for this only when a follower
-        // is behind the leader's purged prefix, and a missing snapshot there is
-        // not recoverable — replication stops with "snapshot not found" and the
-        // follower never catches up. An operator who sees this line is looking
-        // at a replica that has to be rebuilt from a backup, which is why it
-        // names the cause rather than leaving it to the transport.
-        eprintln!(
-            "cluster: a replica needs a snapshot but this node has none: it is behind a purged \
-             log prefix and cannot catch up by replay alone. Rebuild its data directory from a \
-             backup. (Snapshot transfer is not implemented yet; snapshotting is disabled by \
-             default for this reason.)"
-        );
-        Ok(None)
+        // Serve what was persisted, never a freshly assembled one. openraft asks
+        // this when a follower's next_index has fallen below the purged prefix,
+        // and rebuilding the archive here would checkpoint every collection
+        // while the replication task waits — turning "a replica is behind" into
+        // "every write on the leader is blocked".
+        let Some(store) = self.snapshots.clone() else {
+            eprintln!(
+                "cluster: a replica needs a snapshot but this node has no snapshot store \
+                 configured; it cannot catch up by replay alone and must be rebuilt from a \
+                 backup"
+            );
+            return Ok(None);
+        };
+
+        match store.read_current() {
+            Ok(Some((meta, data))) => Ok(Some(Snapshot {
+                meta,
+                snapshot: Box::new(std::io::Cursor::new(data)),
+            })),
+            Ok(None) => {
+                // The only correct reason to be here: no snapshot has been built
+                // yet, which cannot happen once one has been installed or built
+                // on this node. A follower that needs one now is stuck until the
+                // leader takes a new one, so this is worth saying out loud.
+                eprintln!(
+                    "cluster: a replica needs a snapshot and no snapshot has been built yet; \
+                     it will catch up when the next one is taken, or must be rebuilt from a \
+                     backup if the log prefix it needs is already purged"
+                );
+                Ok(None)
+            }
+            // Corruption is not absence. Reporting `None` here would tell
+            // openraft "this node has no snapshot", which is the same answer as
+            // a healthy node that has not built one, and would hide a disk
+            // problem behind a topology behaviour.
+            Err(e) => Err(StorageError::IO {
+                source: openraft::StorageIOError::read(&std::io::Error::other(format!(
+                    "the snapshot store is unreadable: {e}"
+                ))),
+            }),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_store::SnapshotStore;
     use openraft::CommittedLeaderId;
 
     fn make_log_id(index: u64) -> LogId<u64> {
@@ -1001,6 +1151,39 @@ mod tests {
         );
     }
 
+    /// A data collection this node owns but cannot open is divergence.
+    ///
+    /// The snapshot scope is filtered by what the engine has loaded, so a
+    /// collection missing from that map is silently omitted from the next
+    /// archive while the snapshot still claims to cover its boundary. Reads from
+    /// such a node return empty for records it is supposed to hold. Neither is a
+    /// transient, so the node stops answering instead.
+    #[tokio::test]
+    async fn a_collection_this_node_cannot_open_marks_it_not_ready() {
+        let provider = Arc::new(RecordingProvider::default());
+        provider.fail_materialize();
+
+        let mut sm = ClusterStateMachine::for_shard(1, ShardId(0));
+        sm.set_engine(provider.clone());
+        sm.set_apply_failure_flag(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+        let mut config = rekha_core::config::CollectionConfig::new(
+            "broken".into(),
+            3,
+            rekha_core::types::Distance::L2,
+        );
+        config.id = Uuid::new_v4();
+        sm.apply_operation(&ClusterOperation::AddCollection {
+            config,
+            shard: Some(ShardId(0)),
+        });
+
+        assert!(
+            sm.apply_failed(),
+            "a replica that cannot open data it owns must stop reporting readiness"
+        );
+    }
+
     #[test]
     fn test_apply_add_collection() {
         let mut sm = ClusterStateMachine::new();
@@ -1048,6 +1231,7 @@ mod tests {
         fail_checkpoint: std::sync::atomic::AtomicBool,
         fail_apply: std::sync::atomic::AtomicBool,
         slow_apply: std::sync::atomic::AtomicBool,
+        fail_materialize: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingProvider {
@@ -1066,6 +1250,10 @@ mod tests {
             self.slow_apply
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        fn fail_materialize(&self) {
+            self.fail_materialize
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl EngineSnapshotProvider for RecordingProvider {
@@ -1079,6 +1267,9 @@ mod tests {
         }
         fn restore_bytes(&self, archive: &[u8]) -> Result<Vec<u8>, String> {
             self.events.lock().unwrap().push("restore_bytes");
+            Ok(archive.to_vec())
+        }
+        fn snapshot_state(&self, archive: &[u8]) -> Result<Vec<u8>, String> {
             Ok(archive.to_vec())
         }
         fn checkpoint_all(&self, _collections: &[uuid::Uuid]) -> Result<usize, String> {
@@ -1102,6 +1293,12 @@ mod tests {
 
         fn materialize_collection(&self, _collection_id: &uuid::Uuid) -> Result<(), String> {
             self.events.lock().unwrap().push("materialize_collection");
+            if self
+                .fail_materialize
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("simulated materialize failure".into());
+            }
             Ok(())
         }
         fn drop_collection(&self, _collection_id: &uuid::Uuid) -> Result<(), String> {
@@ -1170,8 +1367,12 @@ mod tests {
     #[tokio::test]
     async fn snapshot_checkpoints_before_archiving_and_freezes_the_boundary() {
         let provider = Arc::new(RecordingProvider::default());
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut sm = ClusterStateMachine::new();
         sm.set_engine(provider.clone());
+        sm.set_snapshot_store(Arc::new(
+            SnapshotStore::open(dir.path(), "metadata").expect("store"),
+        ));
         sm.last_applied = Some(make_log_id(7));
 
         let mut builder = sm.get_snapshot_builder().await;
@@ -1207,6 +1408,71 @@ mod tests {
             vec!["checkpoint_all"],
             "nothing may be archived when the checkpoint failed"
         );
+    }
+
+    /// A snapshot has to outlive the call that built it. openraft drops the
+    /// reader it is handed, and a follower that needs a snapshot is the one that
+    /// cannot catch up any other way — so "build, return, forget" is how a
+    /// replica became permanently unrecoverable.
+    #[tokio::test]
+    async fn a_built_snapshot_is_persisted_and_served_by_a_later_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sm = ClusterStateMachine::for_metadata(1);
+        sm.set_engine(Arc::new(RecordingProvider::default()));
+        sm.set_snapshot_store(Arc::new(
+            SnapshotStore::open(dir.path(), "metadata").expect("store"),
+        ));
+        sm.last_applied = Some(make_log_id(11));
+
+        let mut builder = sm.get_snapshot_builder().await;
+        let built = builder.build_snapshot().await.expect("build");
+        assert_eq!(built.meta.last_log_id, Some(make_log_id(11)));
+
+        // A different call, after the builder's return value is gone.
+        let served = sm
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("the snapshot must still exist");
+        assert_eq!(served.meta.snapshot_id, built.meta.snapshot_id);
+        assert_eq!(served.meta.last_log_id, Some(make_log_id(11)));
+    }
+
+    /// A metadata archive and a shard archive are both `SnapshotPayload`s to
+    /// bincode. Without an identity check the wrong one installs cleanly and
+    /// replaces the group's state with the other group's.
+    #[tokio::test]
+    async fn a_metadata_snapshot_is_refused_by_a_shard_group() {
+        let meta_dir = tempfile::tempdir().expect("tempdir");
+        let mut meta_sm = ClusterStateMachine::for_metadata(1);
+        meta_sm.set_engine(Arc::new(RecordingProvider::default()));
+        meta_sm.set_snapshot_store(Arc::new(
+            SnapshotStore::open(meta_dir.path(), "metadata").expect("store"),
+        ));
+        meta_sm.last_applied = Some(make_log_id(5));
+
+        let mut builder = meta_sm.get_snapshot_builder().await;
+        builder.build_snapshot().await.expect("build");
+        let served = meta_sm
+            .get_current_snapshot()
+            .await
+            .expect("read")
+            .expect("a snapshot");
+
+        let shard_dir = tempfile::tempdir().expect("tempdir");
+        let mut shard_sm = ClusterStateMachine::for_shard(2, ShardId(5));
+        shard_sm.set_engine(Arc::new(RecordingProvider::default()));
+        shard_sm.set_snapshot_store(Arc::new(
+            SnapshotStore::open(shard_dir.path(), "shard:5").expect("store"),
+        ));
+
+        let err = shard_sm
+            .install_snapshot(&served.meta, served.snapshot)
+            .await
+            .expect_err("a metadata snapshot must not install into a shard group");
+        let message = err.to_string();
+        assert!(message.contains("refusing to install"), "{message}");
+        assert!(message.contains("shard:5"), "{message}");
     }
 
     /// Installing restores the engine first and then adopts the metadata, and it
@@ -1277,6 +1543,10 @@ mod tests {
         let source_provider = Arc::new(RecordingProvider::default());
         let mut source = ClusterStateMachine::new();
         source.set_engine(source_provider.clone());
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        source.set_snapshot_store(Arc::new(
+            SnapshotStore::open(source_dir.path(), "metadata").expect("store"),
+        ));
         source.last_applied = Some(make_log_id(5));
         source.nodes.insert(
             1,
@@ -1349,6 +1619,10 @@ mod tests {
         let mut source = ClusterStateMachine::for_metadata(1);
         source.set_catalog(source_catalog.clone());
         source.set_engine(Arc::new(RecordingProvider::default()));
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        source.set_snapshot_store(Arc::new(
+            SnapshotStore::open(source_dir.path(), "metadata").expect("store"),
+        ));
         source.last_applied = Some(make_log_id(9));
         source.placements.insert(config.id, ShardId(2));
 

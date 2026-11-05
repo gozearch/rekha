@@ -23,6 +23,24 @@ pub type GroupId = u32;
 /// The metadata group's id. Shard groups are `1..=shard_count`.
 pub const METADATA_GROUP: GroupId = 0;
 
+/// Chunk size used when openraft does not name one.
+///
+/// Matches openraft's `snapshot_max_chunk_size` default (3 MiB). The receiver's
+/// body limit has to exceed it, and is checked at startup by the API's internal
+/// router rather than assumed.
+const DEFAULT_SNAPSHOT_CHUNK: usize = 3 * 1024 * 1024;
+
+/// Floor for a chunk, so a misconfigured tiny value cannot turn one snapshot
+/// into tens of thousands of round trips while holding the replication slot.
+const MIN_SNAPSHOT_CHUNK: usize = 64 * 1024;
+
+/// Header names for the chunked snapshot upload.
+pub const SNAPSHOT_OFFSET_HEADER: &str = "x-rekha-snapshot-offset";
+pub const SNAPSHOT_TOTAL_HEADER: &str = "x-rekha-snapshot-total";
+pub const SNAPSHOT_FINAL_HEADER: &str = "x-rekha-snapshot-final";
+pub const SNAPSHOT_VOTE_HEADER: &str = "x-rekha-snapshot-vote";
+pub const SNAPSHOT_META_HEADER: &str = "x-rekha-snapshot-meta";
+
 /// HTTP-based network client for a single peer and a single consensus group.
 #[derive(Debug)]
 pub struct RaftNetworkImpl {
@@ -94,6 +112,66 @@ impl RaftNetworkImpl {
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }
+
+    /// Upload one chunk of a snapshot.
+    ///
+    /// The body is raw bytes: base64 inside JSON inflated the archive by a third
+    /// and made every chunk cost the same memory as an uncompressed one, which
+    /// is why the previous single-request version could not exceed 32 MiB.
+    ///
+    /// `offset` is exact, not advisory. The receiver appends only when it equals
+    /// the staging file's current length, so a retried or reordered chunk is
+    /// refused rather than silently filling a gap with the wrong bytes.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    async fn send_snapshot_chunk(
+        &self,
+        snapshot_id: &str,
+        offset: u64,
+        total: u64,
+        is_final: bool,
+        vote_json: &str,
+        meta_json: &str,
+        chunk: Vec<u8>,
+    ) -> Result<openraft::raft::SnapshotResponse<u64>, RPCError<u64, u64, RaftError<u64>>> {
+        let Some(addr) = self.addr.as_deref() else {
+            return Err(RPCError::Unreachable(Unreachable::new(&UnknownPeer {
+                target: self.target,
+            })));
+        };
+        let base = format!(
+            "{}/internal/raft/{}/snapshot/{}",
+            addr, self.group, snapshot_id
+        );
+        let mut request = self
+            .client
+            .post(&base)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(SNAPSHOT_OFFSET_HEADER, offset.to_string())
+            .header(SNAPSHOT_TOTAL_HEADER, total.to_string())
+            .header(SNAPSHOT_FINAL_HEADER, if is_final { "1" } else { "0" })
+            .header(SNAPSHOT_VOTE_HEADER, vote_json)
+            .header(SNAPSHOT_META_HEADER, meta_json)
+            .body(chunk);
+        if let Some(ref secret) = self.cluster_secret {
+            request = request.header("x-rekha-cluster-secret", secret);
+        }
+
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RPCError::Network(NetworkError::new(&RpcHttpError {
+                status: status.as_u16(),
+                body,
+            })));
+        }
+        resp.json::<openraft::raft::SnapshotResponse<u64>>()
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))
+    }
 }
 
 /// A peer with no configured address.
@@ -101,6 +179,24 @@ impl RaftNetworkImpl {
 struct UnknownPeer {
     target: u64,
 }
+
+/// A request that could not be encoded before it was sent.
+///
+/// Reported as unreachable because there is no `RPCError` variant for "this
+/// node is broken", and it is retryable from the cluster's point of view: the
+/// next attempt, after a restart, will not hit a serialization failure.
+#[derive(Debug)]
+struct RpcEncodeError {
+    detail: String,
+}
+
+impl Display for RpcEncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for RpcEncodeError {}
 
 impl Display for UnknownPeer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -189,19 +285,59 @@ impl RaftNetwork<RC> for RaftNetworkImpl {
     ) -> Result<openraft::raft::SnapshotResponse<u64>, StreamingError<RC, Fatal<u64>>> {
         let meta = snapshot.meta.clone();
         let data: Vec<u8> = (*snapshot.snapshot).into_inner();
-        // A snapshot has its own, longer deadline; the option is the caller's
-        // bound, not this transport's guess.
+
+        // One request per chunk, not one request for the archive. A single
+        // request had three ceilings that all had to be raised at once — the
+        // 32 MiB body limit, JSON/base64 expansion, and a 200 ms default
+        // deadline — and any one of them left a replica unable to rejoin. A
+        // chunk carries bytes, so the size of the archive is no longer a
+        // property of the transport.
+        //
+        // openraft supplies the size it wants; the constant is only the floor
+        // for the case where it does not.
+        let chunk_size = opt
+            .snapshot_chunk_size()
+            .unwrap_or(DEFAULT_SNAPSHOT_CHUNK)
+            .max(MIN_SNAPSHOT_CHUNK);
         let deadline = opt.hard_ttl();
-        let transfer = tokio::time::timeout(
-            deadline,
-            self.send_rpc::<_, openraft::raft::SnapshotResponse<u64>>(
-                // `send_rpc` already prefixes `/internal/raft/`; passing
-                // `raft/install_snapshot` produced `/internal/raft/raft/install_snapshot`,
-                // which never matches a route, so snapshot installs always 404'd.
-                "install_snapshot",
-                (vote, meta, data),
-            ),
-        );
+
+        let meta_json = serde_json::to_string(&meta).map_err(|e| {
+            StreamingError::Unreachable(Unreachable::new(&RpcEncodeError {
+                detail: format!("snapshot meta could not be encoded: {e}"),
+            }))
+        })?;
+        let vote_json = serde_json::to_string(&vote).map_err(|e| {
+            StreamingError::Unreachable(Unreachable::new(&RpcEncodeError {
+                detail: format!("snapshot vote could not be encoded: {e}"),
+            }))
+        })?;
+
+        let snapshot_id = meta.snapshot_id.clone();
+        let total = data.len() as u64;
+
+        let transfer = tokio::time::timeout(deadline, async {
+            let mut offset = 0usize;
+            loop {
+                let end = (offset + chunk_size).min(data.len());
+                let is_final = end == data.len();
+                let response = self
+                    .send_snapshot_chunk(
+                        &snapshot_id,
+                        offset as u64,
+                        total,
+                        is_final,
+                        &vote_json,
+                        &meta_json,
+                        data[offset..end].to_vec(),
+                    )
+                    .await?;
+                if is_final {
+                    return Ok::<_, RPCError<u64, u64, RaftError<u64>>>(response);
+                }
+                offset = end;
+            }
+        });
+
         match transfer.await {
             // The deadline elapsed: report it the way openraft reports an
             // unreachable peer, which is retryable.
@@ -531,7 +667,9 @@ mod tests {
         for (label, path) in [
             ("vote", "vote"),
             ("append_entries", "append_entries"),
-            ("install_snapshot", "install_snapshot"),
+            // Snapshots go to the chunked endpoint, whose target ends in the
+            // snapshot id from the meta below ("probe").
+            ("install_snapshot", "snapshot/probe"),
         ] {
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
                 .await

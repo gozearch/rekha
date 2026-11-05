@@ -242,24 +242,35 @@ pub fn placement_of(nodes: &[Node]) -> Placement {
 /// Deliberately not recomputed: the shard is a decision the metadata leader
 /// makes for load, so a test that derived it from the id would be comparing its
 /// own hash against itself rather than checking where the cluster put the data.
+///
+/// Retried, because creating a collection returns after the entry **commits**
+/// and a node records the row when it **applies** it. Under a loaded CI run the
+/// two are milliseconds apart but not the same moment, and a single pass turned
+/// that into "the cluster reports no shard".
 pub async fn shard_of(nodes: &[Node], collection: uuid::Uuid) -> Option<rekha_cluster::ShardId> {
-    for node in nodes {
-        let Ok(response) = client()
-            .get(node.url(&format!("/api/v2/collections/{collection}")))
-            .header("x-chroma-token", KEY)
-            .send()
-            .await
-        else {
-            continue;
-        };
-        let Ok(body) = response.json::<serde_json::Value>().await else {
-            continue;
-        };
-        if let Some(shard) = body["shard"].as_u64() {
-            return Some(rekha_cluster::ShardId(shard as u32));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        for node in nodes {
+            let Ok(response) = client()
+                .get(node.url(&format!("/api/v2/collections/{collection}")))
+                .header("x-chroma-token", KEY)
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(body) = response.json::<serde_json::Value>().await else {
+                continue;
+            };
+            if let Some(shard) = body["shard"].as_u64() {
+                return Some(rekha_cluster::ShardId(shard as u32));
+            }
         }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    None
 }
 
 pub fn has_data(node: &Node, collection: uuid::Uuid) -> bool {

@@ -296,6 +296,12 @@ impl Wal {
             file.write_all(&header)?;
             if options.fsync {
                 file.sync_all()?;
+                // The file's *name* is not durable until its directory is. A
+                // crash between creating the file and syncing the directory can
+                // leave the header blocks on disk with no directory entry
+                // pointing at them, and recovery then reports the collection as
+                // missing even though every acknowledged write to it was synced.
+                sync_dir(&file_path)?;
             }
             // A `start_seq` override moves the next append up to that seq, so
             // a checkpointed-and-fully-pruned collection resumes where its

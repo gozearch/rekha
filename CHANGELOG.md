@@ -124,6 +124,15 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `rekha verify` now opens every vector segment, so a corrupt one is reported
+  instead of passing as clean and then failing when the node tries to load the
+  collection. Segments carry their own header checksum rather than a manifest
+  CRC, and only the segment reader validated it — which meant the command
+  intended to gate a backup said "clean" for data that could not be opened.
+- A newly created WAL file's directory is fsynced after the header is written.
+  Without it, a crash could leave the header blocks on disk with no directory
+  entry pointing at them, and recovery would report the collection missing even
+  though every acknowledged write had been synced.
 - Cluster HTTP clients no longer consult a system proxy, and there is one per
   process rather than one per `AppState` and one per replication stream. Two
   reasons: `reqwest::Client::new()` reads the system proxy configuration, which

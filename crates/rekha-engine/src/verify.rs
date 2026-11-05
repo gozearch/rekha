@@ -361,10 +361,26 @@ fn verify_files(dir: &Path, id: &str, files: &[CheckpointFile], report: &mut Ver
             });
             continue;
         }
-        // No checksum means the file carries its own integrity check (a vector
-        // segment) or is derived and rebuildable (the index). Length is all
-        // there is to verify.
+        // No checksum means the file carries its own integrity check or is
+        // derived and rebuildable.
         let Some(expected) = entry.crc32 else {
+            // A vector segment is the first case, and its check lives in the
+            // segment header — which only the segment reader validates. Not
+            // opening it here would let `verify` report a directory clean and the
+            // node then refuse to open the collection, which is the opposite of
+            // what this command is for.
+            if entry.path.starts_with("segments/")
+                && let Err(e) = crate::segment::Segment::open(&path)
+            {
+                report.findings.push(Finding {
+                    scope: id.to_owned(),
+                    class: FindingClass::ChecksumMismatch,
+                    detail: format!("`{}`: {e}", entry.path),
+                });
+            }
+            // `index.bin` is the second case and is deliberately not
+            // inventoried: a lost graph must not reject a generation whose
+            // authoritative data is intact, and recovery rebuilds it.
             continue;
         };
         match std::fs::read(&path) {

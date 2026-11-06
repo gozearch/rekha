@@ -1,0 +1,173 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rekha.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rekha.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "rekha.headlessServiceName" . }}
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "rekha.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "rekha.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "rekha.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: rekha
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /scripts/entrypoint.sh
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: REKHA_DATA_DIR
+              value: /data
+            - name: REKHA_HOST
+              value: "0.0.0.0"
+            - name: REKHA_PORT
+              value: {{ .Values.ports.http | quote }}
+            - name: REKHA_INTERNAL_HOST
+              value: "0.0.0.0"
+            - name: REKHA_INTERNAL_PORT
+              value: {{ .Values.ports.internal | quote }}
+            - name: REKHA_SHARDS
+              value: {{ .Values.cluster.shards | quote }}
+            - name: REKHA_REPLICATION_FACTOR
+              value: {{ .Values.cluster.replicationFactor | quote }}
+            - name: REKHA_WAL_DURABILITY
+              value: {{ .Values.cluster.walDurability | quote }}
+            - name: REKHA_HEARTBEAT_MS
+              value: {{ .Values.cluster.heartbeatMs | quote }}
+            - name: REKHA_ELECTION_MIN_MS
+              value: {{ .Values.cluster.electionMinMs | quote }}
+            - name: REKHA_ELECTION_MAX_MS
+              value: {{ .Values.cluster.electionMaxMs | quote }}
+            - name: REKHA_SNAPSHOT_EVERY_N_LOGS
+              value: {{ .Values.cluster.snapshotEveryNLogs | quote }}
+            - name: REKHA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rekha.secretName" . }}
+                  key: REKHA_API_KEY
+            - name: REKHA_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rekha.secretName" . }}
+                  key: REKHA_CLUSTER_SECRET
+            {{- if or .Values.auth.keyPepper .Values.auth.existingSecret }}
+            - name: REKHA_KEY_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rekha.secretName" . }}
+                  key: REKHA_KEY_PEPPER
+                  optional: true
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+              protocol: TCP
+            - name: internal
+              containerPort: {{ .Values.ports.internal }}
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "rekha.fullname" . }}-scripts
+            defaultMode: 0755
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "rekha.selectorLabels" . | nindent 10 }}
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}

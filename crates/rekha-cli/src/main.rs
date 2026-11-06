@@ -1,5 +1,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod repl;
+
 use clap::{Parser, Subcommand};
 use reqwest::Client;
 use serde_json::Value;
@@ -311,6 +313,12 @@ enum Command {
     Count {
         /// Collection id (UUID).
         collection_id: String,
+    },
+    /// Interactive Vector Command REPL.
+    Repl {
+        /// Initial collection to use.
+        #[arg(long, short)]
+        collection: Option<String>,
     },
 }
 
@@ -918,6 +926,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ..Default::default()
             });
 
+            let shard_cluster_registry = match &topology {
+                Topology::Sharded(placement) | Topology::Joining(placement) => {
+                    Some(Arc::new(ShardCluster::new(placement.clone())))
+                }
+                Topology::Single => None,
+            };
+            if let Some(ref sc) = shard_cluster_registry {
+                sm.set_shards(sc.clone(), std::path::PathBuf::from(&data_dir));
+            }
+
             let raft = Arc::new(
                 openraft::Raft::<rekha_cluster::RaftTypeConfig>::new(
                     node_id,
@@ -929,7 +947,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     sm,
                 )
                 .await
-                .map_err(|e| format!("Raft initialization failed: {e}"))?,
+                .map_err(|e| format!("metadata Raft initialization failed: {e}"))?,
             );
 
             // Only the bootstrap node initializes. Every other node starts as a
@@ -1036,7 +1054,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let placement = placement.clone();
                     let log_dir = std::path::PathBuf::from(&data_dir).join("raft_log");
                     std::fs::create_dir_all(&log_dir)?;
-                    let cluster = ShardCluster::new(placement.clone());
+                    let cluster = shard_cluster_registry
+                        .clone()
+                        .ok_or("shard cluster registry missing")?;
                     for shard in &hosted_shards {
                         let index = shard.0;
                         let mut log_store =
@@ -1134,7 +1154,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         hosted.len(),
                         placement.shard_count()
                     );
-                    Some(Arc::new(cluster))
+                    Some(cluster)
                 }
                 Topology::Single => None,
             };
@@ -1627,6 +1647,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .send()
                 .await?;
             print_response(resp).await?;
+        }
+
+        Command::Repl { collection } => {
+            repl::run_repl(cli.url, collection).await?;
         }
 
         Command::Membership { action } => {

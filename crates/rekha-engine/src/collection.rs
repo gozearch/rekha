@@ -1351,9 +1351,14 @@ impl Collection {
         // Reopen so appends resume where the pruned log left off.
         let epoch = Epoch(self.wal.epoch());
         let wal_dir = self.wal_dir.clone();
-        self.wal = Wal::open(
+        let id = self.config.id;
+        let stem = match self.shard {
+            Some(s) => format!("{id}.shard-{}", s.0),
+            None => id.to_string(),
+        };
+        self.wal = Wal::open_named(
             &wal_dir,
-            &self.config.id,
+            &stem,
             epoch,
             WalOptions {
                 fsync: self.fsync,

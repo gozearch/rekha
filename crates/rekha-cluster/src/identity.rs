@@ -210,16 +210,6 @@ impl PeerDirectory {
         self.peers.read().is_empty()
     }
 
-    /// Every node except `node_id` — the set to replicate to, never including self.
-    pub fn others(&self, node_id: u64) -> BTreeMap<u64, String> {
-        self.peers
-            .read()
-            .iter()
-            .filter(|(id, _)| **id != node_id)
-            .map(|(id, addr)| (*id, addr.clone()))
-            .collect()
-    }
-
     /// Record where `node_id` lives. Returns whether this changed the directory.
     pub fn insert(&self, node_id: u64, addr: impl Into<String>) -> bool {
         let addr = addr.into();
@@ -468,17 +458,13 @@ mod tests {
     }
 
     #[test]
-    fn directory_resolves_urls_and_excludes_self() {
+    fn directory_resolves_urls() {
         let peers = parse_peers("1@10.0.0.1:8000,2@10.0.0.2:8000").unwrap();
         let dir = PeerDirectory::new(&peers);
 
         assert_eq!(dir.url(2).as_deref(), Some("http://10.0.0.2:8000"));
         assert_eq!(dir.url(9), None);
         assert_eq!(dir.ids(), vec![1, 2]);
-
-        let others = dir.others(1);
-        assert_eq!(others.len(), 1);
-        assert_eq!(others.get(&2).map(String::as_str), Some("10.0.0.2:8000"));
     }
 
     #[test]

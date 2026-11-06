@@ -1031,16 +1031,17 @@ impl Engine {
     // a follower merge it against its own state and diverge, so the log carries
     // complete values instead.
 
-    /// Build the operations an `add` would produce, without applying them.
-    pub fn prepare_add(
+    /// Build the operations an `add` would produce on a specific partition.
+    pub fn prepare_add_partition(
         &self,
         collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
         ids: &[Id],
         embeddings: &[Embedding],
         metadatas: Option<&[Option<Metadata>]>,
         documents: Option<&[Option<Document>]>,
     ) -> EngineResult<PreparedBatch> {
-        let coll = self.collection(collection_id)?;
+        let coll = self.collection_partition(collection_id, shard)?;
         let mut coll = coll.lock();
         coll.validate_add(ids, embeddings, metadatas, documents)?;
         let dimension = self.infer_dimension(&mut coll, collection_id, embeddings)?;
@@ -1059,23 +1060,6 @@ impl Engine {
         documents: Option<&[Option<Document>]>,
     ) -> EngineResult<PreparedBatch> {
         let coll = self.collection_partition(collection_id, shard)?;
-        let mut coll = coll.lock();
-        coll.validate_upsert(ids, embeddings, metadatas, documents)?;
-        let dimension = self.infer_dimension(&mut coll, collection_id, embeddings)?;
-        let ops = resolve_upsert_ops(&coll, ids, embeddings, metadatas, documents);
-        Ok(PreparedBatch { ops, dimension })
-    }
-
-    /// Build the operations an `upsert` would produce, without applying them.
-    pub fn prepare_upsert(
-        &self,
-        collection_id: &Uuid,
-        ids: &[Id],
-        embeddings: &[Embedding],
-        metadatas: Option<&[Option<MetadataPatch>]>,
-        documents: Option<&[Option<Document>]>,
-    ) -> EngineResult<PreparedBatch> {
-        let coll = self.collection(collection_id)?;
         let mut coll = coll.lock();
         coll.validate_upsert(ids, embeddings, metadatas, documents)?;
         let dimension = self.infer_dimension(&mut coll, collection_id, embeddings)?;
@@ -1113,43 +1097,42 @@ impl Engine {
         Ok(PreparedBatch { ops, dimension })
     }
 
-    /// Build the operations an `update` would produce, without applying them.
-    pub fn prepare_update(
+    /// Build the operations a `delete` would produce on a specific partition.
+    pub fn prepare_delete_partition(
         &self,
         collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
         ids: &[Id],
-        embeddings: Option<&[Embedding]>,
-        metadatas: Option<&[Option<MetadataPatch>]>,
-        documents: Option<&[Option<Document>]>,
     ) -> EngineResult<PreparedBatch> {
-        let coll = self.collection(collection_id)?;
-        let coll = coll.lock();
-        if let Some(embeddings) = embeddings
-            && embeddings.len() != ids.len()
-        {
-            return Err(EngineError::Validation(format!(
-                "update: {} ids but {} embeddings",
-                ids.len(),
-                embeddings.len()
-            )));
-        }
-        coll.validate_update(ids, metadatas, documents)?;
-        if let Some(embeddings) = embeddings {
-            crate::collection::check_dimensions("update", embeddings, coll.config.dimension)?;
-        }
-        let dimension = coll.config.dimension;
-        let ops = resolve_update_ops(&coll, ids, embeddings, metadatas, documents);
-        Ok(PreparedBatch { ops, dimension })
-    }
-
-    /// Build the operations a `delete` would produce, without applying them.
-    pub fn prepare_delete(&self, collection_id: &Uuid, ids: &[Id]) -> EngineResult<PreparedBatch> {
-        let coll = self.collection(collection_id)?;
+        let coll = self.collection_partition(collection_id, shard)?;
         let coll = coll.lock();
         let ops: Vec<Operation> = ids
             .iter()
             .map(|id| Operation::Delete { id: id.clone() })
             .collect();
+        Ok(PreparedBatch {
+            ops,
+            dimension: coll.config.dimension,
+        })
+    }
+
+    /// Prepare a delete whose target set is chosen by filters on a specific partition.
+    pub fn prepare_delete_where_partition(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        ids: Option<&[Id]>,
+        filter: Option<&WhereFilter>,
+        document: Option<&WhereDocument>,
+        limit: Option<usize>,
+    ) -> EngineResult<PreparedBatch> {
+        let coll = self.collection_partition(collection_id, shard)?;
+        let coll = coll.lock();
+        let mut ids = coll.select(ids, filter, document);
+        if let Some(limit) = limit {
+            ids.truncate(limit);
+        }
+        let ops: Vec<Operation> = ids.into_iter().map(|id| Operation::Delete { id }).collect();
         Ok(PreparedBatch {
             ops,
             dimension: coll.config.dimension,
@@ -1166,17 +1149,7 @@ impl Engine {
         document: Option<&WhereDocument>,
         limit: Option<usize>,
     ) -> EngineResult<PreparedBatch> {
-        let coll = self.collection(collection_id)?;
-        let coll = coll.lock();
-        let mut ids = coll.select(ids, filter, document);
-        if let Some(limit) = limit {
-            ids.truncate(limit);
-        }
-        let ops: Vec<Operation> = ids.into_iter().map(|id| Operation::Delete { id }).collect();
-        Ok(PreparedBatch {
-            ops,
-            dimension: coll.config.dimension,
-        })
+        self.prepare_delete_where_partition(collection_id, None, ids, filter, document, limit)
     }
 
     /// Checkpoint every collection whose applied-entry count has crossed the
@@ -1215,13 +1188,23 @@ impl Engine {
         Ok(ran)
     }
 
-    /// Append operations through the WAL and apply them. The single-node path.
-    pub fn append_ops(&self, collection_id: &Uuid, ops: &[Operation]) -> EngineResult<()> {
-        let coll = self.collection(collection_id)?;
+    /// Append operations through the WAL and apply them to a specific partition.
+    pub fn append_ops_partition(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        ops: &[Operation],
+    ) -> EngineResult<()> {
+        let coll = self.collection_partition(collection_id, shard)?;
         let mut coll = coll.lock();
         coll.write_ops(ops)?;
         coll.flush_if_needed()?;
         coll.auto_checkpoint(self.catalog.as_ref())
+    }
+
+    /// Append operations through the WAL and apply them. The single-node path.
+    pub fn append_ops(&self, collection_id: &Uuid, ops: &[Operation]) -> EngineResult<()> {
+        self.append_ops_partition(collection_id, None, ops)
     }
 
     /// Infer the vector width from the first embedding when the collection has
@@ -1246,12 +1229,15 @@ impl Engine {
         Ok(coll.config.dimension)
     }
 
-    /// Checkpoint one collection: persist its live records, HNSW index, and id
-    /// maps to `{wal_dir}/{id}.checkpoint/`, then prune the WAL down to the
-    /// un-checkpointed tail. A no-op for an empty collection. The WAL remains
-    /// the source of truth — this only accelerates reopen.
-    pub fn checkpoint(&self, collection_id: &Uuid) -> EngineResult<CheckpointOutcome> {
-        let coll = self.collection(collection_id)?;
+    /// Checkpoint a specific partition: persist its live records, HNSW index, and id
+    /// maps to `{wal_dir}/{stem}.checkpoint/`, then prune the WAL down to the
+    /// un-checkpointed tail. A no-op for an empty collection.
+    pub fn checkpoint_partition(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+    ) -> EngineResult<CheckpointOutcome> {
+        let coll = self.collection_partition(collection_id, shard)?;
         let mut coll = coll.lock();
         let outcome = coll.checkpoint(self.catalog.as_ref())?;
         // Exporting is also deferred cleanup: the checkpoint is already durable,
@@ -1259,11 +1245,20 @@ impl Engine {
         if let Err(e) = self.export_published_segments(&coll) {
             tracing::warn!(
                 collection = %collection_id,
+                ?shard,
                 "checkpoint published but the segment export failed: {e}"
             );
             return Ok(CheckpointOutcome::Published { deferred: "export" });
         }
         Ok(outcome)
+    }
+
+    /// Checkpoint one collection: persist its live records, HNSW index, and id
+    /// maps to `{wal_dir}/{id}.checkpoint/`, then prune the WAL down to the
+    /// un-checkpointed tail. A no-op for an empty collection. The WAL remains
+    /// the source of truth — this only accelerates reopen.
+    pub fn checkpoint(&self, collection_id: &Uuid) -> EngineResult<CheckpointOutcome> {
+        self.checkpoint_partition(collection_id, None)
     }
 
     /// Optimize a collection: force-flush the whole buffer into the index,

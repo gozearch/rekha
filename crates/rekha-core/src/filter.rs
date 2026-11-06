@@ -82,6 +82,7 @@ impl WhereFilter {
 
     /// Renders the filter to its canonical JSON string (operator form), for
     /// storage and logging.
+    #[cfg(test)]
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }

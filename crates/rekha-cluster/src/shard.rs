@@ -28,13 +28,15 @@ pub struct ShardCluster {
     /// has no instance for it, which is what makes "not my data" structural
     /// rather than a check that could be forgotten.
     groups: parking_lot::RwLock<HashMap<ShardId, Arc<Raft<RaftTypeConfig>>>>,
-    /// Collections this process has already ensured exist in their shard
-    /// group's log.
+    /// (Collection, Shard) pairs this process has already ensured exist in
+    /// their shard group's log.
     ///
     /// In memory on purpose: losing it costs one idempotent `AddCollection`
-    /// entry per collection after a restart, and a persisted copy would be a
-    /// second source of truth about what a log contains.
-    ensured: parking_lot::Mutex<HashSet<Uuid>>,
+    /// entry per collection per shard after a restart, and a persisted copy
+    /// would be a second source of truth about what a log contains.
+    ensured: parking_lot::Mutex<HashSet<(Uuid, ShardId)>>,
+    /// 2PC transaction IDs that have committed on the metadata consensus group.
+    committed_txs: parking_lot::RwLock<HashSet<Uuid>>,
 }
 
 impl std::fmt::Debug for ShardCluster {
@@ -52,6 +54,7 @@ impl ShardCluster {
             placement: parking_lot::RwLock::new(placement),
             groups: parking_lot::RwLock::new(HashMap::new()),
             ensured: parking_lot::Mutex::new(HashSet::new()),
+            committed_txs: parking_lot::RwLock::new(HashSet::new()),
         }
     }
 
@@ -117,13 +120,28 @@ impl ShardCluster {
 
     /// Whether the shard group for `collection` has already been told the
     /// collection exists.
-    pub fn is_ensured(&self, collection: Uuid) -> bool {
-        self.ensured.lock().contains(&collection)
+    pub fn is_ensured(&self, collection: Uuid, shard: ShardId) -> bool {
+        self.ensured.lock().contains(&(collection, shard))
     }
 
     /// Record that a shard group now knows about `collection`.
-    pub fn mark_ensured(&self, collection: Uuid) {
-        self.ensured.lock().insert(collection);
+    pub fn mark_ensured(&self, collection: Uuid, shard: ShardId) {
+        self.ensured.lock().insert((collection, shard));
+    }
+
+    /// Check whether a 2PC transaction has been committed globally.
+    pub fn is_tx_committed(&self, tx_id: &Uuid) -> bool {
+        self.committed_txs.read().contains(tx_id)
+    }
+
+    /// Mark a 2PC transaction as committed globally.
+    pub fn mark_tx_committed(&self, tx_id: Uuid) {
+        self.committed_txs.write().insert(tx_id);
+    }
+
+    /// Mark a 2PC transaction as aborted globally.
+    pub fn mark_tx_aborted(&self, tx_id: &Uuid) {
+        self.committed_txs.write().remove(tx_id);
     }
 }
 

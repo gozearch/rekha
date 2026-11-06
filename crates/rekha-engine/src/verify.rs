@@ -304,7 +304,11 @@ fn verify_checkpoint(base: &Path, id: &str, report: &mut VerifyReport) -> Option
         return None;
     }
 
-    if meta.collection_id != id {
+    let expected_collection_id = id
+        .split_once(".shard-")
+        .map(|(coll_id, _)| coll_id)
+        .unwrap_or(id);
+    if meta.collection_id != expected_collection_id {
         report.findings.push(Finding {
             scope: id.to_owned(),
             class: FindingClass::ForeignGeneration,
@@ -442,9 +446,21 @@ fn verify_wal(
     id: &str,
     report: &mut VerifyReport,
 ) -> Option<rekha_wal::WalInspection> {
-    // A `.wal` whose name is not a collection id is not this engine's file.
-    let collection_id = id.parse::<uuid::Uuid>().ok()?;
-    let inspection = match rekha_wal::Wal::inspect(wal_dir, &collection_id) {
+    // A `.wal` whose name is not a collection id or partitioned id
+    // (`{uuid}.shard-{n}`) is not this engine's file.
+    let base = id
+        .split_once(".shard-")
+        .map(|(u, s)| s.parse::<u32>().is_ok().then_some(u));
+    let is_valid = match base {
+        Some(Some(u)) => u.parse::<uuid::Uuid>().is_ok(),
+        Some(None) => false,
+        None => id.parse::<uuid::Uuid>().is_ok(),
+    };
+    if !is_valid {
+        return None;
+    }
+
+    let inspection = match rekha_wal::Wal::inspect_named(wal_dir, id) {
         Ok(inspection) => inspection,
         Err(e) => {
             report.findings.push(Finding {

@@ -1,0 +1,209 @@
+# Default values for RekhaDB production cluster.
+# This is a YAML-formatted file.
+
+# Number of cluster nodes. Must be >= 3 for high-availability Raft quorum.
+replicaCount: 3
+
+image:
+  repository: ghcr.io/rekha-db/rekha
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Cluster configuration
+cluster:
+  # The number of nodes in the bootstrap quorum (usually equals replicaCount initially).
+  # Nodes with ordinal < initialClusterSize participate in the bootstrap peer set.
+  # Nodes scaled above initialClusterSize join as learners and auto-register via postStart.
+  initialClusterSize: 3
+  # Placement shards (0 chooses 4 shards per node default).
+  # Once set on a new cluster, it cannot change without re-indexing.
+  shards: 12
+  # Replicas per shard. 3 tolerates 1 node failure.
+  replicationFactor: 3
+  # WAL durability: "durable" (fsyncs every batch) or "relaxed" (acknowledges on OS write).
+  walDurability: durable
+  # Raft election and heartbeat timings in milliseconds.
+  # Tuned for Kubernetes network jitter (higher than bare-metal defaults).
+  heartbeatMs: 500
+  electionMinMs: 1500
+  electionMaxMs: 3000
+  # Number of log entries before triggering a Raft snapshot and log purge.
+  # Set to 10000 or greater to prevent unbounded log growth.
+  snapshotEveryNLogs: 10000
+
+# Authentication and Secrets
+auth:
+  # Name of an existing Secret containing keys:
+  #   - REKHA_API_KEY
+  #   - REKHA_CLUSTER_SECRET
+  #   - REKHA_KEY_PEPPER (optional)
+  existingSecret: ""
+  # Explicit API key (minimum 32 characters).
+  # If left empty and existingSecret is empty, a random 32-byte key is generated during helm install.
+  apiKey: ""
+  # Explicit cluster secret for inter-node Raft communication (minimum 32 bytes).
+  # If left empty and existingSecret is empty, a random 32-byte secret is generated during helm install.
+  clusterSecret: ""
+  # Optional pepper for hashing API tokens.
+  keyPepper: ""
+
+# Listener ports
+ports:
+  http: 8000
+  internal: 9000
+  metrics: 9100
+
+# Client Service (exposes port 8000 for vector read/write operations)
+service:
+  type: ClusterIP
+  port: 8000
+  annotations: {}
+
+# Headless Service (exposes both 8000 and 9000 with publishNotReadyAddresses: true for Raft quorum)
+headlessService:
+  annotations: {}
+
+# Persistent Volume Claims for RekhaDB WAL and catalog data
+persistence:
+  enabled: true
+  # High-performance SSD/NVMe StorageClass recommended for Raft fsync latency.
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 20Gi
+  annotations: {}
+
+# Compute and memory resources
+resources:
+  requests:
+    cpu: 1000m
+    memory: 2Gi
+  limits:
+    cpu: 4000m
+    memory: 8Gi
+
+# Pod Security Context
+podSecurityContext:
+  fsGroup: 10001
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container Security Context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+
+# PodDisruptionBudget protects Raft quorum during node drains and cluster upgrades
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# NetworkPolicy isolates the internal Raft listener (port 9000)
+networkPolicy:
+  enabled: true
+  # Allow incoming client HTTP traffic from anywhere in the cluster to port 8000
+  allowExternalHttp: true
+
+# Dedicated ServiceAccount
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# Scheduling and placement
+nodeSelector: {}
+tolerations: []
+
+# High-availability pod anti-affinity by default
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - rekha
+          topologyKey: kubernetes.io/hostname
+      - weight: 50
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - rekha
+          topologyKey: topology.kubernetes.io/zone
+
+topologySpreadConstraints: []
+
+# Optional Ingress for external client traffic
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: rekha.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Prometheus metrics and alerts
+metrics:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    scrapeTimeout: 10s
+    labels: {}
+  prometheusRule:
+    enabled: false
+    labels: {}
+    # Alerts directly matching docs/operations.md
+    alerts:
+      nodeNotReady:
+        enabled: true
+        severity: critical
+        for: 1m
+      raftQuorumAgeHigh:
+        enabled: true
+        severity: critical
+        for: 30s
+      raftLogGrowing:
+        enabled: true
+        severity: warning
+        for: 15m
+      diskLow:
+        enabled: true
+        severity: critical
+        thresholdPercent: 40
+
+# Optional Automated Backup CronJob
+backup:
+  enabled: false
+  schedule: "0 2 * * *" # Daily at 2:00 AM UTC
+  retentionDays: 7
+  persistence:
+    storageClass: ""
+    size: 50Gi

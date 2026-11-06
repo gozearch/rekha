@@ -1,0 +1,56 @@
+{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "rekha.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rekha.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: rekha.rules
+      rules:
+        {{- if .Values.metrics.prometheusRule.alerts.nodeNotReady.enabled }}
+        - alert: RekhaNodeNotReady
+          expr: probe_success{job="{{ include "rekha.fullname" . }}"} == 0
+          for: {{ .Values.metrics.prometheusRule.alerts.nodeNotReady.for }}
+          labels:
+            severity: {{ .Values.metrics.prometheusRule.alerts.nodeNotReady.severity }}
+          annotations:
+            summary: "RekhaDB node {{ "{{ $labels.instance }}" }} is not ready"
+            description: "The node has returned /ready != 200 for more than 1 minute. It cannot serve writes or has diverged from cluster state."
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.alerts.raftQuorumAgeHigh.enabled }}
+        - alert: RekhaRaftQuorumAgeHigh
+          expr: rekha_raft_quorum_age_ms > (3 * {{ .Values.cluster.heartbeatMs }})
+          for: {{ .Values.metrics.prometheusRule.alerts.raftQuorumAgeHigh.for }}
+          labels:
+            severity: {{ .Values.metrics.prometheusRule.alerts.raftQuorumAgeHigh.severity }}
+          annotations:
+            summary: "RekhaDB node {{ "{{ $labels.instance }}" }} Raft quorum age is high"
+            description: "Raft quorum age exceeded 3x heartbeat interval. The node may be network-isolated or disk I/O stalled."
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.alerts.raftLogGrowing.enabled }}
+        - alert: RekhaRaftLogGrowing
+          expr: predict_linear(rekha_raft_log_bytes[1h], 86400) > 50 * 1024 * 1024 * 1024
+          for: {{ .Values.metrics.prometheusRule.alerts.raftLogGrowing.for }}
+          labels:
+            severity: {{ .Values.metrics.prometheusRule.alerts.raftLogGrowing.severity }}
+          annotations:
+            summary: "RekhaDB Raft log growing without bound"
+            description: "Raft log is monotonically increasing. Ensure REKHA_SNAPSHOT_EVERY_N_LOGS is configured and snapshots are completing."
+        {{- end }}
+        {{- if .Values.metrics.prometheusRule.alerts.diskLow.enabled }}
+        - alert: RekhaDiskSpaceLow
+          expr: (kubelet_volume_stats_available_bytes{persistentvolumeclaim=~"data-{{ include "rekha.fullname" . }}-.*"} / kubelet_volume_stats_capacity_bytes) * 100 < {{ .Values.metrics.prometheusRule.alerts.diskLow.thresholdPercent }}
+          for: 5m
+          labels:
+            severity: {{ .Values.metrics.prometheusRule.alerts.diskLow.severity }}
+          annotations:
+            summary: "RekhaDB disk space is below {{ .Values.metrics.prometheusRule.alerts.diskLow.thresholdPercent }}%"
+            description: "Rekha snapshot compacting requires up to 3x data size headroom. Increase PVC storage capacity."
+        {{- end }}
+{{- end }}

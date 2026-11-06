@@ -283,21 +283,6 @@ fn tmp_sibling(path: &Path) -> std::path::PathBuf {
 }
 
 impl UsearchIndex {
-    /// Restore an index without the caller stating its space and dimension.
-    ///
-    /// Recovery loads a checkpoint without trusting anything the manifest does
-    /// not verify, and the index is derived state anyway. This reads the
-    /// persisted parameters, then delegates to [`UsearchIndex::load`] so every
-    /// consistency check still runs.
-    pub fn load_any(path: &Path) -> IndexResult<Self> {
-        let bytes = std::fs::read(path.with_extension("meta"))?;
-        let meta: IndexMeta = bincode::deserialize(&bytes)?;
-        let space: Distance = meta.space.parse().map_err(|e| {
-            IndexError::Corrupt(format!("persisted space `{}` is invalid: {e}", meta.space))
-        })?;
-        Self::load(path, space, meta.dimension)
-    }
-
     /// Restore an index previously written by [`Index::save`].
     ///
     /// Reads `path.with_extension("meta")` (the bincode maps) and `path` (the

@@ -1,0 +1,23 @@
+apiVersion: v2
+name: rekha
+description: A production-ready Helm chart for RekhaDB, an embeddable and clustered vector database.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - vector-database
+  - chroma
+  - embeddings
+  - hnsw
+  - raft
+  - distributed
+home: https://github.com/rekha-db/rekha
+sources:
+  - https://github.com/rekha-db/rekha
+maintainers:
+  - name: rekha-maintainers
+    email: maintainers@rekha.io
+icon: https://raw.githubusercontent.com/rekha-db/rekha/main/assets/logo.jpg
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/prerelease: "false"

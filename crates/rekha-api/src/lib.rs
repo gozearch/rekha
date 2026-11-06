@@ -17,7 +17,7 @@ use rekha_cluster::raft_types::ClusterOperation;
 use rekha_core::config::CollectionConfig;
 use rekha_core::filter::WhereFilter;
 use rekha_core::types::{Distance, Embedding, Id, Metadata};
-use rekha_engine::{Engine, EngineError, QueryOptions, add_ops};
+use rekha_engine::{Engine, EngineError, QueryOptions};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -286,6 +286,9 @@ pub struct ServerConfig {
     pub allow_open_mode: bool,
 }
 
+type ShardWriteLockMap =
+    HashMap<(Uuid, Option<rekha_cluster::ShardId>), Arc<tokio::sync::Mutex<()>>>;
+
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub tenant: String,
@@ -347,11 +350,11 @@ pub struct AppState {
     /// One async lock per collection, held from prepare through propose.
     ///
     /// The single-node path validates and writes inside one collection lock, so
-    /// two metadata updates cannot merge from the same base. Splitting prepare
+    /// Two metadata updates cannot merge from the same base. Splitting prepare
     /// from apply would reopen that window; this closes it again, and costs
     /// nothing in throughput because the log already totals-orders writes to a
-    /// collection.
-    write_locks: parking_lot::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    /// collection partition.
+    write_locks: parking_lot::Mutex<ShardWriteLockMap>,
     /// Serialises snapshot chunk appends.
     ///
     /// Chunks of one transfer must land in order and without interleaving: the
@@ -528,10 +531,14 @@ impl AppState {
         self
     }
 
-    fn write_lock(&self, collection_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    fn write_lock(
+        &self,
+        collection_id: Uuid,
+        shard: Option<rekha_cluster::ShardId>,
+    ) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.write_locks.lock();
         locks
-            .entry(collection_id)
+            .entry((collection_id, shard))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -540,6 +547,32 @@ impl AppState {
     pub fn with_peer_directory(mut self, peers: rekha_cluster::PeerDirectory) -> Self {
         self.peers = peers;
         self
+    }
+
+    /// Return target nodes for `shard`: leader first if known, then remaining owners.
+    pub(crate) fn shard_targets(&self, shard: rekha_cluster::ShardId) -> Vec<u64> {
+        let Some(shards) = self.shards.as_ref() else {
+            return Vec::new();
+        };
+        let mut targets = Vec::new();
+        if let Some(leader) = shards.leader(shard) {
+            targets.push(leader);
+        }
+        for owner in shards.owners(shard) {
+            if !targets.contains(&owner) {
+                targets.push(owner);
+            }
+        }
+        targets
+    }
+
+    /// Build an internal HTTP POST request with cluster secret header attached.
+    pub(crate) fn internal_post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        let mut req = self.http.post(url);
+        if let Some(ref secret) = self.cluster_secret {
+            req = req.header(crate::leadership::SECRET_HEADER, secret);
+        }
+        req
     }
 }
 
@@ -908,7 +941,8 @@ where
 {
     // The guard is owned so it can be held across awaits without borrowing the
     // state borrow that produced it.
-    let lock = state.write_lock(collection_id);
+    let shard = state.shard_of(&collection_id);
+    let lock = state.write_lock(collection_id, shard);
     let _guard = lock.lock_owned().await;
 
     let prepared = offload(prepare).await?;
@@ -923,9 +957,14 @@ pub(crate) async fn commit_batch_for_shard(
     collection_id: Uuid,
     prepared: rekha_engine::PreparedBatch,
 ) -> Result<(), ApiError> {
+    if prepared.ops.is_empty() {
+        return Ok(());
+    }
+
     if !state.data_via_log {
         let engine = state.engine.clone();
-        offload(move || engine.append_ops(&collection_id, &prepared.ops)).await?;
+        offload(move || engine.append_ops_partition(&collection_id, Some(shard), &prepared.ops))
+            .await?;
         return Ok(());
     }
 
@@ -945,7 +984,7 @@ pub(crate) async fn commit_batch_for_shard(
         .get_collection_by_id(&collection_id)?
         .ok_or_else(|| EngineError::CollectionNotFound(collection_id.to_string()))?;
 
-    if !shards.is_ensured(collection_id) {
+    if !shards.is_ensured(collection_id, shard) {
         raft.client_write(ClusterOperation::AddCollection {
             config: record.config,
             shard: Some(shard),
@@ -956,7 +995,7 @@ pub(crate) async fn commit_batch_for_shard(
                 "could not tell shard {shard} about collection {collection_id}: {e}"
             ))
         })?;
-        shards.mark_ensured(collection_id);
+        shards.mark_ensured(collection_id, shard);
     }
 
     let operation = ClusterOperation::Batch {
@@ -1071,10 +1110,66 @@ async fn commit_batch(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ShardWriteKind {
+    Add {
+        ids: Vec<Id>,
+        embeddings: Vec<Vec<f32>>,
+        metadatas: Option<Vec<Option<Metadata>>>,
+        documents: Option<Vec<Option<String>>>,
+    },
+    Upsert {
+        ids: Vec<Id>,
+        embeddings: Vec<Vec<f32>>,
+        metadatas: Option<Vec<Option<rekha_core::types::MetadataPatch>>>,
+        documents: Option<Vec<Option<String>>>,
+    },
+    Update {
+        ids: Vec<Id>,
+        embeddings: Option<Vec<Vec<f32>>>,
+        metadatas: Option<Vec<Option<rekha_core::types::MetadataPatch>>>,
+        documents: Option<Vec<Option<String>>>,
+    },
+    Delete {
+        ids: Vec<Id>,
+    },
+    DeleteWhere {
+        ids: Option<Vec<Id>>,
+        filter: Option<WhereFilter>,
+        document: Option<rekha_core::filter::WhereDocument>,
+        limit: Option<usize>,
+    },
+    Prepared {
+        ops: Vec<rekha_core::op::Operation>,
+        dimension: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardBatchRequest {
     pub collection_id: Uuid,
-    pub ops: Vec<rekha_core::op::Operation>,
-    pub dimension: usize,
+    pub kind: ShardWriteKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardPrepareRequest {
+    pub tx_id: Uuid,
+    pub collection_id: Uuid,
+    pub kind: ShardWriteKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardCommitRequest {
+    pub tx_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardAbortRequest {
+    pub tx_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardBatchResponse {
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1111,7 +1206,7 @@ pub(crate) type SubBatchUpsert = (
 );
 pub(crate) type SubBatchUpdate = (
     Vec<Id>,
-    Option<Vec<Embedding>>,
+    Option<Vec<Vec<f32>>>,
     Option<Vec<Option<rekha_core::types::MetadataPatch>>>,
     Option<Vec<Option<String>>>,
 );
@@ -1147,79 +1242,602 @@ pub(crate) fn is_partitioned_requested(explicit: Option<bool>, meta: Option<&Met
         .unwrap_or(false)
 }
 
-async fn dispatch_shard_batch(
+pub(crate) async fn check_shard_read_barrier(
+    raft: &Arc<openraft::Raft<rekha_cluster::RaftTypeConfig>>,
+) -> Result<(), ApiError> {
+    let single_voter = {
+        let metrics = raft.metrics();
+        let m = metrics.borrow();
+        m.membership_config.membership().voter_ids().count() <= 1
+    };
+    if single_voter {
+        return Ok(());
+    }
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        raft.ensure_linearizable(),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => {
+            tracing::warn!(%err, "rejecting shard read: this node can no longer prove it leads");
+            let leader = raft.metrics().borrow().current_leader;
+            Err(ApiError::NotLeader { leader })
+        }
+        Err(_) => {
+            tracing::warn!("rejecting shard read: no quorum confirmation within deadline");
+            let leader = raft.metrics().borrow().current_leader;
+            Err(ApiError::NotLeader { leader })
+        }
+    }
+}
+
+async fn ensure_collection_on_shard(
     state: &AppState,
     shard: rekha_cluster::ShardId,
-    req: ShardBatchRequest,
+    collection_id: Uuid,
+) -> Result<(), ApiError> {
+    let record = match state.engine.get_collection_by_id(&collection_id)? {
+        Some(r) => r,
+        None => {
+            return Err(ApiError::Engine(EngineError::Unavailable(format!(
+                "collection {collection_id} metadata not yet applied on shard replica; retry shortly"
+            ))));
+        }
+    };
+    if let Some(shards) = state.shards.as_ref()
+        && let Some(raft) = shards.raft(shard)
+        && !shards.is_ensured(collection_id, shard)
+    {
+        raft.client_write(ClusterOperation::AddCollection {
+            config: record.config.clone(),
+            shard: Some(shard),
+        })
+        .await
+        .map_err(|e| {
+            EngineError::Recovery(format!(
+                "could not tell shard {shard} about collection {collection_id}: {e}"
+            ))
+        })?;
+        shards.mark_ensured(collection_id, shard);
+    }
+    Ok(())
+}
+
+async fn resolve_shard_write_kind(
+    state: &AppState,
+    shard: rekha_cluster::ShardId,
+    collection_id: Uuid,
+    kind: ShardWriteKind,
+) -> Result<(rekha_engine::PreparedBatch, usize), ApiError> {
+    match kind {
+        ShardWriteKind::Add {
+            ids,
+            embeddings,
+            metadatas,
+            documents,
+        } => {
+            let engine = state.engine.clone();
+            let embs: Vec<Embedding> = embeddings.into_iter().map(Embedding::from).collect();
+            let p = offload(move || {
+                engine.prepare_add_partition(
+                    &collection_id,
+                    Some(shard),
+                    &ids,
+                    &embs,
+                    metadatas.as_deref(),
+                    documents.as_deref(),
+                )
+            })
+            .await?;
+            let n = p.ops.len();
+            Ok((p, n))
+        }
+        ShardWriteKind::Upsert {
+            ids,
+            embeddings,
+            metadatas,
+            documents,
+        } => {
+            let engine = state.engine.clone();
+            let embs: Vec<Embedding> = embeddings.into_iter().map(Embedding::from).collect();
+            let p = offload(move || {
+                engine.prepare_upsert_partition(
+                    &collection_id,
+                    Some(shard),
+                    &ids,
+                    &embs,
+                    metadatas.as_deref(),
+                    documents.as_deref(),
+                )
+            })
+            .await?;
+            let n = p.ops.len();
+            Ok((p, n))
+        }
+        ShardWriteKind::Update {
+            ids,
+            embeddings,
+            metadatas,
+            documents,
+        } => {
+            let engine = state.engine.clone();
+            let embs: Option<Vec<Embedding>> =
+                embeddings.map(|e| e.into_iter().map(Embedding::from).collect());
+            let p = offload(move || {
+                engine.prepare_update_partition(
+                    &collection_id,
+                    Some(shard),
+                    &ids,
+                    embs.as_deref(),
+                    metadatas.as_deref(),
+                    documents.as_deref(),
+                )
+            })
+            .await?;
+            let n = p.ops.len();
+            Ok((p, n))
+        }
+        ShardWriteKind::Delete { ids } => {
+            let engine = state.engine.clone();
+            let n = ids.len();
+            let p =
+                offload(move || engine.prepare_delete_partition(&collection_id, Some(shard), &ids))
+                    .await?;
+            Ok((p, n))
+        }
+        ShardWriteKind::DeleteWhere {
+            ids,
+            filter,
+            document,
+            limit,
+        } => {
+            let engine = state.engine.clone();
+            let p = offload(move || {
+                engine.prepare_delete_where_partition(
+                    &collection_id,
+                    Some(shard),
+                    ids.as_deref(),
+                    filter.as_ref(),
+                    document.as_ref(),
+                    limit,
+                )
+            })
+            .await?;
+            let n = p.ops.len();
+            Ok((p, n))
+        }
+        ShardWriteKind::Prepared { ops, dimension } => {
+            let n = ops.len();
+            Ok((rekha_engine::PreparedBatch { ops, dimension }, n))
+        }
+    }
+}
+
+pub(crate) async fn commit_write_for_shard(
+    state: &AppState,
+    shard: rekha_cluster::ShardId,
+    collection_id: Uuid,
+    kind: ShardWriteKind,
+) -> Result<usize, ApiError> {
+    let lock = state.write_lock(collection_id, Some(shard));
+    let _guard = lock.lock_owned().await;
+
+    ensure_collection_on_shard(state, shard, collection_id).await?;
+    let (prepared, count) = resolve_shard_write_kind(state, shard, collection_id, kind).await?;
+    commit_batch_for_shard(state, shard, collection_id, prepared).await?;
+    Ok(count)
+}
+
+pub(crate) async fn prepare_write_for_shard(
+    state: &AppState,
+    shard: rekha_cluster::ShardId,
+    tx_id: Uuid,
+    collection_id: Uuid,
+    kind: ShardWriteKind,
+) -> Result<usize, ApiError> {
+    let lock = state.write_lock(collection_id, Some(shard));
+    let _guard = lock.lock_owned().await;
+
+    ensure_collection_on_shard(state, shard, collection_id).await?;
+    let (prepared, count) = resolve_shard_write_kind(state, shard, collection_id, kind).await?;
+
+    if prepared.ops.is_empty() {
+        return Ok(0);
+    }
+
+    let Some(shards) = state.shards.as_ref() else {
+        return Err(ApiError::Engine(EngineError::Unavailable(
+            "no shards configured".into(),
+        )));
+    };
+    let Some(raft) = shards.raft(shard) else {
+        return Err(ApiError::Engine(EngineError::NotReplica {
+            collection: collection_id.to_string(),
+            shard: Some(shard),
+        }));
+    };
+
+    let operation = ClusterOperation::PrepareBatch {
+        tx_id,
+        collection_id,
+        ops: prepared.ops,
+        dimension: prepared.dimension,
+    };
+
+    match raft.client_write(operation).await {
+        Ok(response) => {
+            match serde_json::from_str::<rekha_cluster::BatchResponse>(&response.data) {
+                Ok(applied) => match applied.error {
+                    None => Ok(count),
+                    Some(error) => Err(ApiError::Engine(EngineError::Recovery(format!(
+                        "2PC prepare committed at log index {} but could not stage: {error}",
+                        applied.seq
+                    )))),
+                },
+                Err(_) => Ok(count),
+            }
+        }
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(forward),
+        )) => Err(ApiError::NotLeader {
+            leader: forward.leader_id.or(forward.leader_node),
+        }),
+        Err(e) => Err(ApiError::Engine(EngineError::Recovery(format!(
+            "2PC prepare failed on shard {shard}: {e}"
+        )))),
+    }
+}
+
+pub(crate) async fn commit_tx_for_shard(
+    state: &AppState,
+    shard: rekha_cluster::ShardId,
+    tx_id: Uuid,
 ) -> Result<(), ApiError> {
     let Some(shards) = state.shards.as_ref() else {
         return Err(ApiError::Engine(EngineError::Unavailable(
             "no shards configured".into(),
         )));
     };
+    let Some(raft) = shards.raft(shard) else {
+        return Err(ApiError::Engine(EngineError::Unavailable(format!(
+            "shard {shard} not hosted here"
+        ))));
+    };
 
-    if let Some(raft) = shards.raft(shard) {
-        let m = raft.metrics();
-        let leads = m.borrow().current_leader == Some(m.borrow().id);
-        if leads {
-            let prepared = rekha_engine::PreparedBatch {
-                ops: req.ops,
-                dimension: req.dimension,
+    let operation = ClusterOperation::CommitBatch { tx_id };
+    match raft.client_write(operation).await {
+        Ok(_) => Ok(()),
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(forward),
+        )) => Err(ApiError::NotLeader {
+            leader: forward.leader_id.or(forward.leader_node),
+        }),
+        Err(e) => Err(ApiError::Engine(EngineError::Recovery(format!(
+            "commit 2PC tx {tx_id} failed on shard {shard}: {e}"
+        )))),
+    }
+}
+
+pub(crate) async fn abort_tx_for_shard(
+    state: &AppState,
+    shard: rekha_cluster::ShardId,
+    tx_id: Uuid,
+) -> Result<(), ApiError> {
+    let Some(shards) = state.shards.as_ref() else {
+        return Ok(());
+    };
+    let Some(raft) = shards.raft(shard) else {
+        return Ok(());
+    };
+
+    let operation = ClusterOperation::AbortBatch { tx_id };
+    let _ = raft.client_write(operation).await;
+    Ok(())
+}
+
+async fn dispatch_shard_prepare(
+    state: &AppState,
+    shard: rekha_cluster::ShardId,
+    req: ShardPrepareRequest,
+) -> Result<usize, ApiError> {
+    let Some(shards) = state.shards.as_ref() else {
+        return Err(ApiError::Engine(EngineError::Unavailable(
+            "no shards configured".into(),
+        )));
+    };
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(raft) = shards.raft(shard)
+            && raft.metrics().borrow().current_leader == Some(raft.metrics().borrow().id)
+        {
+            match prepare_write_for_shard(
+                state,
+                shard,
+                req.tx_id,
+                req.collection_id,
+                req.kind.clone(),
+            )
+            .await
+            {
+                Ok(count) => return Ok(count),
+                Err(ApiError::NotLeader { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut should_retry = false;
+        for target in state.shard_targets(shard) {
+            let Some(url) = state.peers.url(target) else {
+                continue;
             };
-            return commit_batch_for_shard(state, shard, req.collection_id, prepared).await;
+            match state
+                .internal_post(format!("{url}/internal/shard/{}/prepare", shard.0))
+                .json(&req)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let res: ShardBatchResponse = resp.json().await.map_err(|e| {
+                        ApiError::Engine(EngineError::Recovery(format!(
+                            "invalid prepare response from shard {}: {e}",
+                            shard.0
+                        )))
+                    })?;
+                    return Ok(res.count);
+                }
+                Ok(resp) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                    should_retry = true;
+                    if let Some(leader_id) = resp
+                        .headers()
+                        .get(crate::leadership::LEADER_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        && let Some(leader_url) = state.peers.url(leader_id)
+                        && let Ok(resp2) = state
+                            .internal_post(format!(
+                                "{leader_url}/internal/shard/{}/prepare",
+                                shard.0
+                            ))
+                            .json(&req)
+                            .send()
+                            .await
+                        && resp2.status().is_success()
+                    {
+                        let res: ShardBatchResponse = resp2.json().await.map_err(|e| {
+                            ApiError::Engine(EngineError::Recovery(format!(
+                                "invalid prepare response from shard {}: {e}",
+                                shard.0
+                            )))
+                        })?;
+                        return Ok(res.count);
+                    }
+                }
+                Ok(resp) if resp.status().is_client_error() => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ApiError::Engine(EngineError::Validation(body)));
+                }
+                _ => should_retry = true,
+            }
+        }
+
+        if should_retry {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        } else {
+            break;
         }
     }
 
-    let target_leader = shards.leader(shard);
-    let owners = shards.owners(shard);
-    let mut targets = Vec::new();
-    if let Some(l) = target_leader {
-        targets.push(l);
-    }
-    for o in owners {
-        if !targets.contains(&o) {
-            targets.push(o);
-        }
+    Err(ApiError::Engine(EngineError::Unavailable(format!(
+        "could not reach leader for shard {} to prepare 2PC",
+        shard.0
+    ))))
+}
+
+async fn dispatch_shard_commit(
+    state: &AppState,
+    shard: rekha_cluster::ShardId,
+    tx_id: Uuid,
+) -> Result<(), ApiError> {
+    let Some(shards) = state.shards.as_ref() else {
+        return Ok(());
+    };
+    if let Some(raft) = shards.raft(shard)
+        && raft.metrics().borrow().current_leader == Some(raft.metrics().borrow().id)
+    {
+        return commit_tx_for_shard(state, shard, tx_id).await;
     }
 
-    for target in targets {
+    let req = ShardCommitRequest { tx_id };
+    for target in state.shard_targets(shard) {
         let Some(url) = state.peers.url(target) else {
             continue;
         };
-        let mut request = state
-            .http
-            .post(format!("{url}/internal/shard/{}/batch", shard.0))
-            .json(&req);
-        if let Some(ref secret) = state.cluster_secret {
-            request = request.header(crate::leadership::SECRET_HEADER, secret);
-        }
-        match request.send().await {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
-            Ok(resp) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => {
-                if let Some(leader_id) = resp
-                    .headers()
-                    .get(crate::leadership::LEADER_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    && let Some(leader_url) = state.peers.url(leader_id)
-                {
-                    let mut req2 = state
-                        .http
-                        .post(format!("{leader_url}/internal/shard/{}/batch", shard.0))
-                        .json(&req);
-                    if let Some(ref secret) = state.cluster_secret {
-                        req2 = req2.header(crate::leadership::SECRET_HEADER, secret);
-                    }
-                    if let Ok(resp2) = req2.send().await
-                        && resp2.status().is_success()
-                    {
-                        return Ok(());
-                    }
-                }
-            }
-            _ => {}
+        if let Ok(resp) = state
+            .internal_post(format!("{url}/internal/shard/{}/commit", shard.0))
+            .json(&req)
+            .send()
+            .await
+            && resp.status().is_success()
+        {
+            return Ok(());
         }
     }
+    Ok(())
+}
+
+async fn dispatch_shard_abort(state: &AppState, shard: rekha_cluster::ShardId, tx_id: Uuid) {
+    let Some(shards) = state.shards.as_ref() else {
+        return;
+    };
+    if let Some(raft) = shards.raft(shard)
+        && raft.metrics().borrow().current_leader == Some(raft.metrics().borrow().id)
+    {
+        let _ = abort_tx_for_shard(state, shard, tx_id).await;
+        return;
+    }
+
+    let req = ShardAbortRequest { tx_id };
+    for target in state.shard_targets(shard) {
+        let Some(url) = state.peers.url(target) else {
+            continue;
+        };
+        if let Ok(resp) = state
+            .internal_post(format!("{url}/internal/shard/{}/abort", shard.0))
+            .json(&req)
+            .send()
+            .await
+            && resp.status().is_success()
+        {
+            return;
+        }
+    }
+}
+
+pub(crate) async fn write_partitioned_2pc(
+    state: &AppState,
+    collection_id: Uuid,
+    sub_batches: Vec<(rekha_cluster::ShardId, ShardWriteKind)>,
+) -> Result<(), ApiError> {
+    let tx_id = Uuid::new_v4();
+    let prepare_futs = sub_batches.into_iter().map(|(shard, kind)| async move {
+        let req = ShardPrepareRequest {
+            tx_id,
+            collection_id,
+            kind,
+        };
+        dispatch_shard_prepare(state, shard, req)
+            .await
+            .map(|count| (shard, count))
+    });
+
+    let prepare_results = futures::future::join_all(prepare_futs).await;
+    let mut prepared_shards = Vec::with_capacity(prepare_results.len());
+    let mut first_err = None;
+
+    for res in prepare_results {
+        match res {
+            Ok((shard, _)) => prepared_shards.push(shard),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_err {
+        let abort_futs = prepared_shards.into_iter().map(|shard| async move {
+            dispatch_shard_abort(state, shard, tx_id).await;
+        });
+        futures::future::join_all(abort_futs).await;
+        if let Some(raft) = state.raft.as_ref() {
+            let _ = raft.client_write(ClusterOperation::AbortTx { tx_id }).await;
+        }
+        return Err(err);
+    }
+
+    if let Some(raft) = state.raft.as_ref() {
+        let _ = raft
+            .client_write(ClusterOperation::CommitTx {
+                tx_id,
+                shards: prepared_shards.clone(),
+            })
+            .await;
+    }
+
+    let commit_futs = prepared_shards
+        .into_iter()
+        .map(|shard| async move { dispatch_shard_commit(state, shard, tx_id).await });
+    futures::future::join_all(commit_futs).await;
+    Ok(())
+}
+
+async fn dispatch_shard_batch(
+    state: &AppState,
+    shard: rekha_cluster::ShardId,
+    req: ShardBatchRequest,
+) -> Result<usize, ApiError> {
+    let Some(shards) = state.shards.as_ref() else {
+        return Err(ApiError::Engine(EngineError::Unavailable(
+            "no shards configured".into(),
+        )));
+    };
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(raft) = shards.raft(shard)
+            && raft.metrics().borrow().current_leader == Some(raft.metrics().borrow().id)
+        {
+            match commit_write_for_shard(state, shard, req.collection_id, req.kind.clone()).await {
+                Ok(count) => return Ok(count),
+                Err(ApiError::NotLeader { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut should_retry = false;
+        for target in state.shard_targets(shard) {
+            let Some(url) = state.peers.url(target) else {
+                continue;
+            };
+            match state
+                .internal_post(format!("{url}/internal/shard/{}/batch", shard.0))
+                .json(&req)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let res: ShardBatchResponse = resp.json().await.map_err(|e| {
+                        ApiError::Engine(EngineError::Recovery(format!(
+                            "invalid response from shard {}: {e}",
+                            shard.0
+                        )))
+                    })?;
+                    return Ok(res.count);
+                }
+                Ok(resp) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                    should_retry = true;
+                    if let Some(leader_id) = resp
+                        .headers()
+                        .get(crate::leadership::LEADER_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        && let Some(leader_url) = state.peers.url(leader_id)
+                        && let Ok(resp2) = state
+                            .internal_post(format!("{leader_url}/internal/shard/{}/batch", shard.0))
+                            .json(&req)
+                            .send()
+                            .await
+                        && resp2.status().is_success()
+                    {
+                        let res: ShardBatchResponse = resp2.json().await.map_err(|e| {
+                            ApiError::Engine(EngineError::Recovery(format!(
+                                "invalid response from shard {}: {e}",
+                                shard.0
+                            )))
+                        })?;
+                        return Ok(res.count);
+                    }
+                }
+                Ok(resp) if resp.status().is_client_error() => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ApiError::Engine(EngineError::Validation(body)));
+                }
+                _ => should_retry = true,
+            }
+        }
+
+        if should_retry {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        } else {
+            break;
+        }
+    }
+
     Err(ApiError::Engine(EngineError::Unavailable(format!(
         "could not reach leader for shard {}",
         shard.0
@@ -1240,12 +1858,7 @@ async fn dispatch_shard_query(
     if let Some(raft) = shards.raft(shard) {
         let m = raft.metrics();
         let leads = m.borrow().current_leader == Some(m.borrow().id);
-        if leads {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                raft.ensure_linearizable(),
-            )
-            .await;
+        if leads && check_shard_read_barrier(&raft).await.is_ok() {
             let engine = state.engine.clone();
             let collection_id = req.collection_id;
             let query_embeddings = req.query_embeddings;
@@ -1276,36 +1889,19 @@ async fn dispatch_shard_query(
         }
     }
 
-    let target_leader = shards.leader(shard);
-    let owners = shards.owners(shard);
-    let mut targets = Vec::new();
-    if let Some(l) = target_leader {
-        targets.push(l);
-    }
-    for o in owners {
-        if !targets.contains(&o) {
-            targets.push(o);
-        }
-    }
-
-    for target in targets {
+    for target in state.shard_targets(shard) {
         let Some(url) = state.peers.url(target) else {
             continue;
         };
-        let mut request = state
-            .http
-            .post(format!("{url}/internal/shard/{}/query", shard.0))
-            .json(&req);
-        if let Some(ref secret) = state.cluster_secret {
-            request = request.header(crate::leadership::SECRET_HEADER, secret);
-        }
-        match request.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(hits) = resp.json::<Vec<Vec<rekha_engine::ScoredPoint>>>().await {
-                    return Ok(hits);
-                }
-            }
-            _ => {}
+        if let Ok(resp) = state
+            .internal_post(format!("{url}/internal/shard/{}/query", shard.0))
+            .json(&req)
+            .send()
+            .await
+            && resp.status().is_success()
+            && let Ok(hits) = resp.json::<Vec<Vec<rekha_engine::ScoredPoint>>>().await
+        {
+            return Ok(hits);
         }
     }
     Err(ApiError::Engine(EngineError::Unavailable(format!(
@@ -1328,12 +1924,7 @@ async fn dispatch_shard_count(
     if let Some(raft) = shards.raft(shard) {
         let m = raft.metrics();
         let leads = m.borrow().current_leader == Some(m.borrow().id);
-        if leads {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                raft.ensure_linearizable(),
-            )
-            .await;
+        if leads && check_shard_read_barrier(&raft).await.is_ok() {
             return state
                 .engine
                 .count_partition(&collection_id, Some(shard))
@@ -1341,38 +1932,20 @@ async fn dispatch_shard_count(
         }
     }
 
-    let target_leader = shards.leader(shard);
-    let owners = shards.owners(shard);
-    let mut targets = Vec::new();
-    if let Some(l) = target_leader {
-        targets.push(l);
-    }
-    for o in owners {
-        if !targets.contains(&o) {
-            targets.push(o);
-        }
-    }
-
-    for target in targets {
+    for target in state.shard_targets(shard) {
         let Some(url) = state.peers.url(target) else {
             continue;
         };
-        let mut request = state
-            .http
-            .post(format!("{url}/internal/shard/{}/count", shard.0))
-            .json(&collection_id);
-        if let Some(ref secret) = state.cluster_secret {
-            request = request.header(crate::leadership::SECRET_HEADER, secret);
-        }
-        match request.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(val) = resp.json::<serde_json::Value>().await
-                    && let Some(c) = val.get("count").and_then(|v| v.as_u64())
-                {
-                    return Ok(c);
-                }
-            }
-            _ => {}
+        if let Ok(resp) = state
+            .internal_post(format!("{url}/internal/shard/{}/count", shard.0))
+            .json(&collection_id)
+            .send()
+            .await
+            && resp.status().is_success()
+            && let Ok(val) = resp.json::<serde_json::Value>().await
+            && let Some(c) = val.get("count").and_then(|v| v.as_u64())
+        {
+            return Ok(c);
         }
     }
     Err(ApiError::Engine(EngineError::Unavailable(format!(
@@ -1395,12 +1968,7 @@ async fn dispatch_shard_get(
     if let Some(raft) = shards.raft(shard) {
         let m = raft.metrics();
         let leads = m.borrow().current_leader == Some(m.borrow().id);
-        if leads {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                raft.ensure_linearizable(),
-            )
-            .await;
+        if leads && check_shard_read_barrier(&raft).await.is_ok() {
             return state
                 .engine
                 .get_records_partition(
@@ -1416,36 +1984,19 @@ async fn dispatch_shard_get(
         }
     }
 
-    let target_leader = shards.leader(shard);
-    let owners = shards.owners(shard);
-    let mut targets = Vec::new();
-    if let Some(l) = target_leader {
-        targets.push(l);
-    }
-    for o in owners {
-        if !targets.contains(&o) {
-            targets.push(o);
-        }
-    }
-
-    for target in targets {
+    for target in state.shard_targets(shard) {
         let Some(url) = state.peers.url(target) else {
             continue;
         };
-        let mut request = state
-            .http
-            .post(format!("{url}/internal/shard/{}/get", shard.0))
-            .json(&req);
-        if let Some(ref secret) = state.cluster_secret {
-            request = request.header(crate::leadership::SECRET_HEADER, secret);
-        }
-        match request.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(records) = resp.json::<Vec<rekha_engine::Record>>().await {
-                    return Ok(records);
-                }
-            }
-            _ => {}
+        if let Ok(resp) = state
+            .internal_post(format!("{url}/internal/shard/{}/get", shard.0))
+            .json(&req)
+            .send()
+            .await
+            && resp.status().is_success()
+            && let Ok(records) = resp.json::<Vec<rekha_engine::Record>>().await
+        {
+            return Ok(records);
         }
     }
     Err(ApiError::Engine(EngineError::Unavailable(format!(
@@ -2151,14 +2702,10 @@ async fn shard_batch_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(shard_num): axum::extract::Path<u32>,
     Json(req): Json<ShardBatchRequest>,
-) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<ShardBatchResponse>, (StatusCode, Json<serde_json::Value>)> {
     let shard = rekha_cluster::ShardId(shard_num);
-    let prepared = rekha_engine::PreparedBatch {
-        ops: req.ops,
-        dimension: req.dimension,
-    };
-    match commit_batch_for_shard(&state, shard, req.collection_id, prepared).await {
-        Ok(()) => Ok(StatusCode::OK),
+    let count = match commit_write_for_shard(&state, shard, req.collection_id, req.kind).await {
+        Ok(c) => c,
         Err(ApiError::NotLeader { leader }) => {
             let mut headers = axum::http::HeaderMap::new();
             if let Some(id) = leader
@@ -2169,16 +2716,109 @@ async fn shard_batch_handler(
                     v,
                 );
             }
-            Err((
+            return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "error": "not shard leader", "leader": leader })),
-            ))
+            ));
         }
-        Err(ApiError::Engine(e)) => Err((
-            engine_error_status(&e),
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )),
+        Err(ApiError::Engine(e)) => {
+            return Err((
+                engine_error_status(&e),
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ));
+        }
+    };
+    Ok(Json(ShardBatchResponse { count }))
+}
+
+async fn shard_prepare_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(shard_num): axum::extract::Path<u32>,
+    Json(req): Json<ShardPrepareRequest>,
+) -> Result<Json<ShardBatchResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let shard = rekha_cluster::ShardId(shard_num);
+    let count = match prepare_write_for_shard(&state, shard, req.tx_id, req.collection_id, req.kind)
+        .await
+    {
+        Ok(c) => c,
+        Err(ApiError::NotLeader { leader }) => {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(id) = leader
+                && let Ok(v) = axum::http::HeaderValue::from_str(&id.to_string())
+            {
+                headers.insert(
+                    axum::http::HeaderName::from_static(leadership::LEADER_HEADER),
+                    v,
+                );
+            }
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "not shard leader", "leader": leader })),
+            ));
+        }
+        Err(ApiError::Engine(e)) => {
+            return Err((
+                engine_error_status(&e),
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ));
+        }
+    };
+    Ok(Json(ShardBatchResponse { count }))
+}
+
+async fn shard_commit_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(shard_num): axum::extract::Path<u32>,
+    Json(req): Json<ShardCommitRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let shard = rekha_cluster::ShardId(shard_num);
+    match commit_tx_for_shard(&state, shard, req.tx_id).await {
+        Ok(()) => Ok(StatusCode::OK),
+        Err(ApiError::NotLeader { .. }) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+async fn shard_abort_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(shard_num): axum::extract::Path<u32>,
+    Json(req): Json<ShardAbortRequest>,
+) -> StatusCode {
+    let shard = rekha_cluster::ShardId(shard_num);
+    let _ = abort_tx_for_shard(&state, shard, req.tx_id).await;
+    StatusCode::OK
+}
+
+async fn tx_status_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(tx_id): axum::extract::Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Some(shards) = state.shards.as_ref() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let committed = shards.is_tx_committed(&tx_id);
+    Ok(Json(serde_json::json!({ "committed": committed })))
+}
+
+async fn shard_membership_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(shard_num): axum::extract::Path<u32>,
+) -> Result<Json<Vec<u64>>, StatusCode> {
+    let shard = rekha_cluster::ShardId(shard_num);
+    let Some(shards) = state.shards.as_ref() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let Some(raft) = shards.raft(shard) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let m = raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .clone();
+    let voters: Vec<u64> = m.voter_ids().collect();
+    Ok(Json(voters))
 }
 
 async fn shard_query_handler(
@@ -2501,31 +3141,34 @@ async fn add_records(
                 );
             }
         }
-        let mut futures = Vec::new();
-        for (shard, (ids, embs, metas, docs)) in sub_batches {
-            let dim = embs.first().map(|e| e.len()).unwrap_or(0);
-            let embeddings_vec: Vec<Embedding> = embs.into_iter().map(Embedding::from).collect();
-            let ops = add_ops(&ids, &embeddings_vec, metas.as_deref(), docs.as_deref());
-            let batch_req = ShardBatchRequest {
-                collection_id: id,
-                ops,
-                dimension: dim,
-            };
-            let state = state.clone();
-            futures.push(async move { dispatch_shard_batch(&state, shard, batch_req).await });
-        }
-        let _ = futures::future::try_join_all(futures).await?;
+        let batches: Vec<(rekha_cluster::ShardId, ShardWriteKind)> = sub_batches
+            .into_iter()
+            .map(|(shard, (ids, embs, metas, docs))| {
+                (
+                    shard,
+                    ShardWriteKind::Add {
+                        ids,
+                        embeddings: embs,
+                        metadatas: metas,
+                        documents: docs,
+                    },
+                )
+            })
+            .collect();
+        write_partitioned_2pc(&state, id, batches).await?;
         return Ok(StatusCode::OK);
     }
 
+    let shard = state.shard_of(&id);
     let embeddings: Vec<Embedding> = req.embeddings.into_iter().map(|e| e.into()).collect();
     let engine = state.engine.clone();
     let ids = req.ids;
     let metadatas = req.metadatas;
     let documents = req.documents;
     write_batch(&state, id, move || {
-        engine.prepare_add(
+        engine.prepare_add_partition(
             &id,
+            shard,
             &ids,
             &embeddings,
             metadatas.as_deref(),
@@ -2588,34 +3231,25 @@ async fn upsert_records(
                 );
             }
         }
-        let mut futures = Vec::new();
-        for (shard, (ids, embs, metas, docs)) in sub_batches {
-            let dim = embs.first().map(|e| e.len()).unwrap_or(0);
-            let embeddings_vec: Vec<Embedding> = embs.into_iter().map(Embedding::from).collect();
-            let engine = state.engine.clone();
-            let batch = offload(move || {
-                engine.prepare_upsert_partition(
-                    &id,
-                    Some(shard),
-                    &ids,
-                    &embeddings_vec,
-                    metas.as_deref(),
-                    docs.as_deref(),
+        let batches: Vec<(rekha_cluster::ShardId, ShardWriteKind)> = sub_batches
+            .into_iter()
+            .map(|(shard, (ids, embs, metas, docs))| {
+                (
+                    shard,
+                    ShardWriteKind::Upsert {
+                        ids,
+                        embeddings: embs,
+                        metadatas: metas,
+                        documents: docs,
+                    },
                 )
             })
-            .await?;
-            let batch_req = ShardBatchRequest {
-                collection_id: id,
-                ops: batch.ops,
-                dimension: dim,
-            };
-            let state = state.clone();
-            futures.push(async move { dispatch_shard_batch(&state, shard, batch_req).await });
-        }
-        let _ = futures::future::try_join_all(futures).await?;
+            .collect();
+        write_partitioned_2pc(&state, id, batches).await?;
         return Ok(StatusCode::OK);
     }
 
+    let shard = state.shard_of(&id);
     let embeddings: Vec<Embedding> = req.embeddings.into_iter().map(|e| e.into()).collect();
     let metadatas = req.metadatas.map(|list| {
         list.into_iter()
@@ -2626,8 +3260,9 @@ async fn upsert_records(
     let ids = req.ids;
     let documents = req.documents;
     write_batch(&state, id, move || {
-        engine.prepare_upsert(
+        engine.prepare_upsert_partition(
             &id,
+            shard,
             &ids,
             &embeddings,
             metadatas.as_deref(),
@@ -2672,7 +3307,7 @@ async fn update_records(
             });
             entry.0.push(record_id.clone());
             if let (Some(embs), Some(src_embs)) = (&mut entry.1, &req.embeddings) {
-                embs.push(src_embs[i].clone());
+                embs.push(src_embs[i].to_vec());
             }
             if let Some(ref mut metas) = entry.2 {
                 metas.push(
@@ -2692,32 +3327,25 @@ async fn update_records(
                 );
             }
         }
-        let mut futures = Vec::new();
-        for (shard, (ids, embs, metas, docs)) in sub_batches {
-            let engine = state.engine.clone();
-            let batch = offload(move || {
-                engine.prepare_update_partition(
-                    &id,
-                    Some(shard),
-                    &ids,
-                    embs.as_deref(),
-                    metas.as_deref(),
-                    docs.as_deref(),
+        let batches: Vec<(rekha_cluster::ShardId, ShardWriteKind)> = sub_batches
+            .into_iter()
+            .map(|(shard, (ids, embs, metas, docs))| {
+                (
+                    shard,
+                    ShardWriteKind::Update {
+                        ids,
+                        embeddings: embs,
+                        metadatas: metas,
+                        documents: docs,
+                    },
                 )
             })
-            .await?;
-            let batch_req = ShardBatchRequest {
-                collection_id: id,
-                ops: batch.ops,
-                dimension: batch.dimension,
-            };
-            let state = state.clone();
-            futures.push(async move { dispatch_shard_batch(&state, shard, batch_req).await });
-        }
-        let _ = futures::future::try_join_all(futures).await?;
+            .collect();
+        write_partitioned_2pc(&state, id, batches).await?;
         return Ok(StatusCode::OK);
     }
 
+    let shard = state.shard_of(&id);
     let metadatas = req.metadatas.map(|list| {
         list.into_iter()
             .map(|o| o.map(rekha_core::types::metadata_patch_from))
@@ -2728,8 +3356,9 @@ async fn update_records(
     let embeddings = req.embeddings;
     let documents = req.documents;
     write_batch(&state, id, move || {
-        engine.prepare_update(
+        engine.prepare_update_partition(
             &id,
+            shard,
             &ids,
             embeddings.as_deref(),
             metadatas.as_deref(),
@@ -2766,27 +3395,21 @@ async fn delete_records(
             let shard = placement.shard_for_record(&record_id);
             sub_batches.entry(shard).or_default().push(record_id);
         }
-        let mut futures = Vec::new();
-        for (shard, ids) in sub_batches {
-            let ops: Vec<rekha_core::op::Operation> = ids
-                .into_iter()
-                .map(|id| rekha_core::op::Operation::Delete { id })
-                .collect();
-            let batch_req = ShardBatchRequest {
-                collection_id: id,
-                ops,
-                dimension: 0,
-            };
-            let state = state.clone();
-            futures.push(async move { dispatch_shard_batch(&state, shard, batch_req).await });
-        }
-        let _ = futures::future::try_join_all(futures).await?;
+        let batches: Vec<(rekha_cluster::ShardId, ShardWriteKind)> = sub_batches
+            .into_iter()
+            .map(|(shard, ids)| (shard, ShardWriteKind::Delete { ids }))
+            .collect();
+        write_partitioned_2pc(&state, id, batches).await?;
         return Ok(StatusCode::OK);
     }
 
+    let shard = state.shard_of(&id);
     let engine = state.engine.clone();
     let ids = req.ids;
-    write_batch(&state, id, move || engine.prepare_delete(&id, &ids)).await?;
+    write_batch(&state, id, move || {
+        engine.prepare_delete_partition(&id, shard, &ids)
+    })
+    .await?;
     Ok(StatusCode::OK)
 }
 
@@ -3931,6 +4554,14 @@ fn public_routes() -> Router<Arc<AppState>> {
         .merge(auth_routes::auth_router())
 }
 
+fn cluster_admin_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/internal/cluster/membership", get(raft_membership))
+        .route("/internal/cluster/placement", get(raft_placement))
+        .route("/internal/cluster/add_learner", post(raft_add_learner))
+        .route("/internal/cluster/remove_member", post(raft_remove_member))
+}
+
 fn internal_routes() -> Router<Arc<AppState>> {
     Router::new()
         // One process runs one `Raft` per group, so the group id travels in the
@@ -3956,16 +4587,27 @@ fn internal_routes() -> Router<Arc<AppState>> {
             "/internal/cluster/shard/{shard}/ensure_started",
             post(shard_ensure_started),
         )
+        .route(
+            "/internal/cluster/shard/{shard}/membership",
+            get(shard_membership_handler),
+        )
         .route("/internal/cluster/shard/{shard}/drop", post(shard_drop))
         .route("/internal/shard/{shard}/batch", post(shard_batch_handler))
+        .route(
+            "/internal/shard/{shard}/prepare",
+            post(shard_prepare_handler),
+        )
+        .route("/internal/shard/{shard}/commit", post(shard_commit_handler))
+        .route("/internal/shard/{shard}/abort", post(shard_abort_handler))
         .route("/internal/shard/{shard}/query", post(shard_query_handler))
         .route("/internal/shard/{shard}/count", post(shard_count_handler))
         .route("/internal/shard/{shard}/get", post(shard_get_handler))
         .route("/internal/stats/counts", post(stats_counts))
-        .route("/internal/cluster/membership", get(raft_membership))
-        .route("/internal/cluster/placement", get(raft_placement))
-        .route("/internal/cluster/add_learner", post(raft_add_learner))
-        .route("/internal/cluster/remove_member", post(raft_remove_member))
+        .route(
+            "/internal/cluster/tx/{tx_id}/status",
+            get(tx_status_handler),
+        )
+        .merge(cluster_admin_routes())
         // Writes arriving at a follower are forwarded here, on the leader's
         // internal listener, and re-dispatched through the public pipeline so
         // the original caller's credentials are still what is authorized.
@@ -4004,17 +4646,22 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .with_state(app_state)
 }
 
-/// Public API router (collections, health, tenants, Chroma compat).
+/// Public API router (collections, health, tenants, Chroma compat, and
+/// cluster-secret-authenticated membership management).
 /// Intended for the public listener.
 pub fn public_router(app_state: Arc<AppState>) -> Router {
-    public_routes()
+    let public = public_routes()
         // Inner layer: runs after authentication, so an unauthenticated write
         // is rejected as 401 rather than being told where the leader is.
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             leadership::require_leader,
         ))
-        .layer(axum::middleware::from_fn(middleware::auth))
+        .layer(axum::middleware::from_fn(middleware::auth));
+    let cluster_admin =
+        cluster_admin_routes().layer(axum::middleware::from_fn(middleware::internal_auth));
+    public
+        .merge(cluster_admin)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             32 * 1024 * 1024,

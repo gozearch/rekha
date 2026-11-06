@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rekha.fullname" . }}-scripts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rekha.labels" . | nindent 4 }}
+data:
+  entrypoint.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    # Extract ordinal from pod name (e.g., rekha-0 -> 0)
+    ORDINAL="${HOSTNAME##*-}"
+    NODE_ID=$((ORDINAL + 1))
+    export REKHA_NODE_ID="$NODE_ID"
+
+    INITIAL_CLUSTER_SIZE={{ .Values.cluster.initialClusterSize | int }}
+    HEADLESS_SERVICE="{{ include "rekha.headlessServiceName" . }}"
+    FULLNAME="{{ include "rekha.fullname" . }}"
+    NAMESPACE="{{ .Release.Namespace }}"
+    DOMAIN="svc.cluster.local"
+    INTERNAL_PORT="{{ .Values.ports.internal }}"
+    HTTP_PORT="{{ .Values.ports.http }}"
+    POD_FQDN="${HOSTNAME}.${HEADLESS_SERVICE}.${NAMESPACE}.${DOMAIN}"
+
+    echo "Starting RekhaDB pod $HOSTNAME (node_id=$NODE_ID, ordinal=$ORDINAL)..."
+
+    BOOTSTRAP_ARGS=""
+
+    if [ "$ORDINAL" -lt "$INITIAL_CLUSTER_SIZE" ]; then
+      export REKHA_PEERS="{{ include "rekha.initialPeers" . }}"
+      if [ "$ORDINAL" -eq 0 ] && [ ! -f /data/node.id ]; then
+        echo "First start of bootstrap node: enabling --bootstrap"
+        BOOTSTRAP_ARGS="--bootstrap"
+      fi
+    else
+      # Dynamic scale-out node (ordinal >= initialClusterSize)
+      export REKHA_PEERS=""
+      LEADER_URL="http://${FULLNAME}-0.${HEADLESS_SERVICE}.${NAMESPACE}.${DOMAIN}:${INTERNAL_PORT}"
+      BOOTSTRAP_ARGS="--join ${LEADER_URL}"
+
+      if [ ! -f /data/node.id ]; then
+        echo "New dynamic node detected. Spawning background auto-registration into cluster..."
+        (
+          # Wait for local process to start listening
+          while ! curl -sf "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null 2>&1; do
+            sleep 1
+          done
+          echo "Admitting learner node ${NODE_ID} (${POD_FQDN}:${INTERNAL_PORT}) via ${LEADER_URL}..."
+          rekha --url "${LEADER_URL}" membership add --node-id "${NODE_ID}" --addr "${POD_FQDN}:${INTERNAL_PORT}" || true
+        ) &
+      fi
+    fi
+
+    # Execute rekha serve with computed flags and any additional container args
+    # Note: word splitting on BOOTSTRAP_ARGS is intentional when flags are present
+    exec rekha serve $BOOTSTRAP_ARGS "$@"

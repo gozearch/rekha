@@ -84,6 +84,31 @@ pub enum ClusterOperation {
         /// node builds the index at the same width.
         dimension: usize,
     },
+    /// Phase 1 of a cross-shard transaction: stage operations under `tx_id`.
+    PrepareBatch {
+        tx_id: Uuid,
+        collection_id: Uuid,
+        ops: Vec<rekha_core::op::Operation>,
+        dimension: usize,
+    },
+    /// Phase 2 of a cross-shard transaction: commit staged operations for `tx_id`.
+    CommitBatch {
+        tx_id: Uuid,
+    },
+    /// Abort a cross-shard transaction: discard staged operations for `tx_id`.
+    AbortBatch {
+        tx_id: Uuid,
+    },
+    /// Recorded on the metadata group: transaction `tx_id` has been decided as committed
+    /// across `shards`.
+    CommitTx {
+        tx_id: Uuid,
+        shards: Vec<ShardId>,
+    },
+    /// Recorded on the metadata group: transaction `tx_id` has been decided as aborted.
+    AbortTx {
+        tx_id: Uuid,
+    },
     // RBAC
     CreateUser {
         user: UserRecord,

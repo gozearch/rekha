@@ -192,18 +192,6 @@ impl Segment {
         let end = offset + dim * 4;
         Some(bytemuck::cast_slice(&self.mmap[offset..end]))
     }
-
-    /// Iterate over all vectors as `&[f32]` slices.
-    pub fn iter_vectors(&self) -> impl Iterator<Item = &[f32]> {
-        let dim = self.dimension();
-        let count = self.len();
-        let base = HEADER_SIZE;
-        (0..count).map(move |i| {
-            let offset = base + i * dim * 4;
-            let end = offset + dim * 4;
-            bytemuck::cast_slice(&self.mmap[offset..end])
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,23 +317,6 @@ mod tests {
         assert_eq!(v2, &[9.0, 10.0, 11.0, 12.0]);
 
         assert!(seg.get_vector(3).is_none());
-    }
-
-    #[test]
-    fn iter_vectors_matches_input() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("iter.seg");
-
-        let mut writer = SegmentWriter::new(2);
-        writer.push(&[1.0, 2.0]);
-        writer.push(&[3.0, 4.0]);
-        writer.write(&path).unwrap();
-
-        let seg = Segment::open(&path).unwrap();
-        let vecs: Vec<&[f32]> = seg.iter_vectors().collect();
-        assert_eq!(vecs.len(), 2);
-        assert_eq!(vecs[0], &[1.0, 2.0]);
-        assert_eq!(vecs[1], &[3.0, 4.0]);
     }
 
     #[test]

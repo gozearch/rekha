@@ -137,16 +137,6 @@ impl ClusterView {
     pub fn leader_url(&self) -> Option<&str> {
         self.leader.as_ref().and_then(|l| l.addr.as_deref())
     }
-
-    /// True when this node cannot reach a quorum.
-    ///
-    /// `threshold_ms` should be comfortably larger than `heartbeat_interval`.
-    /// Campaigning while isolated only inflates the term and forces a
-    /// leadership change when the network heals.
-    pub fn quorum_stale(&self, threshold_ms: u64) -> bool {
-        self.millis_since_quorum_ack
-            .is_some_and(|ms| ms > threshold_ms)
-    }
 }
 
 /// Publishes [`ClusterView`] updates from the Raft metrics stream.
@@ -292,25 +282,5 @@ mod tests {
         assert_eq!(RaftRole::from(ServerState::Learner), RaftRole::Learner);
         assert_eq!(RaftRole::from(ServerState::Shutdown), RaftRole::Shutdown);
         assert_eq!(RaftRole::Leader.as_str(), "leader");
-    }
-
-    /// Quorum staleness drives the "do not campaign while isolated" guard.
-    #[test]
-    fn quorum_staleness_is_thresholded_and_unknown_means_not_stale() {
-        let mut view = ClusterView::build(
-            1,
-            1,
-            RaftRole::Leader,
-            Some(1),
-            vec![1],
-            None,
-            Some(5_000),
-            &peers(),
-        );
-        assert!(view.quorum_stale(1_000));
-        assert!(!view.quorum_stale(10_000));
-
-        view.millis_since_quorum_ack = None;
-        assert!(!view.quorum_stale(1_000));
     }
 }

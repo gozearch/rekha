@@ -139,3 +139,38 @@ fn a_missing_segment_is_reported() {
         report.findings
     );
 }
+
+#[test]
+fn partitioned_collection_verifies_cleanly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open_engine(&dir);
+    let mut config = CollectionConfig::new("partitioned".into(), DIM, Distance::L2);
+    config.id = uuid::Uuid::new_v4();
+    let shard = Some(rekha_core::cluster::ShardId(2));
+    let record = engine.record_collection(&config, shard).expect("record");
+    let ids: Vec<String> = (0..4).map(|i| format!("r{i}")).collect();
+    let embs: Vec<Embedding> = (0..4).map(|i| embedding(i as f32)).collect();
+    let ops = (0..4)
+        .map(|i| rekha_core::op::Operation::Add {
+            id: ids[i].clone(),
+            embedding: embs[i].clone(),
+            metadata: None,
+            document: None,
+        })
+        .collect::<Vec<_>>();
+
+    engine
+        .append_ops_partition(&record.config.id, shard, &ops)
+        .expect("append ops");
+    engine
+        .checkpoint_partition(&record.config.id, shard)
+        .expect("checkpoint");
+
+    let report = verify_data_dir(dir.path()).expect("verify");
+    assert!(
+        report.is_clean(),
+        "a checkpointed shard partition must verify clean: {:?}",
+        report.findings
+    );
+    assert_eq!(report.collections, 1);
+}

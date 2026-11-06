@@ -7,15 +7,11 @@ use std::sync::Arc;
 use openraft::Entry;
 use openraft::LogId;
 use openraft::LogState;
-use openraft::Snapshot;
-use openraft::SnapshotMeta;
 use openraft::StorageError;
-use openraft::StoredMembership;
 use openraft::Vote;
 use openraft::storage::LogFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
-use openraft::storage::RaftSnapshotBuilder;
 use tokio::sync::Mutex;
 
 use crate::raft_types::RaftTypeConfig;
@@ -182,32 +178,6 @@ impl RaftLogStorage<RaftTypeConfig> for MemoryLogStore {
         store.last_purged_log_id = Some(log_id);
         store.entries.retain(|e| e.log_id.index > log_id.index);
         Ok(())
-    }
-}
-
-pub struct MemorySnapshotBuilder {
-    log: LogStore,
-}
-
-impl RaftSnapshotBuilder<RaftTypeConfig> for MemorySnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<RaftTypeConfig>, StorageError<u64>> {
-        let store = self.log.lock().await;
-        let last_log_id = store.last_log_id().or(store.last_purged_log_id);
-
-        let snapshot_id = uuid::Uuid::new_v4().to_string();
-        let data = vec![];
-        let cursor = std::io::Cursor::new(data);
-
-        let meta = SnapshotMeta {
-            last_log_id,
-            last_membership: StoredMembership::default(),
-            snapshot_id,
-        };
-
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(cursor),
-        })
     }
 }
 

@@ -1,6 +1,6 @@
 //! Cluster metadata state machine — applies Raft-committed entries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use openraft::Entry;
@@ -15,7 +15,6 @@ use openraft::storage::RaftStateMachine;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::cluster::ClockMap;
 use crate::placement::ShardId;
 use crate::raft_types::{BatchResponse, ClusterOperation, NodeInfo, RaftTypeConfig};
 use rekha_storage::Catalog;
@@ -133,6 +132,16 @@ fn is_application_rejection(e: &rekha_storage::CatalogError) -> bool {
     )
 }
 
+/// Staged 2PC transaction payload awaiting a commit or abort decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreparedTx {
+    pub tx_id: Uuid,
+    pub collection_id: Uuid,
+    pub ops: Vec<rekha_core::op::Operation>,
+    pub dimension: usize,
+    pub prepared_at_index: u64,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ClusterStateMachine {
     /// This node's id, used to decide whether a collection is materialized here.
@@ -142,16 +151,12 @@ pub struct ClusterStateMachine {
     #[serde(default)]
     pub role: GroupRole,
     pub nodes: HashMap<u64, NodeInfo>,
-    /// Shard placement, as decided by the metadata leader at creation.
-    ///
-    /// Log-derived and replicated: it is what a shard group uses to decide whose
-    /// data belongs in its snapshots, and what a node recovers after a restart
-    /// without recomputing anything. The durable copy a request is routed by is
-    /// the collection's catalog row; this map and that row are written from the
-    /// same entry, so they cannot disagree about where a collection went.
-    ///
-    /// Not derived from the id: the leader chose the shard for node load, and a
-    /// hash cannot reproduce a decision.
+    /// In-flight prepared 2PC transactions staged on this shard group.
+    #[serde(default)]
+    pub prepared_txs: HashMap<Uuid, PreparedTx>,
+    /// Set of committed 2PC transactions recorded on the metadata group.
+    #[serde(default)]
+    pub committed_txs: HashSet<Uuid>,
     pub placements: HashMap<Uuid, ShardId>,
     /// Owner sets that were decided rather than derived.
     ///
@@ -165,7 +170,6 @@ pub struct ClusterStateMachine {
     /// does not have the data.
     #[serde(default)]
     pub shard_owners: std::collections::BTreeMap<u32, Vec<u64>>,
-    pub clock_map: ClockMap,
     pub last_applied: Option<LogId<u64>>,
     pub membership: StoredMembership<u64, u64>,
     #[serde(skip)]
@@ -203,6 +207,12 @@ pub struct ClusterStateMachine {
     /// a clustered node refuses to start without it (see the CLI).
     #[serde(skip)]
     pub snapshots: Option<Arc<crate::snapshot_store::SnapshotStore>>,
+    /// Dynamically managed shard cluster registry, updated when placement changes.
+    #[serde(skip)]
+    pub shards: Option<Arc<crate::shard::ShardCluster>>,
+    /// Directory where `placement.json` is persisted when topology changes.
+    #[serde(skip)]
+    pub placement_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for ClusterStateMachine {
@@ -212,7 +222,6 @@ impl std::fmt::Debug for ClusterStateMachine {
             .field("role", &self.role)
             .field("nodes", &self.nodes)
             .field("placements", &self.placements)
-            .field("clock_map", &self.clock_map)
             .field("last_applied", &self.last_applied)
             .field("membership", &self.membership)
             .field("engine", &self.engine.as_ref().map(|_| "..."))
@@ -266,6 +275,16 @@ impl ClusterStateMachine {
     /// purge point can never be repaired.
     pub fn set_snapshot_store(&mut self, store: Arc<crate::snapshot_store::SnapshotStore>) {
         self.snapshots = Some(store);
+    }
+
+    /// Attach the dynamic shard cluster registry and placement storage directory.
+    pub fn set_shards(
+        &mut self,
+        shards: Arc<crate::shard::ShardCluster>,
+        placement_dir: std::path::PathBuf,
+    ) {
+        self.shards = Some(shards);
+        self.placement_dir = Some(placement_dir);
     }
 
     /// A stable label for this group, used to reject a snapshot addressed to a
@@ -380,6 +399,7 @@ impl ClusterStateMachine {
     }
 
     /// Whether a committed entry has failed to apply on this node.
+    #[cfg(test)]
     pub fn apply_failed(&self) -> bool {
         self.apply_failure
             .as_ref()
@@ -481,8 +501,27 @@ impl ClusterStateMachine {
                     return;
                 }
                 self.shard_owners.insert(shard.0, owners.clone());
+                if let Some(shards) = &self.shards {
+                    let current = shards.placement();
+                    if let Ok(updated) = current.with_shard_owners(*shard, owners) {
+                        shards.set_placement(Arc::new(updated.clone()));
+                        if let Some(dir) = &self.placement_dir {
+                            let _ = updated.save(dir);
+                        }
+                    }
+                }
             }
-            ClusterOperation::SetVoters { .. } => {}
+            ClusterOperation::SetVoters { voters } => {
+                if let Some(shards) = &self.shards {
+                    let current = shards.placement();
+                    if let Ok(updated) = current.with_voters(voters.iter().copied()) {
+                        shards.set_placement(Arc::new(updated.clone()));
+                        if let Some(dir) = &self.placement_dir {
+                            let _ = updated.save(dir);
+                        }
+                    }
+                }
+            }
             ClusterOperation::AddCollection { config, shard } => {
                 if let Some(shard) = shard {
                     self.placements.insert(config.id, *shard);
@@ -540,6 +579,27 @@ impl ClusterStateMachine {
                 // non-idempotent and the snapshot boundary meaningless.
                 eprintln!(
                     "cluster: a Batch operation reached apply_operation without a log index; \
+                     refusing to apply it blind"
+                );
+                self.note_apply_failure();
+            }
+            ClusterOperation::CommitTx { tx_id, .. } => {
+                self.committed_txs.insert(*tx_id);
+                if let Some(shards) = &self.shards {
+                    shards.mark_tx_committed(*tx_id);
+                }
+            }
+            ClusterOperation::AbortTx { tx_id } => {
+                self.committed_txs.remove(tx_id);
+                if let Some(shards) = &self.shards {
+                    shards.mark_tx_aborted(tx_id);
+                }
+            }
+            ClusterOperation::PrepareBatch { .. }
+            | ClusterOperation::CommitBatch { .. }
+            | ClusterOperation::AbortBatch { .. } => {
+                eprintln!(
+                    "cluster: a 2PC batch operation reached apply_operation without a log index; \
                      refusing to apply it blind"
                 );
                 self.note_apply_failure();
@@ -940,6 +1000,92 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
                             BatchResponse::failed(index, e)
                         }
                     };
+                    responses.push(serde_json::to_string(&response).unwrap_or_else(|e| {
+                        format!("{{\"applied\":0,\"seq\":{index},\"error\":\"{e}\"}}")
+                    }));
+                }
+                EntryPayload::Normal(ClusterOperation::PrepareBatch {
+                    tx_id,
+                    collection_id,
+                    ops,
+                    dimension,
+                }) => {
+                    let index = entry.log_id.index;
+                    self.prepared_txs.insert(
+                        *tx_id,
+                        PreparedTx {
+                            tx_id: *tx_id,
+                            collection_id: *collection_id,
+                            ops: ops.clone(),
+                            dimension: *dimension,
+                            prepared_at_index: index,
+                        },
+                    );
+                    let response = BatchResponse::ok(ops.len(), index);
+                    responses.push(serde_json::to_string(&response).unwrap_or_else(|e| {
+                        format!("{{\"applied\":0,\"seq\":{index},\"error\":\"{e}\"}}")
+                    }));
+                }
+                EntryPayload::Normal(ClusterOperation::CommitBatch { tx_id }) => {
+                    let index = entry.log_id.index;
+                    if let Some(tx) = self.prepared_txs.remove(tx_id) {
+                        let outcome = match self.engine.clone() {
+                            Some(engine) => {
+                                let collection_id = tx.collection_id;
+                                let ops: Arc<[rekha_core::op::Operation]> =
+                                    Arc::from(tx.ops.as_slice());
+                                let dimension = tx.dimension;
+                                let shard_id = match self.role {
+                                    GroupRole::Shard(s) => Some(s),
+                                    GroupRole::Metadata => None,
+                                };
+                                match tokio::task::spawn_blocking(move || {
+                                    engine.apply_batch(
+                                        &collection_id,
+                                        shard_id,
+                                        &ops,
+                                        index,
+                                        dimension,
+                                    )
+                                })
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(join) => Err(format!(
+                                        "apply worker for 2PC commit {tx_id} failed: {join}"
+                                    )),
+                                }
+                            }
+                            None => Err(format!(
+                                "no engine attached, cannot commit 2PC batch {tx_id}"
+                            )),
+                        };
+                        let response = match outcome {
+                            Ok(()) => BatchResponse::ok(tx.ops.len(), index),
+                            Err(e) => {
+                                eprintln!(
+                                    "cluster: FAILED to apply committed 2PC batch for {tx_id} \
+                                     at index {index}: {e}; marking this node not-ready"
+                                );
+                                self.note_apply_failure();
+                                BatchResponse::failed(index, e)
+                            }
+                        };
+                        responses.push(serde_json::to_string(&response).unwrap_or_else(|e| {
+                            format!("{{\"applied\":0,\"seq\":{index},\"error\":\"{e}\"}}")
+                        }));
+                    } else {
+                        // Idempotent commit: already applied or unknown
+                        let response = BatchResponse::ok(0, index);
+                        responses.push(serde_json::to_string(&response).unwrap_or_else(|e| {
+                            format!("{{\"applied\":0,\"seq\":{index},\"error\":\"{e}\"}}")
+                        }));
+                    }
+                }
+                EntryPayload::Normal(ClusterOperation::AbortBatch { tx_id }) => {
+                    let index = entry.log_id.index;
+                    self.prepared_txs.remove(tx_id);
+                    let response = BatchResponse::ok(0, index);
                     responses.push(serde_json::to_string(&response).unwrap_or_else(|e| {
                         format!("{{\"applied\":0,\"seq\":{index},\"error\":\"{e}\"}}")
                     }));

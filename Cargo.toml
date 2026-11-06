@@ -13,14 +13,6 @@ members = [
     "crates/rekha-bench",
 ]
 
-# Shelved, not deleted. Neither is referenced by any crate that ships:
-# `rekha-repl` is a 1,332-line TUI SQL console with its own binary, and
-# `rekha-objectstore` is a six-line placeholder. Keeping them as members meant
-# compiling and auditing a whole TUI dependency stack (reedline, ratatui,
-# crossterm, terminfo) for code nothing calls. Excluded rather than removed so
-# the work survives and can be revisited.
-exclude = ["crates/rekha-repl", "crates/rekha-objectstore"]
-
 [workspace.package]
 edition = "2024"
 version = "0.1.0"

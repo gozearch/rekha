@@ -1,0 +1,23 @@
+Thank you for installing RekhaDB!
+
+Your production RekhaDB cluster is being deployed with {{ .Values.replicaCount }} replicas.
+
+1. Get the admin API key:
+
+  export REKHA_API_KEY=$(kubectl get secret --namespace {{ .Release.Namespace }} {{ include "rekha.secretName" . }} -o jsonpath="{.data.REKHA_API_KEY}" | base64 --decode)
+
+2. Forward the public client API port to your local workstation:
+
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "rekha.fullname" . }} 8000:{{ .Values.service.port }}
+
+3. In another terminal, verify cluster readiness:
+
+  curl -i -H "x-chroma-token: $REKHA_API_KEY" http://127.0.0.1:8000/ready
+
+4. Check cluster membership and shard distribution:
+
+  rekha --url http://127.0.0.1:8000 membership list
+
+5. Dynamically scale out the cluster (no restart or manual re-peering required):
+
+  helm upgrade {{ .Release.Name }} charts/rekha --set replicaCount={{ add .Values.replicaCount 2 }}

@@ -8,7 +8,6 @@
 //! WAL-shipping path existed and was removed because per-node sequence numbers
 //! made a follower's cursor meaningless across an election.
 
-pub mod cluster;
 pub mod identity;
 pub mod leader;
 pub mod log_store;
@@ -22,7 +21,6 @@ pub mod shard;
 pub mod snapshot_store;
 pub mod state_machine;
 
-pub use cluster::{ClockMap, ClusterConfig};
 pub use identity::{
     IdentityError, NodeIdentity, Peer, PeerDirectory, PeerParseError, node_id_path, parse_peers,
 };

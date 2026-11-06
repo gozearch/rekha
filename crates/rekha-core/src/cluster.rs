@@ -7,9 +7,6 @@
 //!   write tagged with an epoch below the current leader epoch is rejected, so
 //!   a stale leader can never overwrite a newer one (classic fencing / Fencing
 //!   Token pattern).
-//! - [`ClockTag`] is a Qdrant-style `(node, seq)` ordering tag: within a node
-//!   the `seq` counter is monotonic, and node ids break ties, so every
-//!   operation gets a globally unique, totally ordered tag.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,32 +33,9 @@ impl std::fmt::Display for ShardId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Epoch(pub u64);
 
-/// Qdrant-style ordering tag. `(node, seq)` is globally unique: `seq` is
-/// monotonic per node and `node` breaks ties across nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ClockTag {
-    /// Owning node id.
-    pub node: u64,
-    /// Per-node monotonic sequence number.
-    pub seq: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clock_tag_ordering() {
-        assert!(ClockTag { node: 1, seq: 0 } < ClockTag { node: 1, seq: 1 });
-        assert!(
-            ClockTag {
-                node: 1,
-                seq: u64::MAX
-            } < ClockTag { node: 2, seq: 0 }
-        );
-        assert_eq!(ClockTag { node: 3, seq: 7 }, ClockTag { node: 3, seq: 7 });
-        assert_ne!(ClockTag { node: 3, seq: 7 }, ClockTag { node: 3, seq: 8 });
-    }
 
     #[test]
     fn epoch_fencing_comparison() {

@@ -18,7 +18,7 @@
 //! the tail; [`dot_scalar`]/[`l2_squared_scalar`] are the reference scalar
 //! implementations kept for tests.
 
-use rekha_core::types::{Distance, Embedding};
+use rekha_core::types::Distance;
 use wide::f32x8;
 
 /// Epsilon added to the L2 norm during cosine normalization, matching Chroma.
@@ -106,13 +106,6 @@ pub fn distance(space: Distance, a: &[f32], b: &[f32]) -> f32 {
         Distance::Ip => 1.0 - dot(a, b),
         Distance::Cosine => 1.0 - dot(&normalize(a), &normalize(b)),
     }
-}
-
-/// Precomputes the raw L2 norm of every embedding in a batch. Callers
-/// (index/engine) add [`NORM_EPSILON`] themselves when normalizing, so this
-/// stays a pure "norm once" helper.
-pub fn batch_norms(vectors: &[Embedding]) -> Vec<f32> {
-    vectors.iter().map(|v| dot(v, v).sqrt()).collect()
 }
 
 /// Reference scalar dot product, kept for cross-checking the SIMD path.
@@ -221,15 +214,6 @@ mod tests {
     fn distance_cosine_same_vector_is_near_zero() {
         let a = [1.0, 2.0, 3.0];
         assert!(distance(Distance::Cosine, &a, &a) < 1e-6);
-    }
-
-    #[test]
-    fn batch_norms_matches_individual() {
-        let v1: Embedding = vec![3.0, 4.0].into();
-        let v2: Embedding = vec![1.0, 2.0, 2.0].into();
-        let norms = batch_norms(&[v1, v2]);
-        assert!((norms[0] - 5.0).abs() < 1e-6);
-        assert!((norms[1] - 3.0).abs() < 1e-6);
     }
 
     #[test]

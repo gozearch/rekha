@@ -336,11 +336,10 @@ rekha-db/
 │   ├── rekha-engine/     # Engine: WAL→buffer→HNSW pipeline
 │   ├── rekha-cluster/    # Cluster types, Raft log, state machine
 │   ├── rekha-api/        # REST API (axum) + ChromaDB compat
-│   ├── rekha-cli/        # CLI binary (rekha)
+│   ├── rekha-cli/        # CLI binary (rekha) + interactive REPL
 │   └── rekha-bench/      # Benchmarks
-│
-│  Shelved and excluded from the workspace: rekha-repl (a TUI SQL console)
-│  and rekha-objectstore (a placeholder). Neither is referenced by the binary.
+├── charts/
+│   └── rekha/            # Production Kubernetes Helm chart
 ├── Containerfile
 ├── docker-compose.yml
 ├── docker-compose.cluster.yml

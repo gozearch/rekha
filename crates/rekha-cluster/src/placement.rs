@@ -253,6 +253,70 @@ impl Placement {
         self.owners.iter().map(|set| set.to_vec()).collect()
     }
 
+    /// Return a new placement with an updated voter set, retaining current shard owners.
+    pub fn with_voters(
+        &self,
+        voters: impl IntoIterator<Item = u64>,
+    ) -> Result<Self, PlacementError> {
+        Self::from_owners(
+            self.shard_count,
+            self.replication_factor,
+            voters,
+            self.owner_table(),
+        )
+    }
+
+    /// Return a new placement with an updated owner set for `shard`.
+    pub fn with_shard_owners(
+        &self,
+        shard: ShardId,
+        owners: &[u64],
+    ) -> Result<Self, PlacementError> {
+        let mut table = self.owner_table();
+        if let Some(entry) = table.get_mut(shard.0 as usize) {
+            *entry = owners.to_vec();
+        } else {
+            return Err(PlacementError::BadOwners {
+                detail: format!(
+                    "shard index {} out of range (count {})",
+                    shard.0, self.shard_count
+                ),
+            });
+        }
+        Self::from_owners(
+            self.shard_count,
+            self.replication_factor,
+            self.voters.iter().copied(),
+            table,
+        )
+    }
+
+    /// Atomically persist this placement configuration to `<dir>/placement.json`.
+    pub fn save(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        let path = dir.join(PlacementConfig::FILE);
+        let tmp = dir.join(format!(
+            ".{}.tmp.{}",
+            PlacementConfig::FILE,
+            std::process::id()
+        ));
+        let config = PlacementConfig {
+            shard_count: self.shard_count(),
+            replication_factor: self.replication_factor(),
+            voters: self.voters().to_vec(),
+            owners: Some(self.owner_table()),
+        };
+        let bytes = serde_json::to_vec_pretty(&config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            use std::io::Write;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
     /// Shard count a cluster of `nodes` should start with.
     ///
     /// `4 × nodes` keeps the number of consensus groups **per node** constant:
@@ -378,6 +442,239 @@ impl Placement {
     pub fn shard_for_record(&self, id: &str) -> ShardId {
         let hash = stable_hash(id.as_bytes());
         ShardId((hash % u64::from(self.shard_count)) as u32)
+    }
+}
+
+/// The placement parameters a cluster agreed on, persisted per node.
+///
+/// All three inputs to [`Placement`] are here, and that completeness is the
+/// point. Shard count and replication factor were persisted while the voter set
+/// was left to `--peers` on each start, so the one input an operator could
+/// change by editing a flag was the one that moved shards — and nothing
+/// noticed. A node restarted with a different `--peers` computed different
+/// owners than its peers and then routed, and stored, shards the rest of the
+/// cluster disagreed about.
+///
+/// This file lives beside `node.id` for the same reason: a node that comes back
+/// with a different value would answer differently from its peers about where
+/// the data is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementConfig {
+    /// Number of shards the cluster was created with.
+    pub shard_count: u32,
+    /// Replicas per shard.
+    pub replication_factor: usize,
+    /// The voters placement was computed for, ascending.
+    pub voters: Vec<u64>,
+    /// `owners[shard]`, in replica order.
+    ///
+    /// `Option` so a document written before this field existed still opens: an
+    /// absent table means "derive it from the voters", which is exactly what
+    /// every existing directory recorded implicitly. A present table is the
+    /// authority, because once shard ownership can change (removal, promotion,
+    /// re-replication) it is no longer a function of the voter set alone.
+    ///
+    /// `#[serde(default)]` is what makes the old form readable; `deny_unknown_fields`
+    /// on the struct still rejects a *misspelled* field, which is the failure
+    /// worth catching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<Vec<Vec<u64>>>,
+}
+
+impl PlacementConfig {
+    /// File name inside the data directory.
+    pub const FILE: &'static str = "placement.json";
+}
+
+/// Why a data directory's placement could not be opened.
+///
+/// Each variant is a different operator mistake, and each message says what to
+/// do instead: "these two numbers disagree" is only useful if it also says that
+/// changing them is a migration.
+#[derive(Debug, thiserror::Error)]
+pub enum PlacementOpenError {
+    /// The persisted file exists but could not be read.
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The persisted file is not a placement document.
+    #[error("{path} is not a placement file: {source}")]
+    Parse {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The seed could not be encoded or written.
+    #[error("cannot write {path}: {source}")]
+    Write {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The requested configuration is not a valid placement.
+    #[error(transparent)]
+    Invalid(#[from] PlacementError),
+    /// `--shards` disagrees with the data directory.
+    #[error(
+        "--shards {requested} disagrees with this data directory, which was created with \
+         {persisted} shards. Changing the shard count moves every collection onto different \
+         nodes; that is a reshard, not a restart"
+    )]
+    ShardsDiffer { requested: u32, persisted: u32 },
+    /// `--replication-factor` disagrees with the data directory.
+    #[error(
+        "--replication-factor {requested} disagrees with this data directory ({persisted}). \
+         Changing it changes where replicas live; that is a rebalance, not a restart"
+    )]
+    ReplicationDiffers { requested: usize, persisted: usize },
+    /// `--peers` disagrees with the data directory.
+    #[error(
+        "--peers lists nodes {configured:?} but this data directory was placed across \
+         {persisted:?}. The voter set is a property of the cluster, not of a start: changing \
+         it moves shards without moving their data, which is a rebalance"
+    )]
+    VotersDiffer {
+        configured: Vec<u64>,
+        persisted: Vec<u64>,
+    },
+    /// This directory holds a cluster's placement, but no topology was given.
+    #[error(
+        "{path} holds a cluster placement but --peers is empty, so this node would open every \
+         collection as a single-node server. Start it with the topology it was placed across"
+    )]
+    NoTopology { path: std::path::PathBuf },
+}
+
+impl Placement {
+    /// Open the placement this data directory was created with, or seed a new
+    /// one from `voters`.
+    ///
+    /// `voters` is a *seed*, not an authority. It is consulted only when the
+    /// data directory has never belonged to a cluster; afterwards the persisted
+    /// voter set is the authority and a differing seed is refused. A node that
+    /// could redefine placement by being restarted would move every shard's
+    /// replicas without moving any data, and the first symptom would be a shard
+    /// group that never elects.
+    ///
+    /// Returns `None` for a directory that is not, and has not been, part of a
+    /// cluster. Single-node mode has no shards at all, so it has no placement
+    /// document to be wrong about.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlacementOpenError`] if the persisted document cannot be read
+    /// or parsed, if a requested flag disagrees with it, or if a new seed is not
+    /// a valid placement. Nothing is written unless all of that holds, so a
+    /// failed start leaves the directory as it was.
+    pub fn open(
+        dir: &std::path::Path,
+        requested_shards: u32,
+        requested_replication: usize,
+        voters: &[u64],
+    ) -> Result<Option<Self>, PlacementOpenError> {
+        let path = dir.join(PlacementConfig::FILE);
+
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if voters.is_empty() {
+                    return Ok(None);
+                }
+                return Self::seed(&path, requested_shards, requested_replication, voters)
+                    .map(Some);
+            }
+            Err(source) => return Err(PlacementOpenError::Read { path, source }),
+        };
+
+        let config: PlacementConfig =
+            serde_json::from_slice(&bytes).map_err(|source| PlacementOpenError::Parse {
+                path: path.clone(),
+                source,
+            })?;
+
+        if voters.is_empty() {
+            return Err(PlacementOpenError::NoTopology { path });
+        }
+        if requested_shards != 0 && requested_shards != config.shard_count {
+            return Err(PlacementOpenError::ShardsDiffer {
+                requested: requested_shards,
+                persisted: config.shard_count,
+            });
+        }
+        if requested_replication != config.replication_factor {
+            return Err(PlacementOpenError::ReplicationDiffers {
+                requested: requested_replication,
+                persisted: config.replication_factor,
+            });
+        }
+        let mut configured = voters.to_vec();
+        configured.sort_unstable();
+        configured.dedup();
+        let is_superset = configured.iter().all(|v| config.voters.contains(v));
+        if configured != config.voters && !is_superset {
+            return Err(PlacementOpenError::VotersDiffer {
+                configured,
+                persisted: config.voters,
+            });
+        }
+
+        let placement = match config.owners {
+            // A present table is the authority. Deriving owners from the voters
+            // would silently revert a shard move that was committed.
+            Some(owners) => Self::from_owners(
+                config.shard_count,
+                config.replication_factor,
+                config.voters.iter().copied(),
+                owners,
+            ),
+            // Written before this field existed: derive, which is what the file
+            // meant.
+            None => Self::new(config.shard_count, config.replication_factor, config.voters),
+        };
+        placement.map(Some).map_err(PlacementOpenError::Invalid)
+    }
+
+    /// Write the first placement document for a directory.
+    fn seed(
+        path: &std::path::Path,
+        requested_shards: u32,
+        requested_replication: usize,
+        voters: &[u64],
+    ) -> Result<Self, PlacementOpenError> {
+        let mut voters = voters.to_vec();
+        voters.sort_unstable();
+        voters.dedup();
+
+        let shard_count = if requested_shards == 0 {
+            Self::default_shard_count(voters.len())
+        } else {
+            requested_shards
+        };
+
+        // Validate before persisting: a bad configuration should fail on the
+        // first start, not after the file is written.
+        let placement = Self::new(shard_count, requested_replication, voters)?;
+
+        let config = PlacementConfig {
+            shard_count: placement.shard_count(),
+            replication_factor: placement.replication_factor(),
+            voters: placement.voters().to_vec(),
+            owners: Some(placement.owner_table()),
+        };
+        let json = serde_json::to_vec_pretty(&config).map_err(|e| PlacementOpenError::Write {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        })?;
+        std::fs::write(path, json).map_err(|source| PlacementOpenError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        Ok(placement)
     }
 }
 
@@ -569,238 +866,6 @@ mod tests {
                  expected roughly 12"
             );
         }
-    }
-}
-
-/// The placement parameters a cluster agreed on, persisted per node.
-///
-/// All three inputs to [`Placement`] are here, and that completeness is the
-/// point. Shard count and replication factor were persisted while the voter set
-/// was left to `--peers` on each start, so the one input an operator could
-/// change by editing a flag was the one that moved shards — and nothing
-/// noticed. A node restarted with a different `--peers` computed different
-/// owners than its peers and then routed, and stored, shards the rest of the
-/// cluster disagreed about.
-///
-/// This file lives beside `node.id` for the same reason: a node that comes back
-/// with a different value would answer differently from its peers about where
-/// the data is.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlacementConfig {
-    /// Number of shards the cluster was created with.
-    pub shard_count: u32,
-    /// Replicas per shard.
-    pub replication_factor: usize,
-    /// The voters placement was computed for, ascending.
-    pub voters: Vec<u64>,
-    /// `owners[shard]`, in replica order.
-    ///
-    /// `Option` so a document written before this field existed still opens: an
-    /// absent table means "derive it from the voters", which is exactly what
-    /// every existing directory recorded implicitly. A present table is the
-    /// authority, because once shard ownership can change (removal, promotion,
-    /// re-replication) it is no longer a function of the voter set alone.
-    ///
-    /// `#[serde(default)]` is what makes the old form readable; `deny_unknown_fields`
-    /// on the struct still rejects a *misspelled* field, which is the failure
-    /// worth catching.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owners: Option<Vec<Vec<u64>>>,
-}
-
-impl PlacementConfig {
-    /// File name inside the data directory.
-    pub const FILE: &'static str = "placement.json";
-}
-
-/// Why a data directory's placement could not be opened.
-///
-/// Each variant is a different operator mistake, and each message says what to
-/// do instead: "these two numbers disagree" is only useful if it also says that
-/// changing them is a migration.
-#[derive(Debug, thiserror::Error)]
-pub enum PlacementOpenError {
-    /// The persisted file exists but could not be read.
-    #[error("cannot read {path}: {source}")]
-    Read {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// The persisted file is not a placement document.
-    #[error("{path} is not a placement file: {source}")]
-    Parse {
-        path: std::path::PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    /// The seed could not be encoded or written.
-    #[error("cannot write {path}: {source}")]
-    Write {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// The requested configuration is not a valid placement.
-    #[error(transparent)]
-    Invalid(#[from] PlacementError),
-    /// `--shards` disagrees with the data directory.
-    #[error(
-        "--shards {requested} disagrees with this data directory, which was created with \
-         {persisted} shards. Changing the shard count moves every collection onto different \
-         nodes; that is a reshard, not a restart"
-    )]
-    ShardsDiffer { requested: u32, persisted: u32 },
-    /// `--replication-factor` disagrees with the data directory.
-    #[error(
-        "--replication-factor {requested} disagrees with this data directory ({persisted}). \
-         Changing it changes where replicas live; that is a rebalance, not a restart"
-    )]
-    ReplicationDiffers { requested: usize, persisted: usize },
-    /// `--peers` disagrees with the data directory.
-    #[error(
-        "--peers lists nodes {configured:?} but this data directory was placed across \
-         {persisted:?}. The voter set is a property of the cluster, not of a start: changing \
-         it moves shards without moving their data, which is a rebalance"
-    )]
-    VotersDiffer {
-        configured: Vec<u64>,
-        persisted: Vec<u64>,
-    },
-    /// This directory holds a cluster's placement, but no topology was given.
-    #[error(
-        "{path} holds a cluster placement but --peers is empty, so this node would open every \
-         collection as a single-node server. Start it with the topology it was placed across"
-    )]
-    NoTopology { path: std::path::PathBuf },
-}
-
-impl Placement {
-    /// Open the placement this data directory was created with, or seed a new
-    /// one from `voters`.
-    ///
-    /// `voters` is a *seed*, not an authority. It is consulted only when the
-    /// data directory has never belonged to a cluster; afterwards the persisted
-    /// voter set is the authority and a differing seed is refused. A node that
-    /// could redefine placement by being restarted would move every shard's
-    /// replicas without moving any data, and the first symptom would be a shard
-    /// group that never elects.
-    ///
-    /// Returns `None` for a directory that is not, and has not been, part of a
-    /// cluster. Single-node mode has no shards at all, so it has no placement
-    /// document to be wrong about.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlacementOpenError`] if the persisted document cannot be read
-    /// or parsed, if a requested flag disagrees with it, or if a new seed is not
-    /// a valid placement. Nothing is written unless all of that holds, so a
-    /// failed start leaves the directory as it was.
-    pub fn open(
-        dir: &std::path::Path,
-        requested_shards: u32,
-        requested_replication: usize,
-        voters: &[u64],
-    ) -> Result<Option<Self>, PlacementOpenError> {
-        let path = dir.join(PlacementConfig::FILE);
-
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if voters.is_empty() {
-                    return Ok(None);
-                }
-                return Self::seed(&path, requested_shards, requested_replication, voters)
-                    .map(Some);
-            }
-            Err(source) => return Err(PlacementOpenError::Read { path, source }),
-        };
-
-        let config: PlacementConfig =
-            serde_json::from_slice(&bytes).map_err(|source| PlacementOpenError::Parse {
-                path: path.clone(),
-                source,
-            })?;
-
-        if voters.is_empty() {
-            return Err(PlacementOpenError::NoTopology { path });
-        }
-        if requested_shards != 0 && requested_shards != config.shard_count {
-            return Err(PlacementOpenError::ShardsDiffer {
-                requested: requested_shards,
-                persisted: config.shard_count,
-            });
-        }
-        if requested_replication != config.replication_factor {
-            return Err(PlacementOpenError::ReplicationDiffers {
-                requested: requested_replication,
-                persisted: config.replication_factor,
-            });
-        }
-        let mut configured = voters.to_vec();
-        configured.sort_unstable();
-        configured.dedup();
-        if configured != config.voters {
-            return Err(PlacementOpenError::VotersDiffer {
-                configured,
-                persisted: config.voters,
-            });
-        }
-
-        let placement = match config.owners {
-            // A present table is the authority. Deriving owners from the voters
-            // would silently revert a shard move that was committed.
-            Some(owners) => Self::from_owners(
-                config.shard_count,
-                config.replication_factor,
-                config.voters.iter().copied(),
-                owners,
-            ),
-            // Written before this field existed: derive, which is what the file
-            // meant.
-            None => Self::new(config.shard_count, config.replication_factor, config.voters),
-        };
-        placement.map(Some).map_err(PlacementOpenError::Invalid)
-    }
-
-    /// Write the first placement document for a directory.
-    fn seed(
-        path: &std::path::Path,
-        requested_shards: u32,
-        requested_replication: usize,
-        voters: &[u64],
-    ) -> Result<Self, PlacementOpenError> {
-        let mut voters = voters.to_vec();
-        voters.sort_unstable();
-        voters.dedup();
-
-        let shard_count = if requested_shards == 0 {
-            Self::default_shard_count(voters.len())
-        } else {
-            requested_shards
-        };
-
-        // Validate before persisting: a bad configuration should fail on the
-        // first start, not after the file is written.
-        let placement = Self::new(shard_count, requested_replication, voters)?;
-
-        let config = PlacementConfig {
-            shard_count: placement.shard_count(),
-            replication_factor: placement.replication_factor(),
-            voters: placement.voters().to_vec(),
-            owners: Some(placement.owner_table()),
-        };
-        let json = serde_json::to_vec_pretty(&config).map_err(|e| PlacementOpenError::Write {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-        })?;
-        std::fs::write(path, json).map_err(|source| PlacementOpenError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        Ok(placement)
     }
 }
 

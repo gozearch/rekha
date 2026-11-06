@@ -1,0 +1,30 @@
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rekha.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rekha.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rekha.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Internal Raft and WAL replication port (9000): strictly cluster-internal between Rekha pods
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "rekha.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.internal }}
+    # Client HTTP port (8000): allow from clients inside the cluster
+    {{- if .Values.networkPolicy.allowExternalHttp }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.ports.http }}
+    {{- end }}
+{{- end }}

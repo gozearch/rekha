@@ -161,4 +161,48 @@ async fn intra_collection_sharding_scatters_and_gathers() {
     assert_eq!(status, 200, "count after delete: {body}");
     let resp: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(resp["count"].as_u64(), Some(98));
+
+    // 5. Verify Cross-Shard 2PC Atomicity (Rollback on Partial Failure)
+    let (status, body) = post_json_retrying(
+        &nodes[0],
+        &format!("/api/v2/collections/{collection}/add"),
+        json!({
+            "ids": ["anchor-1"],
+            "embeddings": [vec![1.0f32; DIM]],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "adding anchor record: {body}");
+
+    // Submit a multi-shard batch containing new records and the duplicate "anchor-1"
+    let (status, body) = post_json(
+        &nodes[0],
+        &format!("/api/v2/collections/{collection}/add"),
+        json!({
+            "ids": ["new-1", "new-2", "new-3", "anchor-1"],
+            "embeddings": [vec![1.0f32; DIM], vec![2.0f32; DIM], vec![3.0f32; DIM], vec![1.0f32; DIM]],
+        }),
+    )
+    .await;
+    assert!(
+        status == 400 || status == 500,
+        "batch with duplicate must be rejected: status {status} body {body}"
+    );
+
+    // Verify 2PC rolled back and none of the new records were stored on any shard
+    let (status, body) = post_json_retrying(
+        &nodes[0],
+        &format!("/api/v2/collections/{collection}/get"),
+        json!({
+            "ids": ["new-1", "new-2", "new-3"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "get must succeed: {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let ids = resp["ids"].as_array().unwrap();
+    assert!(
+        ids.is_empty(),
+        "2PC aborted batch must not leak any records onto other shards: {ids:?}"
+    );
 }

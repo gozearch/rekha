@@ -33,6 +33,9 @@ DEF_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+COMMENT_PATTERN = re.compile(r"^\s*//.*$", re.MULTILINE)
+PUB_USE_PATTERN = re.compile(r"^\s*pub\s+use\b[^;]*;", re.MULTILINE)
+
 # Where a reference may legitimately live. `tests/` and `bench/` included on
 # purpose: an item used only by an integration test is not dead, it is a test
 # seam, and the allowlist is where that decision is recorded.
@@ -50,6 +53,11 @@ DEF_GLOBS = ["crates/*/src/**/*.rs"]
 # are only reachable when testing. They are not production API and must not be
 # reported, so the definition scan stops there.
 TEST_CUT = "#[cfg(test)]"
+
+
+def strip_non_refs(text: str) -> str:
+    text = COMMENT_PATTERN.sub("", text)
+    return PUB_USE_PATTERN.sub("", text)
 
 
 def definitions() -> dict[str, pathlib.Path]:
@@ -87,7 +95,12 @@ def main(argv: list[str]) -> int:
     for pattern in SOURCE_GLOBS:
         for path in sorted(ROOT.glob(pattern)):
             corpus.append(
-                (path, path.read_text(encoding="utf-8", errors="ignore"))
+                (
+                    path,
+                    strip_non_refs(
+                        path.read_text(encoding="utf-8", errors="ignore")
+                    ),
+                )
             )
 
     allowed = allowlisted()

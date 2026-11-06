@@ -37,6 +37,8 @@ pub struct ShardCluster {
     ensured: parking_lot::Mutex<HashSet<(Uuid, ShardId)>>,
     /// 2PC transaction IDs that have committed on the metadata consensus group.
     committed_txs: parking_lot::RwLock<HashSet<Uuid>>,
+    /// In-flight 2PC transactions staged on shards: tx_id -> (shard, timestamp).
+    staged_txs: parking_lot::RwLock<HashMap<Uuid, (ShardId, std::time::Instant)>>,
 }
 
 impl std::fmt::Debug for ShardCluster {
@@ -55,6 +57,7 @@ impl ShardCluster {
             groups: parking_lot::RwLock::new(HashMap::new()),
             ensured: parking_lot::Mutex::new(HashSet::new()),
             committed_txs: parking_lot::RwLock::new(HashSet::new()),
+            staged_txs: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -142,6 +145,29 @@ impl ShardCluster {
     /// Mark a 2PC transaction as aborted globally.
     pub fn mark_tx_aborted(&self, tx_id: &Uuid) {
         self.committed_txs.write().remove(tx_id);
+    }
+
+    /// Register an in-flight prepared transaction on a shard.
+    pub fn mark_tx_staged(&self, shard: ShardId, tx_id: Uuid) {
+        self.staged_txs
+            .write()
+            .insert(tx_id, (shard, std::time::Instant::now()));
+    }
+
+    /// Mark an in-flight transaction resolved on a shard.
+    pub fn mark_tx_resolved(&self, tx_id: &Uuid) {
+        self.staged_txs.write().remove(tx_id);
+    }
+
+    /// Collect any in-flight transactions staged longer than `max_age`.
+    pub fn stale_staged_txs(&self, max_age: std::time::Duration) -> Vec<(Uuid, ShardId)> {
+        let now = std::time::Instant::now();
+        self.staged_txs
+            .read()
+            .iter()
+            .filter(|(_, (_, created))| now.duration_since(*created) >= max_age)
+            .map(|(tx_id, (shard, _))| (*tx_id, *shard))
+            .collect()
     }
 }
 

@@ -105,6 +105,10 @@ pub(crate) struct Collection {
     pub(crate) segment_starts: Vec<usize>,
     /// Maps record id → offset within the segment (for fast vector lookup).
     pub(crate) segment_index: HashMap<Id, usize>,
+    /// In-flight 2PC record reservations: record id -> tx_id.
+    pub(crate) reserved_ids: HashMap<Id, Uuid>,
+    /// In-flight 2PC tx info: tx_id -> (timestamp, list of reserved ids).
+    pub(crate) tx_reservations: HashMap<Uuid, (Instant, Vec<Id>)>,
 }
 
 /// The only checkpoint manifest format this build reads and writes.
@@ -497,6 +501,8 @@ impl Collection {
             segments: Vec::new(),
             segment_starts: Vec::new(),
             segment_index: HashMap::new(),
+            reserved_ids: HashMap::new(),
+            tx_reservations: HashMap::new(),
         })
     }
 
@@ -1154,7 +1160,7 @@ impl Collection {
 
             let mut writer = SegmentWriter::new(self.config.dimension);
             for (i, (id, embedding)) in entries.iter().enumerate() {
-                writer.push(embedding.as_ref());
+                writer.push(embedding.as_ref())?;
                 staged_index.insert(id.clone(), base + i);
             }
             let name = if compact {
@@ -1373,6 +1379,48 @@ impl Collection {
         self.gc_old_generations(&gen_name);
         timings.cleanup_us = phase.elapsed().as_micros() as u64;
         Ok(CheckpointOutcome::Complete)
+    }
+
+    /// Reserve record IDs for an in-flight 2PC transaction.
+    pub(crate) fn reserve_tx_ids(&mut self, tx_id: Uuid, ids: &[Id]) -> EngineResult<()> {
+        let now = Instant::now();
+        let expired: Vec<Uuid> = self
+            .tx_reservations
+            .iter()
+            .filter(|(_, (ts, _))| now.duration_since(*ts) > std::time::Duration::from_secs(30))
+            .map(|(tx, _)| *tx)
+            .collect();
+        for exp in expired {
+            if let Some((_, exp_ids)) = self.tx_reservations.remove(&exp) {
+                for id in exp_ids {
+                    self.reserved_ids.remove(&id);
+                }
+            }
+        }
+
+        for id in ids {
+            if let Some(holder) = self.reserved_ids.get(id)
+                && *holder != tx_id
+            {
+                return Err(EngineError::Validation(format!(
+                    "record `{id}` is locked by in-flight transaction {holder}"
+                )));
+            }
+        }
+        for id in ids {
+            self.reserved_ids.insert(id.clone(), tx_id);
+        }
+        self.tx_reservations.insert(tx_id, (now, ids.to_vec()));
+        Ok(())
+    }
+
+    /// Release record IDs reserved by a 2PC transaction upon commit or abort.
+    pub(crate) fn release_tx_ids(&mut self, tx_id: &Uuid) {
+        if let Some((_, ids)) = self.tx_reservations.remove(tx_id) {
+            for id in ids {
+                self.reserved_ids.remove(&id);
+            }
+        }
     }
 
     /// Check that a just-written generation is internally coherent.
@@ -1737,6 +1785,7 @@ impl Collection {
         // how far the collection has been advanced regardless of where the
         // sequence came from (WAL seq single-node, Raft index in a cluster).
         self.applied_seq = self.applied_seq.max(seq);
+        self.reserved_ids.remove(op.id());
         match op {
             Operation::Add {
                 id,
@@ -1972,6 +2021,11 @@ impl Collection {
                     "add: id `{id}` already exists"
                 )));
             }
+            if let Some(holder) = self.reserved_ids.get(id) {
+                return Err(EngineError::Validation(format!(
+                    "add: id `{id}` is locked by in-flight transaction {holder}"
+                )));
+            }
             if !seen.insert(id) {
                 return Err(EngineError::Validation(format!(
                     "add: duplicate id `{id}` within the batch"
@@ -2000,6 +2054,13 @@ impl Collection {
         check_slice_lengths("upsert", ids, metadatas, "metadatas")?;
         check_slice_lengths("upsert", ids, documents, "documents")?;
         check_dimensions("upsert", embeddings, self.config.dimension)?;
+        for id in ids {
+            if let Some(holder) = self.reserved_ids.get(id) {
+                return Err(EngineError::Validation(format!(
+                    "upsert: id `{id}` is locked by in-flight transaction {holder}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2018,6 +2079,13 @@ impl Collection {
     ) -> EngineResult<()> {
         check_slice_lengths("update", ids, metadatas, "metadatas")?;
         check_slice_lengths("update", ids, documents, "documents")?;
+        for id in ids {
+            if let Some(holder) = self.reserved_ids.get(id) {
+                return Err(EngineError::Validation(format!(
+                    "update: id `{id}` is locked by in-flight transaction {holder}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2035,8 +2103,6 @@ impl Collection {
         options: &QueryOptions,
         with_embedding: bool,
     ) -> EngineResult<Vec<ScoredPoint>> {
-        use std::cmp::Ordering;
-
         if self.config.dimension != 0 && query.len() != self.config.dimension {
             return Err(EngineError::Validation(format!(
                 "query: embedding dimension {} != collection dimension {}",
@@ -2080,8 +2146,8 @@ impl Collection {
 
         out.sort_by(|a, b| {
             a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(Ordering::Equal)
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
         });
         out.truncate(k);
         Ok(out)

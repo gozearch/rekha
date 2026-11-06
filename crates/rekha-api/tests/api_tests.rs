@@ -1204,3 +1204,69 @@ async fn chroma_query_echoes_include() {
     sorted.sort();
     assert_eq!(sorted, vec!["distances", "documents", "metadatas"]);
 }
+
+#[tokio::test]
+async fn reject_non_finite_embeddings() {
+    let (_dir, server) = test_app_no_auth();
+    let col = create_collection(&server, "finite-test", 2).await;
+    let id = collection_id(&col);
+
+    // Direct unit validation checks
+    assert!(rekha_api::validate_embedding_slice(&[f32::NAN, 1.0]).is_err());
+    assert!(rekha_api::validate_embedding_slice(&[1.0, f32::INFINITY]).is_err());
+    assert!(rekha_api::validate_embedding_slice(&[f32::NEG_INFINITY, 1.0]).is_err());
+    assert!(rekha_api::validate_embedding_slice(&[1.0, 2.0]).is_ok());
+
+    // JSON float overflow is rejected with 400
+    let resp = server
+        .post(&format!("/api/v2/collections/{id}/add"))
+        .text("{\"ids\": [\"doc1\"], \"embeddings\": [[1e500, 1.0]]}")
+        .content_type("application/json")
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        400,
+        "Infinity must be rejected: {}",
+        resp.text()
+    );
+
+    // Native v2 query with Infinity is rejected with 400
+    let resp = server
+        .post(&format!("/api/v2/collections/{id}/query"))
+        .text("{\"query_embeddings\": [[1.0, 1e500]], \"n_results\": 1}")
+        .content_type("application/json")
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        400,
+        "Infinity query must be rejected: {}",
+        resp.text()
+    );
+
+    // Chroma add with Infinity is rejected with 400
+    chroma_create(&server, "chroma-finite", Some(2), None).await;
+    let resp = server
+        .post(&format!("{CHROMA_BASE}/chroma-finite/add"))
+        .text("{\"ids\": [\"doc1\"], \"embeddings\": [[1e500, 0.0]]}")
+        .content_type("application/json")
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        400,
+        "Chroma Infinity add must be rejected: {}",
+        resp.text()
+    );
+
+    // Chroma query with Infinity is rejected with 400
+    let resp = server
+        .post(&format!("{CHROMA_BASE}/chroma-finite/query"))
+        .text("{\"query_embeddings\": [[0.0, 1e500]], \"n_results\": 1}")
+        .content_type("application/json")
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        400,
+        "Chroma Infinity query must be rejected: {}",
+        resp.text()
+    );
+}

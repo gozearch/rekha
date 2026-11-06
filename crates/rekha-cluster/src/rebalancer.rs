@@ -82,6 +82,30 @@ pub async fn reconcile_local_shard_leaders(node_id: u64, shards: &Arc<ShardClust
             );
         }
     }
+
+    // Reconcile any in-flight 2PC transactions older than 15s on shards led by this node
+    let stale = shards.stale_staged_txs(Duration::from_secs(15));
+    for (tx_id, shard) in stale {
+        let Some(shard_raft) = shards.raft(shard) else {
+            continue;
+        };
+        let m = shard_raft.metrics().borrow().clone();
+        if m.current_leader != Some(node_id) {
+            continue;
+        }
+        if shards.is_tx_committed(&tx_id) {
+            tracing::info!(shard = shard.0, %tx_id, "reconciler committing stranded 2PC transaction");
+            let _ = shard_raft
+                .client_write(ClusterOperation::CommitBatch { tx_id })
+                .await;
+        } else {
+            tracing::info!(shard = shard.0, %tx_id, "reconciler aborting stranded 2PC transaction");
+            let _ = shard_raft
+                .client_write(ClusterOperation::AbortBatch { tx_id })
+                .await;
+        }
+        shards.mark_tx_resolved(&tx_id);
+    }
 }
 
 /// Execute one reconciliation tick.
@@ -127,18 +151,13 @@ pub async fn run_rebalancer_tick(
             {
                 tracing::info!(learner, "auto-promoted learner to voter in metadata group");
                 let voter_vec: Vec<u64> = new_voters.into_iter().collect();
-                let _ = raft
+                if let Err(e) = raft
                     .client_write(ClusterOperation::SetVoters {
                         voters: voter_vec.clone(),
                     })
-                    .await;
-                let current_p = shards.placement();
-                if let Ok(new_p) = Placement::new(
-                    current_p.shard_count(),
-                    current_p.replication_factor(),
-                    voter_vec.iter().copied(),
-                ) {
-                    shards.set_placement(Arc::new(new_p));
+                    .await
+                {
+                    tracing::error!(learner, %e, "failed to record SetVoters in consensus log");
                 }
             }
         }

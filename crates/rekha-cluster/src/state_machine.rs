@@ -103,6 +103,23 @@ pub trait EngineSnapshotProvider: Send + Sync + 'static {
         index: u64,
         dimension: usize,
     ) -> Result<(), String>;
+
+    /// Reserve record IDs for an in-flight 2PC transaction.
+    fn reserve_tx_ids(
+        &self,
+        collection_id: &uuid::Uuid,
+        shard: Option<ShardId>,
+        tx_id: uuid::Uuid,
+        ids: &[rekha_core::types::Id],
+    ) -> Result<(), String>;
+
+    /// Release record IDs reserved by a 2PC transaction upon commit or abort.
+    fn release_tx_ids(
+        &self,
+        collection_id: &uuid::Uuid,
+        shard: Option<ShardId>,
+        tx_id: &uuid::Uuid,
+    ) -> Result<(), String>;
 }
 
 /// Which consensus group this state machine belongs to.
@@ -436,10 +453,10 @@ impl ClusterStateMachine {
                 // request could never have succeeded on any node. The leader
                 // rejects these before proposing, so reaching here means a race
                 // with a concurrent change or a replay of an older entry.
-                eprintln!("cluster: {what} was rejected: {e}");
+                tracing::warn!(error = %e, "cluster: {what} was rejected");
             }
             Err(e) => {
-                eprintln!("cluster: {what} did not apply: {e}");
+                tracing::error!(error = %e, "cluster: {what} did not apply");
                 self.note_apply_failure();
             }
         }
@@ -452,10 +469,10 @@ impl ClusterStateMachine {
         match result {
             Ok(()) | Err(rekha_storage::CatalogError::NotFound) => {}
             Err(e) if is_application_rejection(&e) => {
-                eprintln!("cluster: {what} was rejected: {e}");
+                tracing::warn!(error = %e, "cluster: {what} was rejected");
             }
             Err(e) => {
-                eprintln!("cluster: {what} did not apply: {e}");
+                tracing::error!(error = %e, "cluster: {what} did not apply");
                 self.note_apply_failure();
             }
         }
@@ -493,10 +510,10 @@ impl ClusterStateMachine {
                 // knows the replication factor and the voter set.
                 let mut seen = std::collections::HashSet::with_capacity(owners.len());
                 if owners.is_empty() || !owners.iter().all(|node| seen.insert(*node)) {
-                    eprintln!(
-                        "cluster: refused an owner set for shard {}: empty or containing \
-                         duplicates ({owners:?})",
-                        shard.0
+                    tracing::warn!(
+                        shard = shard.0,
+                        ?owners,
+                        "cluster: refused an owner set for shard: empty or containing duplicates"
                     );
                     return;
                 }
@@ -538,9 +555,10 @@ impl ClusterStateMachine {
                         // snapshot fails when it looks the record up — whereas
                         // treating a refusal as divergence would take down a
                         // healthy node.
-                        eprintln!(
-                            "cluster: failed to record replicated collection {}: {e}",
-                            config.id
+                        tracing::warn!(
+                            collection_id = %config.id,
+                            error = %e,
+                            "cluster: failed to record replicated collection"
                         );
                     }
                     // The group that owns the shard opens the data. Comparing
@@ -564,9 +582,10 @@ impl ClusterStateMachine {
                         // take a snapshot that silently omits it, because the
                         // snapshot scope is filtered by what the engine has
                         // loaded. Both are divergence; stop answering.
-                        eprintln!(
-                            "cluster: failed to materialize replicated collection {}: {e}",
-                            config.id
+                        tracing::error!(
+                            collection_id = %config.id,
+                            error = %e,
+                            "cluster: failed to materialize replicated collection"
                         );
                         self.note_apply_failure();
                     }
@@ -577,7 +596,7 @@ impl ClusterStateMachine {
                 // entry's log index as the dataset sequence. Reaching here means
                 // a call path dropped the sequence, which would make the apply
                 // non-idempotent and the snapshot boundary meaningless.
-                eprintln!(
+                tracing::error!(
                     "cluster: a Batch operation reached apply_operation without a log index; \
                      refusing to apply it blind"
                 );
@@ -598,7 +617,7 @@ impl ClusterStateMachine {
             ClusterOperation::PrepareBatch { .. }
             | ClusterOperation::CommitBatch { .. }
             | ClusterOperation::AbortBatch { .. } => {
-                eprintln!(
+                tracing::error!(
                     "cluster: a 2PC batch operation reached apply_operation without a log index; \
                      refusing to apply it blind"
                 );
@@ -613,7 +632,7 @@ impl ClusterStateMachine {
                     // node's catalog did not take a committed entry, and serving
                     // from it would report a namespace that half the cluster
                     // cannot see.
-                    eprintln!("cluster: failed to create tenant {name}: {e}");
+                    tracing::error!(tenant = %name, error = %e, "cluster: failed to create tenant");
                     self.note_apply_failure();
                 }
             }
@@ -622,7 +641,7 @@ impl ClusterStateMachine {
                     && let Err(e) = catalog.create_database(tenant, name)
                     && !matches!(e, rekha_storage::CatalogError::AlreadyExists)
                 {
-                    eprintln!("cluster: failed to create database {tenant}/{name}: {e}");
+                    tracing::error!(tenant = %tenant, database = %name, error = %e, "cluster: failed to create database");
                     self.note_apply_failure();
                 }
             }
@@ -635,7 +654,7 @@ impl ClusterStateMachine {
                 if let Some(engine) = &self.engine
                     && let Err(e) = engine.drop_collection(collection_id, shard_id)
                 {
-                    eprintln!("cluster: failed to drop replicated collection {collection_id}: {e}");
+                    tracing::warn!(collection_id = %collection_id, error = %e, "cluster: failed to drop replicated collection");
                 }
             }
             ClusterOperation::CreateUser {
@@ -905,7 +924,7 @@ fn persist_snapshot(
     // Retention is best-effort: the snapshot that was just published is the one
     // the cluster needs, and failing to delete an old one must not fail it.
     if let Err(e) = store.prune(crate::snapshot_store::KEEP) {
-        eprintln!("cluster: pruning old snapshots failed: {e}");
+        tracing::warn!(error = %e, "cluster: pruning old snapshots failed");
     }
     Ok(())
 }
@@ -992,9 +1011,11 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
                             // also reported in the response, so the client that
                             // wrote it is told rather than only the next reader
                             // of /ready.
-                            eprintln!(
-                                "cluster: FAILED to apply committed batch for {collection_id} \
-                                 at index {index}: {e}; marking this node not-ready"
+                            tracing::error!(
+                                collection_id = %collection_id,
+                                index,
+                                error = %e,
+                                "cluster: FAILED to apply committed batch; marking this node not-ready"
                             );
                             self.note_apply_failure();
                             BatchResponse::failed(index, e)
@@ -1011,6 +1032,15 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
                     dimension,
                 }) => {
                     let index = entry.log_id.index;
+                    let ids: Vec<rekha_core::types::Id> =
+                        ops.iter().map(|o| o.id().to_string()).collect();
+                    let shard_id = match self.role {
+                        GroupRole::Shard(s) => Some(s),
+                        GroupRole::Metadata => None,
+                    };
+                    if let Some(engine) = &self.engine {
+                        let _ = engine.reserve_tx_ids(collection_id, shard_id, *tx_id, &ids);
+                    }
                     self.prepared_txs.insert(
                         *tx_id,
                         PreparedTx {
@@ -1028,17 +1058,20 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
                 }
                 EntryPayload::Normal(ClusterOperation::CommitBatch { tx_id }) => {
                     let index = entry.log_id.index;
+                    let shard_id = match self.role {
+                        GroupRole::Shard(s) => Some(s),
+                        GroupRole::Metadata => None,
+                    };
                     if let Some(tx) = self.prepared_txs.remove(tx_id) {
+                        if let Some(engine) = &self.engine {
+                            let _ = engine.release_tx_ids(&tx.collection_id, shard_id, tx_id);
+                        }
                         let outcome = match self.engine.clone() {
                             Some(engine) => {
                                 let collection_id = tx.collection_id;
                                 let ops: Arc<[rekha_core::op::Operation]> =
                                     Arc::from(tx.ops.as_slice());
                                 let dimension = tx.dimension;
-                                let shard_id = match self.role {
-                                    GroupRole::Shard(s) => Some(s),
-                                    GroupRole::Metadata => None,
-                                };
                                 match tokio::task::spawn_blocking(move || {
                                     engine.apply_batch(
                                         &collection_id,
@@ -1063,9 +1096,11 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
                         let response = match outcome {
                             Ok(()) => BatchResponse::ok(tx.ops.len(), index),
                             Err(e) => {
-                                eprintln!(
-                                    "cluster: FAILED to apply committed 2PC batch for {tx_id} \
-                                     at index {index}: {e}; marking this node not-ready"
+                                tracing::error!(
+                                    tx_id = %tx_id,
+                                    index,
+                                    error = %e,
+                                    "cluster: FAILED to apply committed 2PC batch; marking this node not-ready"
                                 );
                                 self.note_apply_failure();
                                 BatchResponse::failed(index, e)
@@ -1084,7 +1119,15 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
                 }
                 EntryPayload::Normal(ClusterOperation::AbortBatch { tx_id }) => {
                     let index = entry.log_id.index;
-                    self.prepared_txs.remove(tx_id);
+                    let shard_id = match self.role {
+                        GroupRole::Shard(s) => Some(s),
+                        GroupRole::Metadata => None,
+                    };
+                    if let Some(tx) = self.prepared_txs.remove(tx_id)
+                        && let Some(engine) = &self.engine
+                    {
+                        let _ = engine.release_tx_ids(&tx.collection_id, shard_id, tx_id);
+                    }
                     let response = BatchResponse::ok(0, index);
                     responses.push(serde_json::to_string(&response).unwrap_or_else(|e| {
                         format!("{{\"applied\":0,\"seq\":{index},\"error\":\"{e}\"}}")
@@ -1246,15 +1289,15 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
             match store.publish(meta, &data) {
                 Ok(_) => {
                     if let Err(e) = store.prune(crate::snapshot_store::KEEP) {
-                        eprintln!("cluster: pruning old snapshots failed: {e}");
+                        tracing::warn!(error = %e, "cluster: pruning old snapshots failed");
                     }
                 }
                 // The install itself succeeded, so this is not a reason to fail
                 // it: the state is in memory and durable. It only means this
                 // node cannot yet hand the snapshot to someone else.
-                Err(e) => eprintln!(
-                    "cluster: installed a snapshot but could not persist it for later \
-                     transfers: {e}"
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "cluster: installed a snapshot but could not persist it for later transfers"
                 ),
             }
         }
@@ -1318,7 +1361,7 @@ impl RaftStateMachine<RaftTypeConfig> for ClusterStateMachine {
         {
             // The snapshot is still valid for this transfer; failing to keep a
             // copy only means the next request builds another one.
-            eprintln!("cluster: could not persist the on-demand snapshot: {e}");
+            tracing::warn!(error = %e, "cluster: could not persist the on-demand snapshot");
         }
         Ok(Some(Snapshot {
             meta,
@@ -1573,6 +1616,23 @@ mod tests {
             &self,
             _collection_id: &uuid::Uuid,
             _shard: Option<ShardId>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn reserve_tx_ids(
+            &self,
+            _collection_id: &uuid::Uuid,
+            _shard: Option<ShardId>,
+            _tx_id: uuid::Uuid,
+            _ids: &[rekha_core::types::Id],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn release_tx_ids(
+            &self,
+            _collection_id: &uuid::Uuid,
+            _shard: Option<ShardId>,
+            _tx_id: &uuid::Uuid,
         ) -> Result<(), String> {
             Ok(())
         }

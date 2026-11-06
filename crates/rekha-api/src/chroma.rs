@@ -546,13 +546,7 @@ fn validate_chroma_add(req: &ChromaAddRequest) -> Result<(), EngineError> {
         }
     }
     for emb in embeddings {
-        if emb.is_empty() || emb.len() > crate::MAX_DIMENSION {
-            return Err(validation_err(format!(
-                "embedding dimension {} invalid (max {})",
-                emb.len(),
-                crate::MAX_DIMENSION
-            )));
-        }
+        crate::validate_embedding_slice(emb)?;
     }
     if let Some(ref v) = req.metadatas
         && v.len() != req.ids.len()
@@ -771,6 +765,11 @@ pub(crate) async fn update_records_chroma(
             req.ids.len(),
             crate::MAX_BATCH_SIZE
         ))));
+    }
+    if let Some(ref embs) = req.embeddings {
+        for emb in embs {
+            crate::validate_embedding_slice(emb)?;
+        }
     }
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
     // Chroma sends `embeddings: null` for a metadata-only update, and may send a
@@ -1017,6 +1016,9 @@ pub(crate) async fn query_records_chroma(
             req.n_results,
             crate::MAX_N_RESULTS
         ))));
+    }
+    for emb in &req.query_embeddings {
+        crate::validate_embedding_slice(emb)?;
     }
     let id = resolve_collection(&state.engine, &tenant, &database, &name)?;
 

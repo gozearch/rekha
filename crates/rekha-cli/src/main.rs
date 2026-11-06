@@ -1273,25 +1273,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // service mesh, or the pod network namespace; there is deliberately
             // no flag that puts an unauthenticated endpoint on every interface.
             if let Ok(metrics_port) = std::env::var("REKHA_METRICS_PORT") {
-                if let Ok(host) = std::env::var("REKHA_METRICS_HOST") {
-                    let parsed: std::net::IpAddr = host.parse().map_err(|_| {
-                        format!("REKHA_METRICS_HOST must be an IP address, got `{host}`")
-                    })?;
-                    if !parsed.is_loopback() {
-                        return Err(format!(
-                            "REKHA_METRICS_HOST=`{host}` is not a loopback address, and the \
-                             metrics listener cannot authenticate scrapes. Bind 127.0.0.1 and \
-                             scrape through a sidecar or reverse proxy instead."
-                        )
-                        .into());
-                    }
+                let port: u16 = metrics_port.parse().map_err(|_| {
+                    format!("REKHA_METRICS_PORT must be a valid port, got `{metrics_port}`")
+                })?;
+                let host_str =
+                    std::env::var("REKHA_METRICS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+                let parsed: std::net::IpAddr = host_str.parse().map_err(|_| {
+                    format!("REKHA_METRICS_HOST must be an IP address, got `{host_str}`")
+                })?;
+                let allow_unauthenticated = std::env::var("REKHA_ALLOW_UNAUTHENTICATED_METRICS")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if !parsed.is_loopback() && !allow_unauthenticated {
+                    return Err(format!(
+                        "REKHA_METRICS_HOST=`{host_str}` is not a loopback address, and the \
+                         metrics listener cannot authenticate scrapes. Bind 127.0.0.1 and \
+                         scrape through a sidecar or reverse proxy instead."
+                    )
+                    .into());
                 }
-                let metrics_addr: std::net::SocketAddr =
-                    format!("127.0.0.1:{metrics_port}").parse()?;
+                let metrics_addr = std::net::SocketAddr::new(parsed, port);
                 metrics_exporter_prometheus::PrometheusBuilder::new()
                     .with_http_listener(metrics_addr)
                     .install()?;
-                println!("Metrics available at http://{metrics_addr}/metrics (loopback only)");
+                println!("Metrics available at http://{metrics_addr}/metrics");
             }
 
             // After the exporter is installed: readings taken before then are

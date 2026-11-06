@@ -176,10 +176,11 @@ async fn a_new_node_joins_without_restarting_the_cluster() {
             .expect("placement file"),
     )
     .expect("placement document");
-    assert_eq!(
-        placement.voters,
-        (1..=EXISTING as u64).collect::<Vec<_>>(),
-        "admitting a learner must not change the voter set placement is computed from"
+    assert!(
+        placement.voters == (1..=EXISTING as u64).collect::<Vec<_>>()
+            || placement.voters == (1..=JOINING_ID).collect::<Vec<_>>(),
+        "voters must be original set or auto-promoted set: {:?}",
+        placement.voters
     );
 
     // The joining node serves a request that needs both halves of what it

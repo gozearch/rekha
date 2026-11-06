@@ -1168,6 +1168,17 @@ pub struct ShardAbortRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxCommitRequest {
+    pub tx_id: Uuid,
+    pub shards: Vec<rekha_cluster::ShardId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxAbortRequest {
+    pub tx_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardBatchResponse {
     pub count: usize,
 }
@@ -1448,12 +1459,23 @@ pub(crate) async fn prepare_write_for_shard(
         return Ok(0);
     }
 
+    let ids: Vec<String> = prepared.ops.iter().map(|o| o.id().to_string()).collect();
+    state
+        .engine
+        .reserve_tx_ids(&collection_id, Some(shard), tx_id, &ids)?;
+
     let Some(shards) = state.shards.as_ref() else {
+        let _ = state
+            .engine
+            .release_tx_ids(&collection_id, Some(shard), &tx_id);
         return Err(ApiError::Engine(EngineError::Unavailable(
             "no shards configured".into(),
         )));
     };
     let Some(raft) = shards.raft(shard) else {
+        let _ = state
+            .engine
+            .release_tx_ids(&collection_id, Some(shard), &tx_id);
         return Err(ApiError::Engine(EngineError::NotReplica {
             collection: collection_id.to_string(),
             shard: Some(shard),
@@ -1471,23 +1493,44 @@ pub(crate) async fn prepare_write_for_shard(
         Ok(response) => {
             match serde_json::from_str::<rekha_cluster::BatchResponse>(&response.data) {
                 Ok(applied) => match applied.error {
-                    None => Ok(count),
-                    Some(error) => Err(ApiError::Engine(EngineError::Recovery(format!(
-                        "2PC prepare committed at log index {} but could not stage: {error}",
-                        applied.seq
-                    )))),
+                    None => {
+                        shards.mark_tx_staged(shard, tx_id);
+                        Ok(count)
+                    }
+                    Some(error) => {
+                        let _ = state
+                            .engine
+                            .release_tx_ids(&collection_id, Some(shard), &tx_id);
+                        Err(ApiError::Engine(EngineError::Recovery(format!(
+                            "2PC prepare committed at log index {} but could not stage: {error}",
+                            applied.seq
+                        ))))
+                    }
                 },
-                Err(_) => Ok(count),
+                Err(_) => {
+                    shards.mark_tx_staged(shard, tx_id);
+                    Ok(count)
+                }
             }
         }
         Err(openraft::error::RaftError::APIError(
             openraft::error::ClientWriteError::ForwardToLeader(forward),
-        )) => Err(ApiError::NotLeader {
-            leader: forward.leader_id.or(forward.leader_node),
-        }),
-        Err(e) => Err(ApiError::Engine(EngineError::Recovery(format!(
-            "2PC prepare failed on shard {shard}: {e}"
-        )))),
+        )) => {
+            let _ = state
+                .engine
+                .release_tx_ids(&collection_id, Some(shard), &tx_id);
+            Err(ApiError::NotLeader {
+                leader: forward.leader_id.or(forward.leader_node),
+            })
+        }
+        Err(e) => {
+            let _ = state
+                .engine
+                .release_tx_ids(&collection_id, Some(shard), &tx_id);
+            Err(ApiError::Engine(EngineError::Recovery(format!(
+                "2PC prepare failed on shard {shard}: {e}"
+            ))))
+        }
     }
 }
 
@@ -1509,7 +1552,10 @@ pub(crate) async fn commit_tx_for_shard(
 
     let operation = ClusterOperation::CommitBatch { tx_id };
     match raft.client_write(operation).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            shards.mark_tx_resolved(&tx_id);
+            Ok(())
+        }
         Err(openraft::error::RaftError::APIError(
             openraft::error::ClientWriteError::ForwardToLeader(forward),
         )) => Err(ApiError::NotLeader {
@@ -1529,6 +1575,7 @@ pub(crate) async fn abort_tx_for_shard(
     let Some(shards) = state.shards.as_ref() else {
         return Ok(());
     };
+    shards.mark_tx_resolved(&tx_id);
     let Some(raft) = shards.raft(shard) else {
         return Ok(());
     };
@@ -1645,37 +1692,153 @@ async fn dispatch_shard_commit(
     let Some(shards) = state.shards.as_ref() else {
         return Ok(());
     };
-    if let Some(raft) = shards.raft(shard)
-        && raft.metrics().borrow().current_leader == Some(raft.metrics().borrow().id)
-    {
-        return commit_tx_for_shard(state, shard, tx_id).await;
-    }
 
-    let req = ShardCommitRequest { tx_id };
-    for target in state.shard_targets(shard) {
-        let Some(url) = state.peers.url(target) else {
-            continue;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let is_leader = if let Some(raft) = shards.raft(shard) {
+            let m = raft.metrics();
+            let b = m.borrow();
+            b.current_leader == Some(b.id)
+        } else {
+            false
         };
-        if let Ok(resp) = state
-            .internal_post(format!("{url}/internal/shard/{}/commit", shard.0))
-            .json(&req)
-            .send()
-            .await
-            && resp.status().is_success()
-        {
-            return Ok(());
+        if is_leader {
+            match commit_tx_for_shard(state, shard, tx_id).await {
+                Ok(()) => return Ok(()),
+                Err(ApiError::NotLeader { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let req = ShardCommitRequest { tx_id };
+        let mut should_retry = false;
+        for target in state.shard_targets(shard) {
+            let Some(url) = state.peers.url(target) else {
+                continue;
+            };
+            match state
+                .internal_post(format!("{url}/internal/shard/{}/commit", shard.0))
+                .json(&req)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => should_retry = true,
+                _ => should_retry = true,
+            }
+        }
+        if should_retry {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        } else {
+            break;
         }
     }
-    Ok(())
+    Err(ApiError::Engine(EngineError::Unavailable(format!(
+        "could not reach leader for shard {} to commit 2PC transaction {tx_id}",
+        shard.0
+    ))))
+}
+
+async fn dispatch_metadata_commit_tx(
+    state: &AppState,
+    tx_id: Uuid,
+    shards: Vec<rekha_cluster::ShardId>,
+) -> Result<(), ApiError> {
+    let Some(raft) = state.raft.as_ref() else {
+        return Ok(());
+    };
+
+    let op = ClusterOperation::CommitTx {
+        tx_id,
+        shards: shards.clone(),
+    };
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let (is_leader, leader_id) = {
+            let m = raft.metrics();
+            let b = m.borrow();
+            (b.current_leader == Some(b.id), b.current_leader)
+        };
+        if is_leader {
+            match raft.client_write(op.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(openraft::error::RaftError::APIError(
+                    openraft::error::ClientWriteError::ForwardToLeader(_),
+                )) => {}
+                Err(e) => {
+                    return Err(ApiError::Engine(EngineError::Recovery(format!(
+                        "failed to commit 2PC transaction {tx_id} on metadata group: {e}"
+                    ))));
+                }
+            }
+        }
+
+        // Try forwarding to the metadata leader
+        if let Some(leader) = leader_id
+            && let Some(url) = state.peers.url(leader)
+        {
+            let req = TxCommitRequest {
+                tx_id,
+                shards: shards.clone(),
+            };
+            if let Ok(resp) = state
+                .internal_post(format!("{url}/internal/cluster/tx/commit"))
+                .json(&req)
+                .send()
+                .await
+                && resp.status().is_success()
+            {
+                return Ok(());
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    Err(ApiError::Engine(EngineError::Unavailable(format!(
+        "could not reach metadata leader to commit 2PC transaction {tx_id}"
+    ))))
+}
+
+async fn dispatch_metadata_abort_tx(state: &AppState, tx_id: Uuid) {
+    let Some(raft) = state.raft.as_ref() else {
+        return;
+    };
+    let op = ClusterOperation::AbortTx { tx_id };
+    let (is_leader, leader_id) = {
+        let m = raft.metrics();
+        let b = m.borrow();
+        (b.current_leader == Some(b.id), b.current_leader)
+    };
+    if is_leader {
+        let _ = raft.client_write(op).await;
+        return;
+    }
+    if let Some(leader) = leader_id
+        && let Some(url) = state.peers.url(leader)
+    {
+        let req = TxAbortRequest { tx_id };
+        let _ = state
+            .internal_post(format!("{url}/internal/cluster/tx/abort"))
+            .json(&req)
+            .send()
+            .await;
+    }
 }
 
 async fn dispatch_shard_abort(state: &AppState, shard: rekha_cluster::ShardId, tx_id: Uuid) {
     let Some(shards) = state.shards.as_ref() else {
         return;
     };
-    if let Some(raft) = shards.raft(shard)
-        && raft.metrics().borrow().current_leader == Some(raft.metrics().borrow().id)
-    {
+    let is_leader = if let Some(raft) = shards.raft(shard) {
+        let m = raft.metrics();
+        let b = m.borrow();
+        b.current_leader == Some(b.id)
+    } else {
+        false
+    };
+    if is_leader {
         let _ = abort_tx_for_shard(state, shard, tx_id).await;
         return;
     }
@@ -1734,25 +1897,26 @@ pub(crate) async fn write_partitioned_2pc(
             dispatch_shard_abort(state, shard, tx_id).await;
         });
         futures::future::join_all(abort_futs).await;
-        if let Some(raft) = state.raft.as_ref() {
-            let _ = raft.client_write(ClusterOperation::AbortTx { tx_id }).await;
-        }
+        dispatch_metadata_abort_tx(state, tx_id).await;
         return Err(err);
     }
 
-    if let Some(raft) = state.raft.as_ref() {
-        let _ = raft
-            .client_write(ClusterOperation::CommitTx {
-                tx_id,
-                shards: prepared_shards.clone(),
-            })
-            .await;
+    if let Err(e) = dispatch_metadata_commit_tx(state, tx_id, prepared_shards.clone()).await {
+        let abort_futs = prepared_shards.into_iter().map(|shard| async move {
+            dispatch_shard_abort(state, shard, tx_id).await;
+        });
+        futures::future::join_all(abort_futs).await;
+        dispatch_metadata_abort_tx(state, tx_id).await;
+        return Err(e);
     }
 
     let commit_futs = prepared_shards
         .into_iter()
         .map(|shard| async move { dispatch_shard_commit(state, shard, tx_id).await });
-    futures::future::join_all(commit_futs).await;
+    let commit_results = futures::future::join_all(commit_futs).await;
+    for res in commit_results {
+        res?;
+    }
     Ok(())
 }
 
@@ -2082,20 +2246,30 @@ pub(crate) fn validate_ids(ids: &[Id]) -> Result<(), EngineError> {
     Ok(())
 }
 
+pub fn validate_embedding_slice(emb: &[f32]) -> Result<(), EngineError> {
+    if emb.is_empty() {
+        return Err(validation_err("embedding must not be empty"));
+    }
+    if emb.len() > MAX_DIMENSION {
+        return Err(validation_err(format!(
+            "embedding dimension {} exceeds max {MAX_DIMENSION}",
+            emb.len()
+        )));
+    }
+    if !emb.iter().all(|v| v.is_finite()) {
+        return Err(validation_err(
+            "embedding contains non-finite value (NaN or Infinity)",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_embeddings(embeddings: &[Vec<f32>]) -> Result<(), EngineError> {
     if embeddings.is_empty() {
         return Err(validation_err("embeddings must not be empty"));
     }
     for emb in embeddings {
-        if emb.is_empty() {
-            return Err(validation_err("embedding must not be empty"));
-        }
-        if emb.len() > MAX_DIMENSION {
-            return Err(validation_err(format!(
-                "embedding dimension {} exceeds max {MAX_DIMENSION}",
-                emb.len()
-            )));
-        }
+        validate_embedding_slice(emb)?;
     }
     Ok(())
 }
@@ -2182,15 +2356,7 @@ pub(crate) fn validate_query_request(req: &QueryRequest) -> Result<(), EngineErr
         )));
     }
     for emb in &req.query_embeddings {
-        if emb.is_empty() {
-            return Err(validation_err("query embedding must not be empty"));
-        }
-        if emb.len() > MAX_DIMENSION {
-            return Err(validation_err(format!(
-                "query embedding dimension {} exceeds max {MAX_DIMENSION}",
-                emb.len()
-            )));
-        }
+        validate_embedding_slice(emb)?;
     }
     Ok(())
 }
@@ -2201,6 +2367,18 @@ pub(crate) fn validate_delete_request(req: &DeleteRequest) -> Result<(), EngineE
 
 pub(crate) fn validate_update_request(req: &UpdateRequest) -> Result<(), EngineError> {
     validate_ids(&req.ids)?;
+    if let Some(ref embs) = req.embeddings {
+        if embs.len() != req.ids.len() {
+            return Err(validation_err(format!(
+                "embeddings len {} != ids len {}",
+                embs.len(),
+                req.ids.len()
+            )));
+        }
+        for emb in embs {
+            validate_embedding_slice(emb.as_ref())?;
+        }
+    }
     if let Some(ref v) = req.metadatas
         && v.len() != req.ids.len()
     {
@@ -2798,6 +2976,33 @@ async fn tx_status_handler(
     };
     let committed = shards.is_tx_committed(&tx_id);
     Ok(Json(serde_json::json!({ "committed": committed })))
+}
+
+async fn tx_commit_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TxCommitRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    dispatch_metadata_commit_tx(&state, req.tx_id, req.shards)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| match e {
+            ApiError::NotLeader { leader } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "not metadata leader", "leader": leader })),
+            ),
+            ApiError::Engine(e) => (
+                engine_error_status(&e),
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ),
+        })
+}
+
+async fn tx_abort_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TxAbortRequest>,
+) -> StatusCode {
+    dispatch_metadata_abort_tx(&state, req.tx_id).await;
+    StatusCode::OK
 }
 
 async fn shard_membership_handler(
@@ -4607,6 +4812,8 @@ fn internal_routes() -> Router<Arc<AppState>> {
             "/internal/cluster/tx/{tx_id}/status",
             get(tx_status_handler),
         )
+        .route("/internal/cluster/tx/commit", post(tx_commit_handler))
+        .route("/internal/cluster/tx/abort", post(tx_abort_handler))
         .merge(cluster_admin_routes())
         // Writes arriving at a follower are forwarded here, on the leader's
         // internal listener, and re-dispatched through the public pipeline so

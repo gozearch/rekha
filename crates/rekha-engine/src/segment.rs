@@ -215,17 +215,18 @@ impl SegmentWriter {
         }
     }
 
-    /// Append a vector. Panics if `embedding.len() != self.dimension`.
-    pub fn push(&mut self, embedding: &[f32]) {
-        assert_eq!(
-            embedding.len(),
-            self.dimension as usize,
-            "dimension mismatch: expected {}, got {}",
-            self.dimension,
-            embedding.len()
-        );
+    /// Append a vector. Errors if `embedding.len() != self.dimension`.
+    pub fn push(&mut self, embedding: &[f32]) -> EngineResult<()> {
+        if embedding.len() != self.dimension as usize {
+            return Err(EngineError::Validation(format!(
+                "dimension mismatch: expected {}, got {}",
+                self.dimension,
+                embedding.len()
+            )));
+        }
         self.vectors.extend_from_slice(embedding);
         self.count += 1;
+        Ok(())
     }
 
     /// Number of vectors accumulated.
@@ -298,9 +299,9 @@ mod tests {
         let path = dir.path().join("test.seg");
 
         let mut writer = SegmentWriter::new(4);
-        writer.push(&[1.0, 2.0, 3.0, 4.0]);
-        writer.push(&[5.0, 6.0, 7.0, 8.0]);
-        writer.push(&[9.0, 10.0, 11.0, 12.0]);
+        writer.push(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+        writer.push(&[5.0, 6.0, 7.0, 8.0]).unwrap();
+        writer.push(&[9.0, 10.0, 11.0, 12.0]).unwrap();
         assert_eq!(writer.len(), 3);
 
         let bytes_written = writer.write(&path).unwrap();
@@ -352,7 +353,7 @@ mod tests {
         let path = dir.path().join("trunc.seg");
 
         let mut writer = SegmentWriter::new(4);
-        writer.push(&[1.0, 2.0, 3.0, 4.0]);
+        writer.push(&[1.0, 2.0, 3.0, 4.0]).unwrap();
         writer.write(&path).unwrap();
 
         // Truncate the file to remove the last few bytes.

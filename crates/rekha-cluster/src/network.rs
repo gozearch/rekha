@@ -77,8 +77,9 @@ fn shared_http_client() -> reqwest::Client {
         .get_or_init(|| match reqwest::Client::builder().no_proxy().build() {
             Ok(client) => client,
             Err(e) => {
-                eprintln!(
-                    "raft network: proxy-free client could not be built ({e}); falling back \
+                tracing::warn!(
+                    error = %e,
+                    "raft network: proxy-free client could not be built; falling back \
                      to defaults, which may consult a system proxy"
                 );
                 reqwest::Client::new()

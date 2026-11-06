@@ -1188,6 +1188,32 @@ impl Engine {
         Ok(ran)
     }
 
+    /// Reserve record IDs for an in-flight 2PC transaction on a partition.
+    pub fn reserve_tx_ids(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        tx_id: Uuid,
+        ids: &[Id],
+    ) -> EngineResult<()> {
+        let coll = self.collection_partition(collection_id, shard)?;
+        let mut coll = coll.lock();
+        coll.reserve_tx_ids(tx_id, ids)
+    }
+
+    /// Release record IDs reserved by a 2PC transaction upon commit or abort.
+    pub fn release_tx_ids(
+        &self,
+        collection_id: &Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        tx_id: &Uuid,
+    ) -> EngineResult<()> {
+        let coll = self.collection_partition(collection_id, shard)?;
+        let mut coll = coll.lock();
+        coll.release_tx_ids(tx_id);
+        Ok(())
+    }
+
     /// Append operations through the WAL and apply them to a specific partition.
     pub fn append_ops_partition(
         &self,
@@ -1985,6 +2011,25 @@ impl rekha_cluster::EngineSnapshotProvider for Engine {
     ) -> Result<(), String> {
         let _ = self.catalog.delete_collection(collection_id);
         Engine::drop_collection_partition(self, collection_id, shard).map_err(|e| e.to_string())
+    }
+
+    fn reserve_tx_ids(
+        &self,
+        collection_id: &uuid::Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        tx_id: uuid::Uuid,
+        ids: &[rekha_core::types::Id],
+    ) -> Result<(), String> {
+        Engine::reserve_tx_ids(self, collection_id, shard, tx_id, ids).map_err(|e| e.to_string())
+    }
+
+    fn release_tx_ids(
+        &self,
+        collection_id: &uuid::Uuid,
+        shard: Option<rekha_core::cluster::ShardId>,
+        tx_id: &uuid::Uuid,
+    ) -> Result<(), String> {
+        Engine::release_tx_ids(self, collection_id, shard, tx_id).map_err(|e| e.to_string())
     }
 }
 

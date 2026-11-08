@@ -57,9 +57,13 @@ const FORBIDDEN: &[(&str, &str)] = &[
         "is_leader: bool",
         "leadership is not application state; read it from the consensus view",
     ),
+    // `let is_leader = <raft.metrics() comparison>` is the sanctioned shape: it
+    // observes consensus. The hazard is *storing* leadership — a field
+    // declaration is caught by `is_leader: bool` above, and an assignment to
+    // one is caught here.
     (
-        "is_leader = ",
-        "a replicated is_leader flag is a second source of truth",
+        ".is_leader = ",
+        "assigning to a stored is_leader flag is a second source of truth",
     ),
 ];
 

@@ -2281,6 +2281,7 @@ name = "rekha-cluster"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "metrics",
  "openraft",
  "parking_lot",
  "redb",

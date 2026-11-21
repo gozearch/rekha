@@ -59,6 +59,43 @@ pub fn free_port() -> u16 {
     listener.local_addr().expect("addr").port()
 }
 
+/// A fresh data directory that outlives the child processes using it.
+///
+/// The guard is leaked on purpose: a `tempdir` dropped at the end of the
+/// setup expression would delete the directory from under a running server.
+pub fn temp_dir() -> PathBuf {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    path
+}
+
+/// Run a `rekha` subcommand against `url`, with the cluster secret.
+///
+/// `--url` is a global flag, so it precedes the subcommand.
+pub fn rekha(args: &[&str], url: &str) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_rekha"))
+        .arg("--url")
+        .arg(url)
+        .args(args)
+        .env("REKHA_CLUSTER_SECRET", SECRET)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run rekha");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// The parsed output of `rekha membership list` against `url`.
+pub fn membership(url: &str) -> serde_json::Value {
+    let (code, stdout, stderr) = rekha(&["membership", "list"], url);
+    assert_eq!(code, 0, "membership list failed: {stderr}");
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("list output `{stdout}`: {e}"))
+}
+
 /// The `id@addr` topology string for a set of ports, ids `1..=ports.len()`.
 pub fn peers_spec(ports: &[u16]) -> String {
     (0..ports.len())

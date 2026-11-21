@@ -39,6 +39,23 @@ pub struct ShardCluster {
     committed_txs: parking_lot::RwLock<HashSet<Uuid>>,
     /// In-flight 2PC transactions staged on shards: tx_id -> (shard, timestamp).
     staged_txs: parking_lot::RwLock<HashMap<Uuid, (ShardId, std::time::Instant)>>,
+    /// Last promotion attempt per (group, node), for `membership` output.
+    ///
+    /// In memory on purpose: populated by the leader tick that attempts the
+    /// promotion, empty on nodes that never lead the group. A restart clears
+    /// it; the next tick repopulates it.
+    promotion_attempts: parking_lot::Mutex<HashMap<(String, u64), PromotionAttempt>>,
+}
+
+/// The last promotion attempt for one (group, node) pair.
+#[derive(Debug, Clone)]
+pub struct PromotionAttempt {
+    /// Wall-clock time of the attempt, milliseconds since epoch.
+    pub at_ms: u64,
+    /// `promoted | skipped_lag | error`.
+    pub outcome: String,
+    /// Entries behind `last_log_index` at decision time, if known.
+    pub lag: Option<u64>,
 }
 
 impl std::fmt::Debug for ShardCluster {
@@ -58,6 +75,7 @@ impl ShardCluster {
             ensured: parking_lot::Mutex::new(HashSet::new()),
             committed_txs: parking_lot::RwLock::new(HashSet::new()),
             staged_txs: parking_lot::RwLock::new(HashMap::new()),
+            promotion_attempts: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -167,6 +185,37 @@ impl ShardCluster {
             .iter()
             .filter(|(_, (_, created))| now.duration_since(*created) >= max_age)
             .map(|(tx_id, (shard, _))| (*tx_id, *shard))
+            .collect()
+    }
+
+    /// Record a promotion attempt for `membership` output.
+    pub fn record_promotion_attempt(
+        &self,
+        group: &str,
+        node: u64,
+        lag: Option<u64>,
+        outcome: &str,
+    ) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.promotion_attempts.lock().insert(
+            (group.to_string(), node),
+            PromotionAttempt {
+                at_ms: now_ms,
+                outcome: outcome.to_string(),
+                lag,
+            },
+        );
+    }
+
+    /// Snapshot of last promotion attempts, for `membership` output.
+    pub fn last_promotions(&self) -> Vec<(String, u64, PromotionAttempt)> {
+        self.promotion_attempts
+            .lock()
+            .iter()
+            .map(|((group, node), attempt)| (group.clone(), *node, attempt.clone()))
             .collect()
     }
 }

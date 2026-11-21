@@ -16,44 +16,17 @@
 
 mod common;
 
-use std::path::PathBuf;
-use std::process::Command;
-
 use common::*;
 use serde_json::json;
+use std::path::PathBuf;
 
 const NODES: usize = 4;
-
-fn rekha(args: &[&str], url: &str) -> (i32, String, String) {
-    // `--url` is a global flag, so it precedes the subcommand.
-    let output = Command::new(env!("CARGO_BIN_EXE_rekha"))
-        .arg("--url")
-        .arg(url)
-        .args(args)
-        .env("REKHA_CLUSTER_SECRET", SECRET)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("run rekha");
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn membership_commands_reach_the_server_and_refuse_what_they_must() {
     let _serial = SERIAL.lock().await;
 
-    let dirs: Vec<PathBuf> = (0..NODES)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            // Leak the guard: the directory must outlive the child processes.
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect();
+    let dirs: Vec<PathBuf> = (0..NODES).map(|_| temp_dir()).collect();
     let ports: Vec<u16> = (0..NODES).map(|_| free_port()).collect();
 
     let nodes = spawn_cluster(&dirs, &ports);

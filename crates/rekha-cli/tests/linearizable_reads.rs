@@ -27,14 +27,7 @@ use serde_json::json;
 const NODES: usize = 3;
 
 fn dirs(count: usize) -> Vec<PathBuf> {
-    (0..count)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect()
+    (0..count).map(|_| temp_dir()).collect()
 }
 
 fn spawn(dir: &std::path::Path, port: u16, id: u64, peers: &str, bootstrap: bool) -> Node {

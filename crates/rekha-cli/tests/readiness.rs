@@ -15,15 +15,7 @@ use common::*;
 const NODES: usize = 3;
 
 fn dirs(count: usize) -> Vec<PathBuf> {
-    (0..count)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            // Leak the guard: the directory must outlive the child processes.
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect()
+    (0..count).map(|_| temp_dir()).collect()
 }
 
 async fn ready_body(node: &Node) -> (u16, serde_json::Value) {

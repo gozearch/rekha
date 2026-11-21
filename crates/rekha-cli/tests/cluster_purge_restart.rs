@@ -45,15 +45,7 @@ fn spawn(dir: &std::path::Path, port: u16, id: u64, peers: &str, bootstrap: bool
 }
 
 fn dirs(count: usize) -> Vec<PathBuf> {
-    (0..count)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            // Leak the guard: the directory has to outlive the child processes.
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect()
+    (0..count).map(|_| temp_dir()).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

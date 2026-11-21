@@ -281,9 +281,10 @@ Before exposing a node to real traffic:
 - Use `--wal-durability durable` (the default) in single-node mode. In cluster
   mode durability comes from the Raft log.
 - Size the cluster once: `--shards` and `--replication-factor` are persisted and
-  cannot be changed by a restart. A learner can be added, but elastic scale-out
-  (promoting it to a voter and moving shards) is not supported yet; plan for the
-  capacity you expect.
+  cannot be changed by a restart. A learner can be added with `--join` plus
+  `rekha membership add`, and it is promoted to voter automatically once its
+  lag drops below 50 entries; moving shards for load balancing is deferred to
+  v2, so plan for the capacity you expect.
 - By default the Raft log is never purged, so it grows and a restart replays it.
   Set `REKHA_SNAPSHOT_EVERY_N_LOGS=<n>` to compact it every `n` entries: a
   restarted node resumes from the purge watermark, and a node that was offline

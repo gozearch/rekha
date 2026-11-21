@@ -187,6 +187,27 @@ impl LeaderTracker {
     }
 }
 
+/// This leader's replication progress for `node`.
+///
+/// `None` means either this node is not the leader or the peer never
+/// replicated. Callers treat both as "no evidence of catch-up" (infinite lag),
+/// never as zero — promoting on an idle cluster is how a learner that
+/// replicated nothing becomes a voter.
+pub fn replication_matched<NID, N>(
+    metrics: &openraft::RaftMetrics<NID, N>,
+    node: &NID,
+) -> Option<u64>
+where
+    NID: openraft::NodeId,
+    N: openraft::Node,
+{
+    metrics
+        .replication
+        .as_ref()
+        .and_then(|r| r.get(node))
+        .and_then(|id| id.as_ref().map(|log_id| log_id.index))
+}
+
 fn view_from_metrics(m: &openraft::RaftMetrics<u64, u64>, peers: &PeerDirectory) -> ClusterView {
     let voters = m
         .membership_config

@@ -20,7 +20,6 @@
 mod common;
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -28,38 +27,6 @@ use serde_json::json;
 
 const EXISTING: usize = 4;
 const JOINING_ID: u64 = 5;
-
-fn temp_dir() -> PathBuf {
-    let dir = tempfile::tempdir().expect("tempdir");
-    // Leak the guard: the directory must outlive the child processes.
-    let path = dir.path().to_path_buf();
-    std::mem::forget(dir);
-    path
-}
-
-/// Run a `rekha` subcommand against `url`, with the cluster secret.
-fn rekha(args: &[&str], url: &str) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_rekha"))
-        // `--url` is a global flag, so it precedes the subcommand.
-        .arg("--url")
-        .arg(url)
-        .args(args)
-        .env("REKHA_CLUSTER_SECRET", SECRET)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("run rekha");
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
-}
-
-fn membership(url: &str) -> serde_json::Value {
-    let (code, stdout, stderr) = rekha(&["membership", "list"], url);
-    assert_eq!(code, 0, "membership list failed: {stderr}");
-    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("list output `{stdout}`: {e}"))
-}
 
 /// Whether a node reports ready, without waiting for it.
 async fn is_ready(node: &Node) -> bool {
@@ -156,21 +123,8 @@ async fn a_new_node_joins_without_restarting_the_cluster() {
     // member, not once it has caught up. Readiness is the assertion that it did.
     wait_ready(std::slice::from_ref(&joining)).await;
 
-    let listed = membership(&nodes[0].url(""));
-    let members = listed["members"].as_array().expect("members");
-    assert_eq!(
-        members.len(),
-        EXISTING + 1,
-        "the learner must be listed as a member: {listed}"
-    );
-    assert!(
-        members.iter().any(|m| m.as_u64() == Some(JOINING_ID)),
-        "member {JOINING_ID} missing: {listed}"
-    );
-
-    // It hosts nothing, so the voter set — and every shard's owner set — is
-    // unchanged. `members` distinguishes voters from learners; the placement
-    // document on the existing nodes must still name four.
+    // The voter-set assertion already allows the auto-promoted set
+    // (original voters or original plus the joined node); keep it.
     let placement: rekha_cluster::PlacementConfig = serde_json::from_slice(
         &std::fs::read(nodes[0].data_dir.join(rekha_cluster::PlacementConfig::FILE))
             .expect("placement file"),
@@ -183,29 +137,62 @@ async fn a_new_node_joins_without_restarting_the_cluster() {
         placement.voters
     );
 
+    // Poll `voters` (not the deprecated `members` alias) every 500ms for up
+    // to 60s until the joined node moves from learner to voter; fail with the
+    // last payload on expiry.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let listed = membership(&nodes[0].url(""));
+        let voters = listed["voters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("membership must report voters: {listed}"));
+        if voters.iter().any(|v| v.as_u64() == Some(JOINING_ID)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "joined node was not promoted to voter within 60s: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     // The joining node serves a request that needs both halves of what it
     // learned: the collection's catalog row (or it would answer 404) and the
     // owner's address (or the count would be 0). Its own `--peers` is empty.
-    let response = client()
-        .get(joining.url(&format!("/api/v2/collections/{collection}")))
-        .header("x-chroma-token", KEY)
-        .send()
-        .await
-        .expect("request to the joining node");
-    assert_eq!(
-        response.status().as_u16(),
-        200,
-        "the joining node must answer for a collection it does not host"
-    );
-    let body = response.json::<serde_json::Value>().await.expect("json");
+    // Polled, not read once: once the node is a voter it may materialize the
+    // shard empty before the snapshot applies, and a single GET in that window
+    // answers 0 for records that exist elsewhere.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let body = loop {
+        let response = client()
+            .get(joining.url(&format!("/api/v2/collections/{collection}")))
+            .header("x-chroma-token", KEY)
+            .send()
+            .await
+            .expect("request to the joining node");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the joining node must answer for a collection it does not host"
+        );
+        let body = response.json::<serde_json::Value>().await.expect("json");
+        assert!(
+            body["shard"].as_u64().is_some(),
+            "the joining node must know where the collection lives; got {body}"
+        );
+        if body["count"].as_u64() == Some(2) {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the joining node never reached 2 records within 60s; got {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     assert_eq!(
         body["count"].as_u64(),
         Some(2),
         "the joining node must reach an owner to count the records; got {body}"
-    );
-    assert!(
-        body["shard"].as_u64().is_some(),
-        "the joining node must know where the collection lives; got {body}"
     );
 
     // And the cluster it joined is unaffected.

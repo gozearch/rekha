@@ -48,6 +48,7 @@ answer is fine. It is not appropriate for read-your-writes. The response header
 | `rekha_raft_quorum_age_ms` > 3 × heartbeat | isolated from quorum, or the disk stalled | page |
 | `rekha_raft_log_bytes{group}` growing without bound | snapshots disabled or failing, so the log never purges | warn, then set `REKHA_SNAPSHOT_EVERY_N_LOGS` |
 | apply lag (`applied` vs `last_log_index` in `/internal/cluster/membership`) | a replica is not keeping up | warn at minutes, page at hours |
+| promotion lag (`matched` vs `last_log_index` per learner in `/internal/cluster/membership`) | a learner is not catching up enough to be promoted (threshold: 50 entries) | warn if a learner never drops below threshold |
 | free disk | two snapshot archives per group plus the data | page below 40% |
 
 Apply lag that persists while `/ready` is `200` is the shape of the failure this
@@ -69,8 +70,35 @@ Three things consume disk, and they are sized separately.
 `REKHA_SNAPSHOT_EVERY_N_LOGS=<n>` compacts every `n` entries and keeps `n` of
 history. It is safe to enable, with one constraint: membership is reconstructed
 from the placement document after a purge, so **do not change the peer list or
-`--shards` while compaction is on**. Promotion and removal are not implemented
-yet; the warning printed at startup says the same thing.
+`--shards` while compaction is on**. Automatic promotion of a learner to voter
+is implemented; removal of a voter is not yet, and the warning printed at
+startup says the same thing.
+
+## Adding a node (join, then automatic promotion)
+
+Run in this order:
+
+1. Start the new node with `--join <any-member-url>` and the same
+   `REKHA_CLUSTER_SECRET`. It fetches the placement, starts as a learner, and
+   replicates the log (or installs a snapshot if it fell behind the purge
+   point).
+2. Admit it once: `rekha membership add --node-id <id> --addr <internal-addr>`
+   against the metadata leader.
+3. Watch `learners[].lag` in `GET /internal/cluster/membership` fall below the
+   promotion lag threshold of 50 entries. The reconciler ticks every 1500ms
+   and attempts at most one promotion per group per tick, so partial promotion
+   across groups is normal — later ticks converge.
+4. Verify `voters` in `membership` lists the new node, and `last_promotion`
+   reports `promoted` for its groups.
+
+What to check when promotion stalls:
+
+- lag stays above 50 entries — the learner is still copying; check snapshot
+  transfer errors and leader stability, not the membership guard;
+- no leader in the group — promotion is decided by each group's leader, so an
+  election blocks the tick;
+- repeated `error` outcomes in `last_promotion` — read the reconciler log line
+  (group, node, lag, outcome) for the cause.
 
 ## A replica that fell behind
 

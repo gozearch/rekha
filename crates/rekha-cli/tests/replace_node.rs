@@ -27,14 +27,6 @@ use serde_json::json;
 
 const NODES: usize = 3;
 
-fn temp_dir() -> PathBuf {
-    let dir = tempfile::tempdir().expect("tempdir");
-    // Leak the guard: the directory must outlive the child processes.
-    let path = dir.path().to_path_buf();
-    std::mem::forget(dir);
-    path
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_voter_whose_disk_was_wiped_catches_up_again() {
     let _serial = SERIAL.lock().await;

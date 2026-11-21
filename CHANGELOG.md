@@ -8,6 +8,13 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Automatic learner-to-voter promotion. A node admitted with `--join` plus
+  `rekha membership add` is promoted by the background reconciler once its lag
+  drops below the promotion lag threshold of 50 entries, one attempt per group
+  per 1500ms tick. `GET /internal/cluster/membership` (and the per-shard
+  variant) now reports `voters`/`learners` with per-learner lag plus the last
+  promotion attempt, keeping `members` as a deprecated alias. Moving shards for
+  load balancing stays deferred to v2.
 - Reads are linearizable. `query`, `get` and `count` are routed to the shard's
   leader and answered only after a barrier that confirms leadership with a
   quorum and waits for the leader's applied state to reach the read index. Before

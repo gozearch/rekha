@@ -8,7 +8,6 @@
 mod common;
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -16,35 +15,6 @@ use serde_json::json;
 
 const EXISTING: usize = 3;
 const JOINING_ID: u64 = 4;
-
-fn temp_dir() -> PathBuf {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().to_path_buf();
-    std::mem::forget(dir);
-    path
-}
-
-fn rekha(args: &[&str], url: &str) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_rekha"))
-        .arg("--url")
-        .arg(url)
-        .args(args)
-        .env("REKHA_CLUSTER_SECRET", SECRET)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("run rekha");
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
-}
-
-fn membership(url: &str) -> serde_json::Value {
-    let (code, stdout, stderr) = rekha(&["membership", "list"], url);
-    assert_eq!(code, 0, "membership list failed: {stderr}");
-    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("list output `{stdout}`: {e}"))
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_rebalancer_promotes_learner_to_voter() {
@@ -108,33 +78,87 @@ async fn auto_rebalancer_promotes_learner_to_voter() {
     assert_eq!(code, 0, "admitting learner: {stderr}");
     wait_ready(std::slice::from_ref(&joining)).await;
 
-    // Wait for the background reconciler to automatically promote the learner to voter
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    // Wait for the background reconciler to automatically promote the
+    // learner to voter: poll `voters` (not the deprecated `members` alias)
+    // every 500ms for up to 60s; fail with the last payload on expiry.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let list = loop {
         let list = membership(&url);
-        let members = list["members"].as_array().unwrap();
-        if members.len() == 4 {
-            break;
+        let voters = list["voters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("membership must report voters: {list}"));
+        if voters.iter().any(|v| v.as_u64() == Some(JOINING_ID)) {
+            break list;
         }
         assert!(
             Instant::now() < deadline,
-            "learner was not promoted to voter within deadline: {list}"
+            "learner was not promoted to voter within 60s: {list}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    };
+    let _ = list;
 
-    // Verify all nodes serve count
+    // Write after voter state through a survivor, then assert every node
+    // serves the new count with a linearizable read that names its server.
+    let (status, body) = post_json_retrying(
+        &nodes[0],
+        &format!("/api/v2/collections/{collection}/add"),
+        json!({"ids": vec!["c"], "embeddings": vec![vec![0.5f32; DIM]]}),
+    )
+    .await;
+    assert_eq!(status, 200, "write after promotion: {body}");
+
+    let ids: Vec<u64> = nodes
+        .iter()
+        .chain(std::iter::once(&joining))
+        .map(|n| n.id)
+        .collect();
     for node in nodes.iter().chain(std::iter::once(&joining)) {
-        let (status, body) = post_json_retrying(
-            node,
-            &format!("/api/v2/collections/{collection}/count"),
-            json!({}),
-        )
-        .await;
-        assert_eq!(status, 200, "count: {body}");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&body).unwrap()["count"].as_u64(),
-            Some(2)
-        );
+        // Linearizable reads can 503 while a group is mid-transition
+        // (joint consensus, election); retry like the write path does. A 200
+        // with a short count is also retried: a node that just materialized
+        // the shard answers from its empty state until the snapshot applies.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let body = loop {
+            let resp = client()
+                .post(node.url(&format!("/api/v2/collections/{collection}/count")))
+                .header("x-chroma-token", KEY)
+                .json(&json!({}))
+                .send()
+                .await
+                .expect("count request");
+            if resp.status().as_u16() == 503 {
+                assert!(
+                    Instant::now() < deadline,
+                    "node {} never left transition within 60s",
+                    node.id
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            assert_eq!(resp.status().as_u16(), 200, "count on node {}", node.id);
+            let served_by = resp
+                .headers()
+                .get("x-rekha-served-by")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_else(|| panic!("node {} omitted x-rekha-served-by", node.id));
+            let served: u64 = served_by.parse().expect("served-by is a node id");
+            assert!(
+                ids.contains(&served),
+                "node {} was served by unknown node {served}",
+                node.id
+            );
+            let body: serde_json::Value = resp.json().await.expect("count json");
+            if body["count"].as_u64() == Some(3) {
+                break body;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node {} never reached 3 records within 60s; got {body}",
+                node.id
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        assert_eq!(body["count"].as_u64(), Some(3), "count on node {}", node.id);
     }
 }

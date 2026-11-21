@@ -15,6 +15,55 @@ use crate::placement::{Placement, ShardId};
 use crate::raft_types::{ClusterOperation, RaftTypeConfig};
 use crate::shard::ShardCluster;
 
+/// Entries behind `last_log_index` that still allow promotion.
+///
+/// A learner whose replication `matched` index is at least this close to the
+/// leader's last log is caught up enough to become a voter. `None` matched
+/// (never replicated) is treated as infinite lag, never as zero, so an idle
+/// cluster does not promote a node that has replicated nothing.
+pub const PROMOTION_LAG_THRESHOLD: u64 = 50;
+
+/// Attach the cluster secret to an internal request, if one is configured.
+///
+/// Internal routes fail closed without it; the three reconciler call sites
+/// share this rather than repeating the conditional header.
+fn with_secret(
+    req: reqwest::RequestBuilder,
+    cluster_secret: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match cluster_secret {
+        Some(secret) => req.header("x-rekha-cluster-secret", secret),
+        None => req,
+    }
+}
+
+/// Record one promotion attempt for observability.
+fn record_promotion_attempt(
+    shards: &ShardCluster,
+    group: &str,
+    node: u64,
+    lag: Option<u64>,
+    outcome: &str,
+) {
+    metrics::counter!(
+        "rekha_promotion_attempts_total",
+        "group" => group.to_string(),
+        "node" => node.to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+    if let Some(lag) = lag {
+        metrics::gauge!(
+            "rekha_learner_lag_entries",
+            "group" => group.to_string(),
+            "node" => node.to_string()
+        )
+        .set(lag as f64);
+    }
+    shards.record_promotion_attempt(group, node, lag, outcome);
+    tracing::info!(group, node, lag, outcome, "promotion attempt");
+}
+
 /// Reconcile shard groups led by this local node towards target placement.
 pub async fn reconcile_local_shard_leaders(node_id: u64, shards: &Arc<ShardCluster>) {
     let placement = shards.placement();
@@ -27,7 +76,9 @@ pub async fn reconcile_local_shard_leaders(node_id: u64, shards: &Arc<ShardClust
         Err(_) => return,
     };
 
-    for shard in shards.shards() {
+    let mut shards_sorted = shards.shards();
+    shards_sorted.sort_unstable_by_key(|s| s.0);
+    for shard in shards_sorted {
         let Some(shard_raft) = shards.raft(shard) else {
             continue;
         };
@@ -54,32 +105,66 @@ pub async fn reconcile_local_shard_leaders(node_id: u64, shards: &Arc<ShardClust
             }
         }
 
-        // Check if all target owners have caught up within 50 entries
+        // At most one promotion attempt per group per tick. A learner that
+        // never replicated (matched None) is infinite lag and skips.
         let shard_last_log = m.last_log_index.unwrap_or(0);
-        let all_caught_up = target_owners.iter().all(|&node| {
+        let mut lag_of: Option<u64> = Some(0);
+        let mut pending: Option<u64> = None;
+        for &node in &target_owners {
             if current_voters.contains(&node) {
-                return true;
+                continue;
             }
-            let matched = m
-                .replication
-                .as_ref()
-                .and_then(|r| r.get(&node))
-                .and_then(|id| id.map(|l| l.index))
-                .unwrap_or(0);
-            matched >= shard_last_log.saturating_sub(50)
-        });
+            match crate::replication_matched(&m, &node) {
+                None => {
+                    lag_of = None;
+                    pending = Some(node);
+                    break;
+                }
+                Some(matched) => {
+                    let lag = shard_last_log.saturating_sub(matched);
+                    lag_of = Some(lag_of.map_or(lag, |prev: u64| prev.max(lag)));
+                    if lag > PROMOTION_LAG_THRESHOLD {
+                        pending = Some(node);
+                    }
+                }
+            }
+        }
+        let group_label = format!("shard:{}", shard.0);
+        match (lag_of, pending) {
+            (None, Some(node)) => {
+                record_promotion_attempt(shards, &group_label, node, None, "skipped_lag");
+                continue;
+            }
+            (Some(_), Some(node)) => {
+                if let Some(lag) = lag_of {
+                    record_promotion_attempt(shards, &group_label, node, Some(lag), "skipped_lag");
+                }
+                continue;
+            }
+            _ => {}
+        }
 
-        if all_caught_up
-            && shard_raft
-                .change_membership(target_set, false)
-                .await
-                .is_ok()
+        if shard_raft
+            .change_membership(target_set, false)
+            .await
+            .is_ok()
         {
+            for &node in &target_owners {
+                if !current_voters.contains(&node) {
+                    record_promotion_attempt(shards, &group_label, node, lag_of, "promoted");
+                }
+            }
             tracing::info!(
                 shard = shard.0,
                 ?target_owners,
                 "shard leader transitioned membership to target owners"
             );
+        } else {
+            for &node in &target_owners {
+                if !current_voters.contains(&node) {
+                    record_promotion_attempt(shards, &group_label, node, lag_of, "error");
+                }
+            }
         }
     }
 
@@ -129,19 +214,29 @@ pub async fn run_rebalancer_tick(
     let last_log = m.last_log_index.unwrap_or(0);
     let current_voters: std::collections::BTreeSet<u64> =
         m.membership_config.membership().voter_ids().collect();
-    let learners: Vec<u64> = m.membership_config.membership().learner_ids().collect();
 
-    // 2a. Learner auto-promotion in the metadata group
-    for learner in learners {
-        let matched = m
-            .replication
-            .as_ref()
-            .and_then(|r| r.get(&learner))
-            .and_then(|id| id.map(|l| l.index))
-            .unwrap_or(0);
-
-        // Once learner caught up within 50 entries of last log, promote to voter
-        if matched >= last_log.saturating_sub(50) {
+    // 2a. Learner auto-promotion in the metadata group. At most one
+    // promotion attempt per tick; groups proceed independently. Falls through
+    // to 2b either way: shard reconciliation must not starve while a learner
+    // exists.
+    let mut learners: Vec<u64> = m.membership_config.membership().learner_ids().collect();
+    learners.sort_unstable();
+    if let Some(learner) = learners.into_iter().next() {
+        let mut attempt: Option<(Option<u64>, &str)> = None;
+        let mut lag = None;
+        match crate::replication_matched(&m, &learner) {
+            // Never replicated: infinite lag, never promote on an idle cluster.
+            None => attempt = Some((None, "skipped_lag")),
+            Some(matched) => {
+                lag = Some(last_log.saturating_sub(matched));
+                if lag.is_some_and(|lag| lag > PROMOTION_LAG_THRESHOLD) {
+                    attempt = Some((lag, "skipped_lag"));
+                }
+            }
+        }
+        if let Some((lag, outcome)) = attempt {
+            record_promotion_attempt(shards, "metadata", learner, lag, outcome);
+        } else {
             let mut new_voters = current_voters.clone();
             new_voters.insert(learner);
             if raft
@@ -149,6 +244,7 @@ pub async fn run_rebalancer_tick(
                 .await
                 .is_ok()
             {
+                record_promotion_attempt(shards, "metadata", learner, lag, "promoted");
                 tracing::info!(learner, "auto-promoted learner to voter in metadata group");
                 let voter_vec: Vec<u64> = new_voters.into_iter().collect();
                 if let Err(e) = raft
@@ -159,6 +255,8 @@ pub async fn run_rebalancer_tick(
                 {
                     tracing::error!(learner, %e, "failed to record SetVoters in consensus log");
                 }
+            } else {
+                record_promotion_attempt(shards, "metadata", learner, lag, "error");
             }
         }
     }
@@ -184,13 +282,13 @@ pub async fn run_rebalancer_tick(
                 if !current_owners.contains(&new_node)
                     && let Some(url) = peers.url(new_node)
                 {
-                    let mut req = http.post(format!(
-                        "{url}/internal/cluster/shard/{}/ensure_started",
-                        shard.0
-                    ));
-                    if let Some(secret) = cluster_secret {
-                        req = req.header("x-rekha-cluster-secret", secret);
-                    }
+                    let req = with_secret(
+                        http.post(format!(
+                            "{url}/internal/cluster/shard/{}/ensure_started",
+                            shard.0
+                        )),
+                        cluster_secret,
+                    );
                     let _ = req.send().await;
                 }
             }
@@ -209,21 +307,29 @@ pub async fn run_rebalancer_tick(
                 let mut match_found = false;
                 for &owner in &target_owners {
                     if let Some(url) = peers.url(owner) {
-                        let mut req = http.get(format!(
-                            "{url}/internal/cluster/shard/{}/membership",
-                            shard.0
-                        ));
-                        if let Some(secret) = cluster_secret {
-                            req = req.header("x-rekha-cluster-secret", secret);
-                        }
+                        let req = with_secret(
+                            http.get(format!(
+                                "{url}/internal/cluster/shard/{}/membership",
+                                shard.0
+                            )),
+                            cluster_secret,
+                        );
                         if let Ok(resp) = req.send().await
-                            && let Ok(voters) = resp.json::<Vec<u64>>().await
+                            && let Ok(body) = resp.json::<serde_json::Value>().await
                         {
-                            let v_set: std::collections::BTreeSet<u64> =
-                                voters.into_iter().collect();
-                            if v_set == target_owners.iter().copied().collect() {
-                                match_found = true;
-                                break;
+                            // New shape is an object with a `voters` array;
+                            // accept a bare array from an older binary too.
+                            let voters: Option<Vec<u64>> = body
+                                .get("voters")
+                                .and_then(|v| serde_json::from_value::<Vec<u64>>(v.clone()).ok())
+                                .or_else(|| serde_json::from_value::<Vec<u64>>(body.clone()).ok());
+                            if let Some(voters) = voters {
+                                let v_set: std::collections::BTreeSet<u64> =
+                                    voters.into_iter().collect();
+                                if v_set == target_owners.iter().copied().collect() {
+                                    match_found = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -249,11 +355,10 @@ pub async fn run_rebalancer_tick(
                     if !target_owners.contains(&old_node)
                         && let Some(url) = peers.url(old_node)
                     {
-                        let mut req =
-                            http.post(format!("{url}/internal/cluster/shard/{}/drop", shard.0));
-                        if let Some(secret) = cluster_secret {
-                            req = req.header("x-rekha-cluster-secret", secret);
-                        }
+                        let req = with_secret(
+                            http.post(format!("{url}/internal/cluster/shard/{}/drop", shard.0)),
+                            cluster_secret,
+                        );
                         let _ = req.send().await;
                     }
                 }

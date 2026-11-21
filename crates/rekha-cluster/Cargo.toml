@@ -13,6 +13,7 @@ rekha-storage = { path = "../rekha-storage" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+metrics.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
 bincode = "1"

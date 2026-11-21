@@ -18,14 +18,7 @@ use serde_json::json;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn intra_collection_sharding_scatters_and_gathers() {
     let _serial = SERIAL.lock().await;
-    let dirs: Vec<PathBuf> = (0..4)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect();
+    let dirs: Vec<PathBuf> = (0..4).map(|_| temp_dir()).collect();
     let ports: Vec<u16> = (0..4).map(|_| free_port()).collect();
 
     let nodes = spawn_cluster(&dirs, &ports);

@@ -24,15 +24,7 @@ use serde_json::json;
 const NODES: usize = 4;
 
 fn temp_dirs(count: usize) -> Vec<PathBuf> {
-    (0..count)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            // Leak the guard: the directory must outlive the child processes.
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect()
+    (0..count).map(|_| temp_dir()).collect()
 }
 
 /// Start a node that must be refused, and return everything it said.

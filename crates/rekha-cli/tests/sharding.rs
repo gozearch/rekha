@@ -22,17 +22,7 @@ use serde_json::json;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn data_lives_on_its_replicas_only_and_any_node_serves_it() {
     let _serial = SERIAL.lock().await;
-    let dirs: Vec<PathBuf> = (0..4)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            // Leak the guard: the directory must outlive the child processes for
-            // the whole test, and `TempDir`'s drop would remove it too early if
-            // it were kept alive by a local.
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect();
+    let dirs: Vec<PathBuf> = (0..4).map(|_| temp_dir()).collect();
     let ports: Vec<u16> = (0..4).map(|_| free_port()).collect();
 
     let nodes = spawn_cluster(&dirs, &ports);
@@ -201,14 +191,7 @@ async fn data_lives_on_its_replicas_only_and_any_node_serves_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_survives_the_loss_of_the_replica_routing_prefers() {
     let _serial = SERIAL.lock().await;
-    let dirs: Vec<PathBuf> = (0..4)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect();
+    let dirs: Vec<PathBuf> = (0..4).map(|_| temp_dir()).collect();
     let ports: Vec<u16> = (0..4).map(|_| free_port()).collect();
 
     let mut nodes = spawn_cluster(&dirs, &ports);
@@ -365,14 +348,7 @@ async fn shard_leader(nodes: &[Node], shard: rekha_cluster::ShardId) -> Option<u
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn placement_survives_a_restart_without_moving_data() {
     let _serial = SERIAL.lock().await;
-    let dirs: Vec<PathBuf> = (0..4)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect();
+    let dirs: Vec<PathBuf> = (0..4).map(|_| temp_dir()).collect();
     let ports: Vec<u16> = (0..4).map(|_| free_port()).collect();
 
     let mut nodes = spawn_cluster(&dirs, &ports);

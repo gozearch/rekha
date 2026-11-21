@@ -24,7 +24,7 @@ pub mod state_machine;
 pub use identity::{
     IdentityError, NodeIdentity, Peer, PeerDirectory, PeerParseError, node_id_path, parse_peers,
 };
-pub use leader::{ClusterView, LeaderInfo, LeaderTracker, RaftRole};
+pub use leader::{ClusterView, LeaderInfo, LeaderTracker, RaftRole, replication_matched};
 pub use log_store::MemoryLogStore;
 pub use network::channel::{ChannelHub, ChannelMessage, ChannelNetwork, ChannelNetworkFactory};
 pub use network::{GroupId, METADATA_GROUP, RaftNetworkFactoryImpl, RaftNetworkImpl};

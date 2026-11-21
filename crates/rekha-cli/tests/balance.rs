@@ -52,15 +52,7 @@ fn collections_per_node(nodes: &[Node]) -> Vec<(u64, usize)> {
 async fn collections_are_spread_across_nodes() {
     let _serial = SERIAL.lock().await;
 
-    let dirs: Vec<PathBuf> = (0..NODES)
-        .map(|_| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            // Leak the guard: the directory must outlive the child processes.
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-        .collect();
+    let dirs: Vec<PathBuf> = (0..NODES).map(|_| temp_dir()).collect();
     let ports: Vec<u16> = (0..NODES).map(|_| free_port()).collect();
 
     let nodes = spawn_cluster(&dirs, &ports);

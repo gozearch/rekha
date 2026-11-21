@@ -495,6 +495,67 @@ impl AppState {
         }
     }
 
+    /// Whether this node is a **voter** in the consensus group that holds
+    /// `collection`.
+    ///
+    /// This is the condition under which a local count is a real answer rather
+    /// than an artefact of having opened the files early: a node can hold a
+    /// group and materialized partitions before it has replicated anything
+    /// (`ensure_started` does exactly that while a promoted node catches up).
+    /// A voter has the log up to its join point by joint consensus, so its
+    /// applied state is authoritative for what it claims to hold.
+    ///
+    /// Single-node mode has no shard registry and no replication, so the local
+    /// engine is authoritative: `true`. A clustered node with no group for the
+    /// collection is not a voter: `false`, which callers must read as "forward
+    /// or refuse", never as "zero".
+    pub fn is_voter_for(&self, collection: &uuid::Uuid) -> bool {
+        let Some(shards) = self.shards.as_ref() else {
+            // One group holds everything: a single node, or a cluster started
+            // with only the metadata group. This node's membership in that
+            // group is the answer, and with no consensus at all the local
+            // engine is the record.
+            return match self.raft.as_ref() {
+                Some(raft) => {
+                    let metrics = raft.metrics();
+                    let m = metrics.borrow();
+                    m.membership_config
+                        .membership()
+                        .voter_ids()
+                        .any(|id| id == m.id)
+                }
+                None => true,
+            };
+        };
+        let Some(shard) = self.shard_of(collection) else {
+            // An unsharded row inside a cluster: one group holds everything and
+            // this node's membership in it is the answer.
+            return match self.raft.as_ref() {
+                Some(raft) => {
+                    let metrics = raft.metrics();
+                    let m = metrics.borrow();
+                    m.membership_config
+                        .membership()
+                        .voter_ids()
+                        .any(|id| id == m.id)
+                }
+                None => false,
+            };
+        };
+        match shards.raft(shard) {
+            Some(raft) => {
+                let metrics = raft.metrics();
+                let m = metrics.borrow();
+                m.membership_config
+                    .membership()
+                    .voter_ids()
+                    .any(|id| id == m.id)
+            }
+            // The group is not running here, so this node holds none of it.
+            None => false,
+        }
+    }
+
     /// The shard that holds `collection`, from its catalog row.
     ///
     /// This is the only way a collection's shard is learned. It is decided once
@@ -596,7 +657,18 @@ async fn counts_for(
         std::collections::HashMap::new();
 
     for id in ids {
-        match state.engine.count_local(id) {
+        // A local count is only an answer when this node is a voter of the
+        // group that holds the collection. A node that has merely opened the
+        // files — `ensure_started` materializes an empty partition for a shard
+        // that is still being replicated — would otherwise report `0` for
+        // records that exist elsewhere, which is indistinguishable from an
+        // empty collection. Treat it as "cannot answer" and forward instead.
+        let local = if state.is_voter_for(id) {
+            state.engine.count_local(id)
+        } else {
+            Ok(None)
+        };
+        match local {
             Ok(Some(local)) => {
                 counts.insert(*id, local);
             }
@@ -662,13 +734,19 @@ async fn counts_for(
 }
 
 /// Counts this node holds, for a peer that needs them.
+///
+/// Only a voter answers: a peer may hold a group and empty partitions while it
+/// catches up, and answering `0` there would turn "still replicating" into
+/// "empty collection" one forwarding hop away from the client.
 async fn stats_counts(
     State(state): State<Arc<AppState>>,
     Json(ids): Json<Vec<uuid::Uuid>>,
 ) -> Json<std::collections::HashMap<String, u64>> {
     let mut counts = std::collections::HashMap::new();
     for id in ids {
-        if let Ok(Some(count)) = state.engine.count_local(&id) {
+        if state.is_voter_for(&id)
+            && let Ok(Some(count)) = state.engine.count_local(&id)
+        {
             counts.insert(id.to_string(), count);
         }
     }

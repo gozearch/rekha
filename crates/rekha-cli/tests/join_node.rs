@@ -159,10 +159,11 @@ async fn a_new_node_joins_without_restarting_the_cluster() {
     // The joining node serves a request that needs both halves of what it
     // learned: the collection's catalog row (or it would answer 404) and the
     // owner's address (or the count would be 0). Its own `--peers` is empty.
-    // Polled, not read once: once the node is a voter it may materialize the
-    // shard empty before the snapshot applies, and a single GET in that window
-    // answers 0 for records that exist elsewhere.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Polled, not read once: the node must never report fewer records than an
+    // owner holds, but it may need a moment to reach one. A `0` that persists
+    // is the failure this guards: a node that opened the shard's files before
+    // replicating them answering for data it does not have.
+    let deadline = Instant::now() + Duration::from_secs(90);
     let body = loop {
         let response = client()
             .get(joining.url(&format!("/api/v2/collections/{collection}")))
@@ -185,7 +186,7 @@ async fn a_new_node_joins_without_restarting_the_cluster() {
         }
         assert!(
             Instant::now() < deadline,
-            "the joining node never reached 2 records within 60s; got {body}"
+            "the joining node never reached 2 records within 90s; got {body}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };

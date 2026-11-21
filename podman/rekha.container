@@ -10,7 +10,7 @@
 #   journalctl --user -u rekha -f
 
 [Container]
-Image=ghcr.io/gozearch/rekha-db:latest
+Image=ghcr.io/gozearch/rekha:latest
 ContainerName=rekha
 PublishPort=8000:8000
 Volume=rekha-data.volume:/data

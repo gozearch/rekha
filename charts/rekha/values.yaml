@@ -5,7 +5,7 @@
 replicaCount: 3
 
 image:
-  repository: ghcr.io/rekha-db/rekha
+  repository: ghcr.io/gozearch/rekha
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
   tag: ""

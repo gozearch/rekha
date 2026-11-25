@@ -152,6 +152,13 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bound to `0.0.0.0` does not run in open mode.
 - The published image is built from `Containerfile`.
 - `rekha-cluster` no longer depends on the unused `rekha-wal` crate.
+- `cookie` is 0.18.3 and `url` is 2.5.9, closing RUSTSEC-2026-0594 (private
+  cookie nonce reuse after `fork`) and RUSTSEC-2026-0592 (stack overflow on
+  nested `blob:` URLs in `Url::origin()`). `chrono` carries an
+  "unmaintained" advisory with no upgrade path: openraft 0.9 and
+  axum-test/expect-json depend on it unconditionally, so it is a documented
+  exception in `deny.toml` rather than a silent one, pending the openraft 0.10
+  migration.
 
 ### Fixed
 

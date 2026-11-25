@@ -3,8 +3,8 @@
 # Every entry here was produced by running `cargo deny check` against the real
 # lockfile and triaging what it found — not copied from a template. The first
 # run surfaced seven vulnerabilities and two yanked crates; all were fixed by
-# `cargo update` rather than allowlisted, and only the two entries below remain,
-# each with a reason.
+# `cargo update` rather than allowlisted. What remains below is only advisories
+# with no safe upgrade, each with the scope of its exposure written down.
 
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
@@ -19,6 +19,16 @@ ignore = [
     # is a containment argument, not a proof, so migrating to a maintained
     # codec is tracked rather than forgotten.
     { id = "RUSTSEC-2025-0141", reason = "unmaintained, not vulnerable; internal encoding behind cluster auth; migration tracked" },
+    # chrono has no replacement in either path that pulls it in, so there is no
+    # version to upgrade to: openraft 0.9 depends on it unconditionally (0.10
+    # dropped it), and axum-test depends on expect-json, which uses it for
+    # ISO-8601 matchers. The advisory is "unmaintained", not a vulnerability.
+    #
+    # Scope of exposure: chrono formats timestamps in Raft log IDs and in test
+    # assertions. No untrusted input is parsed with it. The fix is the openraft
+    # 0.10 upgrade, which is an API migration rather than a `cargo update`, and
+    # is tracked in the dependency-policy issue rather than silently allowlisted.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, not vulnerable; only openraft + axum-test/expect-json; openraft 0.10 upgrade tracked" },
 ]
 
 [licenses]

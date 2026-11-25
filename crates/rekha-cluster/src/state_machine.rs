@@ -2080,3 +2080,593 @@ mod tests {
         assert_eq!(last_applied, None);
     }
 }
+
+#[cfg(test)]
+mod catalog_apply_tests {
+    use super::*;
+    use crate::placement::{Placement, ShardId};
+    use openraft::CommittedLeaderId;
+    use rekha_core::auth::{Permission, RoleRecord, UserRecord};
+    use rekha_core::op::Operation;
+    use rekha_core::types::Embedding;
+    use rekha_storage::RedbCatalog;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    fn log_id(index: u64) -> LogId<u64> {
+        LogId::new(CommittedLeaderId::new(1, 0), index)
+    }
+
+    fn entry(index: u64, op: ClusterOperation) -> openraft::Entry<RaftTypeConfig> {
+        openraft::Entry {
+            log_id: log_id(index),
+            payload: openraft::EntryPayload::Normal(op),
+        }
+    }
+
+    /// The engine seam, without the engine crate.
+    ///
+    /// `rekha-cluster` depends on the `EngineSnapshotProvider` trait, not on
+    /// the engine, so the tests provide the smallest honest implementation:
+    /// applied batches are counted per (collection, shard), and the lifecycle
+    /// calls are recorded. That is exactly what the state machine promises the
+    /// engine, and it keeps these tests free of WAL and HNSW timing.
+    #[derive(Default)]
+    struct RecordingProvider {
+        applied: Mutex<std::collections::HashMap<(Uuid, Option<ShardId>), usize>>,
+        materialized: Mutex<HashSet<(Uuid, Option<ShardId>)>>,
+        fail_apply: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingProvider {
+        fn count(&self, collection: Uuid, shard: Option<ShardId>) -> usize {
+            self.applied
+                .lock()
+                .unwrap()
+                .get(&(collection, shard))
+                .copied()
+                .unwrap_or(0)
+        }
+        fn is_materialized(&self, collection: Uuid, shard: Option<ShardId>) -> bool {
+            self.materialized
+                .lock()
+                .unwrap()
+                .contains(&(collection, shard))
+        }
+        fn fail_apply(&self) {
+            self.fail_apply
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl EngineSnapshotProvider for RecordingProvider {
+        fn snapshot_bytes(
+            &self,
+            _state: &[u8],
+            _shard: Option<ShardId>,
+            _collections: &[uuid::Uuid],
+        ) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn restore_bytes(
+            &self,
+            _shard: Option<ShardId>,
+            _archive: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn snapshot_state(&self, _archive: &[u8]) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn checkpoint_all(
+            &self,
+            _shard: Option<ShardId>,
+            _collections: &[uuid::Uuid],
+        ) -> Result<usize, String> {
+            Ok(0)
+        }
+        fn record_collection(
+            &self,
+            _config: &rekha_core::config::CollectionConfig,
+            _shard: Option<ShardId>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn materialize_collection(
+            &self,
+            collection_id: &uuid::Uuid,
+            shard: Option<ShardId>,
+        ) -> Result<(), String> {
+            self.materialized
+                .lock()
+                .unwrap()
+                .insert((*collection_id, shard));
+            Ok(())
+        }
+        fn drop_collection(
+            &self,
+            collection_id: &uuid::Uuid,
+            shard: Option<ShardId>,
+        ) -> Result<(), String> {
+            self.materialized
+                .lock()
+                .unwrap()
+                .remove(&(*collection_id, shard));
+            self.applied
+                .lock()
+                .unwrap()
+                .remove(&(*collection_id, shard));
+            Ok(())
+        }
+        fn apply_batch(
+            &self,
+            collection_id: &uuid::Uuid,
+            shard: Option<ShardId>,
+            ops: &[Operation],
+            _index: u64,
+            _dimension: usize,
+        ) -> Result<(), String> {
+            if self.fail_apply.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("injected apply failure".into());
+            }
+            *self
+                .applied
+                .lock()
+                .unwrap()
+                .entry((*collection_id, shard))
+                .or_default() += ops.len();
+            Ok(())
+        }
+        fn reserve_tx_ids(
+            &self,
+            _collection_id: &uuid::Uuid,
+            _shard: Option<ShardId>,
+            _tx_id: uuid::Uuid,
+            _ids: &[rekha_core::types::Id],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn release_tx_ids(
+            &self,
+            _collection_id: &uuid::Uuid,
+            _shard: Option<ShardId>,
+            _tx_id: &uuid::Uuid,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct Harness {
+        sm: ClusterStateMachine,
+        provider: Arc<RecordingProvider>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn harness(role: GroupRole) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(RedbCatalog::open(dir.path().join("catalog.redb")).unwrap());
+        catalog.ensure_builtin_roles().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let mut sm = match role {
+            GroupRole::Metadata => ClusterStateMachine::for_metadata(1),
+            GroupRole::Shard(s) => ClusterStateMachine::for_shard(1, s),
+        };
+        sm.set_catalog(catalog);
+        sm.set_engine(provider.clone() as Arc<dyn EngineSnapshotProvider>);
+        Harness {
+            sm,
+            provider,
+            _dir: dir,
+        }
+    }
+
+    fn collection(id: Uuid, name: &str) -> rekha_core::config::CollectionConfig {
+        let mut config = rekha_core::config::CollectionConfig::new(
+            name.into(),
+            4,
+            rekha_core::types::Distance::L2,
+        );
+        config.id = id;
+        config
+    }
+
+    fn add(id: &str, value: f32) -> Operation {
+        Operation::Add {
+            id: id.into(),
+            embedding: Embedding::from(vec![value, 0.0, 0.0, 0.0]),
+            metadata: None,
+            document: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn every_rbac_operation_applies_through_the_catalog() {
+        let h = harness(GroupRole::Metadata);
+        let mut sm = h.sm;
+        let catalog = sm.catalog.clone().unwrap();
+        let user = UserRecord {
+            id: "u1".into(),
+            name: "alice".into(),
+            enabled: true,
+            created_at_ms: 0,
+        };
+        let role = RoleRecord {
+            id: "r1".into(),
+            name: "analyst".into(),
+            description: String::new(),
+            built_in: false,
+        };
+        let perm = Permission {
+            id: "p1".into(),
+            action: "record.get".into(),
+            tenant: None,
+            database: None,
+        };
+
+        for (i, op) in [
+            ClusterOperation::CreateUser {
+                user: user.clone(),
+                key_hash: [1u8; 32],
+                key_label: "default".into(),
+            },
+            ClusterOperation::SetUserEnabled {
+                user_id: user.id.clone(),
+                enabled: false,
+            },
+            ClusterOperation::CreateApiKey {
+                user_id: user.id.clone(),
+                key_hash: [2u8; 32],
+                label: "second".into(),
+            },
+            ClusterOperation::DeleteApiKey {
+                user_id: user.id.clone(),
+                key_hash: [2u8; 32],
+            },
+            ClusterOperation::CreateRole { role: role.clone() },
+            ClusterOperation::AddPermission {
+                role_id: role.id.clone(),
+                permission: perm.clone(),
+            },
+            ClusterOperation::AssignRole {
+                user_id: user.id.clone(),
+                role_id: role.id.clone(),
+                assigned_by: "admin".into(),
+            },
+            ClusterOperation::UnassignRole {
+                user_id: user.id.clone(),
+                role_id: role.id.clone(),
+            },
+            ClusterOperation::RemovePermission {
+                role_id: role.id.clone(),
+                perm_id: perm.id.clone(),
+            },
+            ClusterOperation::DeleteRole {
+                role_id: role.id.clone(),
+            },
+            ClusterOperation::DeleteUser {
+                user_id: user.id.clone(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sm.apply(vec![entry(i as u64 + 1, op)])
+                .await
+                .expect("apply must not fail");
+            assert!(
+                !sm.apply_failed(),
+                "a legal RBAC entry must not mark the node not-ready"
+            );
+        }
+
+        assert!(catalog.get_user(&user.id).unwrap().is_none());
+        assert!(catalog.get_role(&role.id).unwrap().is_none());
+        assert_eq!(sm.last_applied, Some(log_id(11)));
+    }
+
+    #[tokio::test]
+    async fn the_bootstrap_superadmin_is_one_entry_with_a_role() {
+        let h = harness(GroupRole::Metadata);
+        let mut sm = h.sm;
+        let catalog = sm.catalog.clone().unwrap();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        sm.set_bootstrap_ready_flag(ready.clone());
+        let role = catalog.get_role_by_name("superadmin").unwrap().unwrap();
+        let user = UserRecord {
+            id: "admin".into(),
+            name: "admin".into(),
+            enabled: true,
+            created_at_ms: 0,
+        };
+
+        sm.apply(vec![entry(
+            1,
+            ClusterOperation::BootstrapSuperadmin {
+                user: user.clone(),
+                key_hash: [9u8; 32],
+                key_label: "bootstrap".into(),
+                role_id: role.id.clone(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        assert!(catalog.get_user(&user.id).unwrap().is_some());
+        assert!(
+            !catalog.get_user_roles(&user.id).unwrap().is_empty(),
+            "the role must be granted in the same entry"
+        );
+        assert!(ready.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!sm.apply_failed());
+
+        // Replaying the entry is the expected case after a restart.
+        sm.apply(vec![entry(
+            2,
+            ClusterOperation::BootstrapSuperadmin {
+                user,
+                key_hash: [9u8; 32],
+                key_label: "bootstrap".into(),
+                role_id: role.id,
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(!sm.apply_failed(), "a replay is not divergence");
+    }
+
+    #[tokio::test]
+    async fn a_batch_prepare_and_commit_stage_then_apply() {
+        let h = harness(GroupRole::Shard(ShardId(0)));
+        let mut sm = h.sm;
+        let provider = h.provider;
+        let cid = Uuid::new_v4();
+        sm.apply(vec![entry(
+            1,
+            ClusterOperation::AddCollection {
+                config: collection(cid, "docs"),
+                shard: Some(ShardId(0)),
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(provider.is_materialized(cid, Some(ShardId(0))));
+
+        sm.apply(vec![entry(
+            2,
+            ClusterOperation::Batch {
+                collection_id: cid,
+                ops: vec![add("a", 1.0)],
+                dimension: 4,
+            },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(provider.count(cid, Some(ShardId(0))), 1);
+
+        let tx = Uuid::new_v4();
+        sm.apply(vec![entry(
+            3,
+            ClusterOperation::PrepareBatch {
+                tx_id: tx,
+                collection_id: cid,
+                ops: vec![add("b", 2.0)],
+                dimension: 4,
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(sm.prepared_txs.contains_key(&tx));
+        assert_eq!(
+            provider.count(cid, Some(ShardId(0))),
+            1,
+            "a prepared transaction must not be visible"
+        );
+
+        sm.apply(vec![entry(4, ClusterOperation::CommitBatch { tx_id: tx })])
+            .await
+            .unwrap();
+        assert!(sm.prepared_txs.is_empty());
+        assert_eq!(provider.count(cid, Some(ShardId(0))), 2);
+
+        // A replay of the commit is idempotent.
+        sm.apply(vec![entry(5, ClusterOperation::CommitBatch { tx_id: tx })])
+            .await
+            .unwrap();
+        assert_eq!(provider.count(cid, Some(ShardId(0))), 2);
+        assert!(!sm.apply_failed());
+    }
+
+    #[tokio::test]
+    async fn an_aborted_transaction_never_becomes_visible() {
+        let h = harness(GroupRole::Shard(ShardId(0)));
+        let mut sm = h.sm;
+        let provider = h.provider;
+        let cid = Uuid::new_v4();
+        sm.apply(vec![entry(
+            1,
+            ClusterOperation::AddCollection {
+                config: collection(cid, "abort"),
+                shard: Some(ShardId(0)),
+            },
+        )])
+        .await
+        .unwrap();
+
+        let tx = Uuid::new_v4();
+        sm.apply(vec![entry(
+            2,
+            ClusterOperation::PrepareBatch {
+                tx_id: tx,
+                collection_id: cid,
+                ops: vec![add("a", 1.0)],
+                dimension: 4,
+            },
+        )])
+        .await
+        .unwrap();
+        sm.apply(vec![entry(3, ClusterOperation::AbortBatch { tx_id: tx })])
+            .await
+            .unwrap();
+        assert!(sm.prepared_txs.is_empty());
+        assert_eq!(provider.count(cid, Some(ShardId(0))), 0);
+        assert!(!sm.apply_failed());
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_marks_the_node_not_ready() {
+        let h = harness(GroupRole::Shard(ShardId(0)));
+        let mut sm = h.sm;
+        let provider = h.provider;
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        sm.set_apply_failure_flag(flag.clone());
+        let cid = Uuid::new_v4();
+        sm.apply(vec![entry(
+            1,
+            ClusterOperation::AddCollection {
+                config: collection(cid, "fail"),
+                shard: Some(ShardId(0)),
+            },
+        )])
+        .await
+        .unwrap();
+        let tx = Uuid::new_v4();
+        sm.apply(vec![entry(
+            2,
+            ClusterOperation::PrepareBatch {
+                tx_id: tx,
+                collection_id: cid,
+                ops: vec![add("a", 1.0)],
+                dimension: 4,
+            },
+        )])
+        .await
+        .unwrap();
+        provider.fail_apply();
+        sm.apply(vec![entry(3, ClusterOperation::CommitBatch { tx_id: tx })])
+            .await
+            .unwrap();
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "a committed entry that cannot apply must stop readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespaces_and_transaction_decisions_are_recorded() {
+        let h = harness(GroupRole::Metadata);
+        let mut sm = h.sm;
+        let catalog = sm.catalog.clone().unwrap();
+        sm.apply(vec![entry(
+            1,
+            ClusterOperation::CreateTenant {
+                name: "acme".into(),
+            },
+        )])
+        .await
+        .unwrap();
+        sm.apply(vec![entry(
+            2,
+            ClusterOperation::CreateDatabase {
+                tenant: "acme".into(),
+                name: "vectors".into(),
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(
+            catalog
+                .list_tenants()
+                .unwrap()
+                .contains(&"acme".to_string())
+        );
+        assert!(
+            catalog
+                .list_databases()
+                .unwrap()
+                .contains(&("acme".to_string(), "vectors".to_string()))
+        );
+
+        let tx = Uuid::new_v4();
+        sm.apply(vec![entry(
+            3,
+            ClusterOperation::CommitTx {
+                tx_id: tx,
+                shards: vec![ShardId(0)],
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(sm.committed_txs.contains(&tx));
+        sm.apply(vec![entry(4, ClusterOperation::AbortTx { tx_id: tx })])
+            .await
+            .unwrap();
+        assert!(!sm.committed_txs.contains(&tx));
+    }
+
+    #[tokio::test]
+    async fn ownership_and_voter_updates_reach_the_live_registry() {
+        let h = harness(GroupRole::Metadata);
+        let mut sm = h.sm;
+        let placement = Arc::new(Placement::new(2, 2, [1u64, 2]).unwrap());
+        let shards = Arc::new(crate::shard::ShardCluster::new(placement));
+        sm.set_shards(shards.clone(), h._dir.path().join("placement"));
+
+        sm.apply(vec![entry(
+            1,
+            ClusterOperation::SetShardOwners {
+                shard: ShardId(0),
+                owners: vec![2, 1],
+            },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(shards.owners(ShardId(0)), vec![2, 1]);
+
+        // A voter shrink needs a replication factor the smaller set can still
+        // satisfy; the placement refuses an impossible one and the arm leaves
+        // the registry untouched.
+        let h2 = harness(GroupRole::Metadata);
+        let mut sm2 = h2.sm;
+        let placement = Arc::new(Placement::new(2, 1, [1u64, 2]).unwrap());
+        let shards2 = Arc::new(crate::shard::ShardCluster::new(placement));
+        sm2.set_shards(shards2.clone(), h2._dir.path().join("placement"));
+        sm2.apply(vec![entry(
+            1,
+            ClusterOperation::SetVoters { voters: vec![2] },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(shards2.placement().voters(), vec![2]);
+        assert!(!sm2.apply_failed());
+    }
+
+    #[tokio::test]
+    async fn removing_a_collection_drops_its_partition() {
+        let h = harness(GroupRole::Shard(ShardId(0)));
+        let mut sm = h.sm;
+        let provider = h.provider;
+        let cid = Uuid::new_v4();
+        sm.apply(vec![entry(
+            1,
+            ClusterOperation::AddCollection {
+                config: collection(cid, "gone"),
+                shard: Some(ShardId(0)),
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(provider.is_materialized(cid, Some(ShardId(0))));
+
+        sm.apply(vec![entry(
+            2,
+            ClusterOperation::RemoveCollection { collection_id: cid },
+        )])
+        .await
+        .unwrap();
+        assert!(
+            !provider.is_materialized(cid, Some(ShardId(0))),
+            "a removed collection is no longer materialized"
+        );
+        assert!(sm.placements.is_empty());
+    }
+}

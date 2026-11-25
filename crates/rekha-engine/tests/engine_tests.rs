@@ -4058,3 +4058,238 @@ fn auto_checkpoint_after_delete_does_not_fail_the_write() {
         .expect("auto-checkpoint must not turn an acknowledged write into an error");
     assert_eq!(engine.count(&id).unwrap(), 7);
 }
+
+// ---------------------------------------------------------------------------
+// Sharded engine: partitions, reservations, and background checkpoints
+// ---------------------------------------------------------------------------
+
+fn vec_of(seed: f32) -> Embedding {
+    (0..DIM as i32)
+        .map(|d| seed + d as f32)
+        .collect::<Vec<f32>>()
+        .into()
+}
+
+fn op_add(id: &str, seed: f32) -> rekha_core::op::Operation {
+    rekha_core::op::Operation::Add {
+        id: id.to_owned(),
+        embedding: vec_of(seed),
+        metadata: None,
+        document: None,
+    }
+}
+
+fn shard_one() -> Option<ShardId> {
+    Some(ShardId(1))
+}
+
+#[test]
+fn partition_reads_and_writes_stay_on_their_shard() {
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir);
+    let config = CollectionConfig::new("parts".into(), DIM, Distance::L2);
+    let id = engine.create_collection(&config).unwrap().config.id;
+
+    engine
+        .materialize_collection_partition(&id, shard_one())
+        .unwrap();
+    engine
+        .append_ops_partition(&id, shard_one(), &[op_add("a", 0.0), op_add("b", 1.0)])
+        .unwrap();
+
+    assert_eq!(engine.count_partition(&id, shard_one()).unwrap(), 2);
+    assert_eq!(
+        engine.count(&id).unwrap(),
+        2,
+        "count merges the open partitions"
+    );
+
+    let by_id = engine
+        .get_records_partition(
+            &id,
+            shard_one(),
+            Some(&["b".to_owned()]),
+            None,
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+    assert_eq!(by_id.len(), 1);
+    assert_eq!(by_id[0].id, "b");
+    assert!(by_id[0].embedding.is_some());
+
+    let page = engine
+        .get_records_partition(&id, shard_one(), None, None, None, Some(1), 1)
+        .unwrap();
+    assert_eq!(page.len(), 1, "offset/limit apply inside the partition");
+
+    let hits = engine
+        .query_partition(&id, shard_one(), &vec_of(0.0), 1, &QueryOptions::default())
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "a");
+
+    let many = engine
+        .query_many_partition(
+            &id,
+            shard_one(),
+            &[vec_of(0.0), vec_of(1.0)],
+            1,
+            &QueryOptions::default(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(many.len(), 2);
+    assert!(
+        many[0][0].embedding.is_some(),
+        "with_embeddings is honoured"
+    );
+}
+
+#[test]
+fn a_multi_partition_read_merges_sorts_and_pages() {
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir);
+    let config = CollectionConfig::new("merged".into(), DIM, Distance::L2);
+    let id = engine.create_collection(&config).unwrap().config.id;
+
+    for shard in [ShardId(1), ShardId(2)] {
+        engine
+            .materialize_collection_partition(&id, Some(shard))
+            .unwrap();
+    }
+    engine
+        .append_ops_partition(&id, Some(ShardId(1)), &[op_add("a", 0.0)])
+        .unwrap();
+    engine
+        .append_ops_partition(&id, Some(ShardId(2)), &[op_add("b", 1.0)])
+        .unwrap();
+
+    let all = engine.get_records(&id, None, None, None, None, 0).unwrap();
+    assert_eq!(all.len(), 2, "both partitions contribute");
+    let mut ids: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["a", "b"]);
+
+    let second = engine
+        .get_records(&id, None, None, None, Some(1), 1)
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(ids.contains(&second[0].id.as_str()));
+
+    assert_eq!(engine.count_local(&id).unwrap(), Some(2));
+
+    let filtered = engine
+        .get_records(
+            &id,
+            None,
+            Some(&WhereFilter::parse_json(r#"{"missing": {"$eq": 1}}"#).unwrap()),
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+    assert!(filtered.is_empty());
+
+    let by_doc = engine
+        .get_records(
+            &id,
+            None,
+            None,
+            Some(&rekha_core::filter::WhereDocument::Contains("nope".into())),
+            None,
+            0,
+        )
+        .unwrap();
+    assert!(by_doc.is_empty());
+}
+
+#[test]
+fn a_reserved_id_is_locked_until_the_transaction_releases_it() {
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir);
+    let config = CollectionConfig::new("tx".into(), DIM, Distance::L2);
+    let id = engine.create_collection(&config).unwrap().config.id;
+    engine
+        .materialize_collection_partition(&id, shard_one())
+        .unwrap();
+
+    let tx = Uuid::new_v4();
+    engine
+        .reserve_tx_ids(&id, shard_one(), tx, &["locked".to_owned()])
+        .unwrap();
+    let err = engine
+        .prepare_add_partition(
+            &id,
+            shard_one(),
+            &["locked".to_owned()],
+            &[vec_of(0.0)],
+            None,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Validation(ref m) if m.contains("in-flight transaction")),
+        "{err:?}"
+    );
+
+    engine.release_tx_ids(&id, shard_one(), &tx).unwrap();
+    let prepared = engine
+        .prepare_add_partition(
+            &id,
+            shard_one(),
+            &["locked".to_owned()],
+            &[vec_of(0.0)],
+            None,
+            None,
+        )
+        .unwrap();
+    engine
+        .append_ops_partition(&id, shard_one(), &prepared.ops)
+        .unwrap();
+    assert_eq!(engine.count_partition(&id, shard_one()).unwrap(), 1);
+}
+
+#[test]
+fn a_cluster_engine_checkpoints_on_demand_not_on_the_write_path() {
+    use rekha_cluster::state_machine::EngineSnapshotProvider;
+    use rekha_engine::ApplyMode;
+
+    let dir = TempDir::new().unwrap();
+    let catalog: Arc<dyn Catalog> =
+        Arc::new(RedbCatalog::open(dir.path().join("catalog.redb")).unwrap());
+    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(dir.path().join("objects")));
+    let engine = Engine::open(
+        catalog,
+        storage,
+        dir.path().join("wal"),
+        EngineConfig {
+            apply_mode: ApplyMode::Committed,
+            ..EngineConfig::default()
+        },
+    )
+    .unwrap();
+    let mut config = CollectionConfig::new("due".into(), DIM, Distance::L2);
+    config.hnsw.sync_threshold = 1;
+    let id = engine.create_collection(&config).unwrap().config.id;
+
+    assert_eq!(
+        engine.checkpoint_if_due().unwrap(),
+        0,
+        "nothing has been applied yet"
+    );
+    engine
+        .apply_batch(&id, None, &[op_add("a", 0.0)], 1, DIM)
+        .unwrap();
+    assert_eq!(
+        engine.checkpoint_if_due().unwrap(),
+        1,
+        "an applied batch past the threshold makes a checkpoint due"
+    );
+    assert_eq!(
+        engine.checkpoint_if_due().unwrap(),
+        0,
+        "a second call finds nothing due"
+    );
+}

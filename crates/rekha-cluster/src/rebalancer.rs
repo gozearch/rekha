@@ -23,6 +23,55 @@ use crate::shard::ShardCluster;
 /// cluster does not promote a node that has replicated nothing.
 pub const PROMOTION_LAG_THRESHOLD: u64 = 50;
 
+/// What one reconciliation tick should do about a learner.
+///
+/// Split out of the two serving loops because the decision has six cases
+/// (never replicated, behind by more than the threshold, within the threshold,
+/// already a voter, nothing to promote, several learners) and inlining it made
+/// each loop read like a state machine with the metrics calls on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromotionDecision {
+    /// Membership may be widened to the target owners.
+    Promote { lag: Option<u64> },
+    /// `node` is not caught up; record the attempt and try again next tick.
+    Skip { node: u64, lag: Option<u64> },
+}
+
+/// Decide whether `targets` can be promoted against `voters`.
+///
+/// `matched` reports how far a node has replicated, or `None` when it has
+/// replicated nothing. `None` is *infinite* lag, never zero: promoting a node
+/// that promised nothing on an idle cluster is what removed a voter's ability
+/// to answer for its own data.
+pub(crate) fn decide_promotion(
+    targets: &[u64],
+    voters: &std::collections::BTreeSet<u64>,
+    last_log: u64,
+    matched: impl Fn(u64) -> Option<u64>,
+) -> PromotionDecision {
+    let mut lag_of: Option<u64> = Some(0);
+    let mut blocked: Option<u64> = None;
+    for &node in targets {
+        if voters.contains(&node) {
+            continue;
+        }
+        match matched(node) {
+            None => return PromotionDecision::Skip { node, lag: None },
+            Some(matched) => {
+                let lag = last_log.saturating_sub(matched);
+                lag_of = Some(lag_of.map_or(lag, |prev| prev.max(lag)));
+                if lag > PROMOTION_LAG_THRESHOLD {
+                    blocked = Some(node);
+                }
+            }
+        }
+    }
+    match blocked {
+        Some(node) => PromotionDecision::Skip { node, lag: lag_of },
+        None => PromotionDecision::Promote { lag: lag_of },
+    }
+}
+
 /// Attach the cluster secret to an internal request, if one is configured.
 ///
 /// Internal routes fail closed without it; the three reconciler call sites
@@ -107,42 +156,19 @@ pub async fn reconcile_local_shard_leaders(node_id: u64, shards: &Arc<ShardClust
 
         // At most one promotion attempt per group per tick. A learner that
         // never replicated (matched None) is infinite lag and skips.
-        let shard_last_log = m.last_log_index.unwrap_or(0);
-        let mut lag_of: Option<u64> = Some(0);
-        let mut pending: Option<u64> = None;
-        for &node in &target_owners {
-            if current_voters.contains(&node) {
-                continue;
-            }
-            match crate::replication_matched(&m, &node) {
-                None => {
-                    lag_of = None;
-                    pending = Some(node);
-                    break;
-                }
-                Some(matched) => {
-                    let lag = shard_last_log.saturating_sub(matched);
-                    lag_of = Some(lag_of.map_or(lag, |prev: u64| prev.max(lag)));
-                    if lag > PROMOTION_LAG_THRESHOLD {
-                        pending = Some(node);
-                    }
-                }
-            }
-        }
         let group_label = format!("shard:{}", shard.0);
-        match (lag_of, pending) {
-            (None, Some(node)) => {
-                record_promotion_attempt(shards, &group_label, node, None, "skipped_lag");
+        let lag_of = match decide_promotion(
+            &target_owners,
+            &current_voters,
+            m.last_log_index.unwrap_or(0),
+            |node| crate::replication_matched(&m, &node),
+        ) {
+            PromotionDecision::Skip { node, lag } => {
+                record_promotion_attempt(shards, &group_label, node, lag, "skipped_lag");
                 continue;
             }
-            (Some(_), Some(node)) => {
-                if let Some(lag) = lag_of {
-                    record_promotion_attempt(shards, &group_label, node, Some(lag), "skipped_lag");
-                }
-                continue;
-            }
-            _ => {}
-        }
+            PromotionDecision::Promote { lag } => lag,
+        };
 
         if shard_raft
             .change_membership(target_set, false)
@@ -222,41 +248,36 @@ pub async fn run_rebalancer_tick(
     let mut learners: Vec<u64> = m.membership_config.membership().learner_ids().collect();
     learners.sort_unstable();
     if let Some(learner) = learners.into_iter().next() {
-        let mut attempt: Option<(Option<u64>, &str)> = None;
-        let mut lag = None;
-        match crate::replication_matched(&m, &learner) {
-            // Never replicated: infinite lag, never promote on an idle cluster.
-            None => attempt = Some((None, "skipped_lag")),
-            Some(matched) => {
-                lag = Some(last_log.saturating_sub(matched));
-                if lag.is_some_and(|lag| lag > PROMOTION_LAG_THRESHOLD) {
-                    attempt = Some((lag, "skipped_lag"));
-                }
+        match decide_promotion(&[learner], &current_voters, last_log, |node| {
+            crate::replication_matched(&m, &node)
+        }) {
+            PromotionDecision::Skip { lag, .. } => {
+                record_promotion_attempt(shards, "metadata", learner, lag, "skipped_lag");
+                // Falls through to 2b: shard reconciliation must not starve
+                // while a learner waits for its next attempt.
             }
-        }
-        if let Some((lag, outcome)) = attempt {
-            record_promotion_attempt(shards, "metadata", learner, lag, outcome);
-        } else {
-            let mut new_voters = current_voters.clone();
-            new_voters.insert(learner);
-            if raft
-                .change_membership(new_voters.clone(), true)
-                .await
-                .is_ok()
-            {
-                record_promotion_attempt(shards, "metadata", learner, lag, "promoted");
-                tracing::info!(learner, "auto-promoted learner to voter in metadata group");
-                let voter_vec: Vec<u64> = new_voters.into_iter().collect();
-                if let Err(e) = raft
-                    .client_write(ClusterOperation::SetVoters {
-                        voters: voter_vec.clone(),
-                    })
+            PromotionDecision::Promote { lag } => {
+                let mut new_voters = current_voters.clone();
+                new_voters.insert(learner);
+                if raft
+                    .change_membership(new_voters.clone(), true)
                     .await
+                    .is_ok()
                 {
-                    tracing::error!(learner, %e, "failed to record SetVoters in consensus log");
+                    record_promotion_attempt(shards, "metadata", learner, lag, "promoted");
+                    tracing::info!(learner, "auto-promoted learner to voter in metadata group");
+                    let voter_vec: Vec<u64> = new_voters.into_iter().collect();
+                    if let Err(e) = raft
+                        .client_write(ClusterOperation::SetVoters {
+                            voters: voter_vec.clone(),
+                        })
+                        .await
+                    {
+                        tracing::error!(learner, %e, "failed to record SetVoters in consensus log");
+                    }
+                } else {
+                    record_promotion_attempt(shards, "metadata", learner, lag, "error");
                 }
-            } else {
-                record_promotion_attempt(shards, "metadata", learner, lag, "error");
             }
         }
     }
@@ -390,4 +411,91 @@ pub fn spawn_auto_rebalancer(
             .await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn voters(ids: &[u64]) -> BTreeSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_learner_within_the_threshold_is_promoted() {
+        let decision = decide_promotion(&[1, 2], &voters(&[1]), 1_000, |node| {
+            (node == 2).then_some(1_000 - PROMOTION_LAG_THRESHOLD)
+        });
+        assert_eq!(
+            decision,
+            PromotionDecision::Promote {
+                lag: Some(PROMOTION_LAG_THRESHOLD)
+            },
+            "exactly at the threshold is caught up"
+        );
+    }
+
+    #[test]
+    fn one_entry_behind_the_threshold_skips() {
+        let decision = decide_promotion(&[1, 2], &voters(&[1]), 1_000, |node| {
+            (node == 2).then_some(1_000 - PROMOTION_LAG_THRESHOLD - 1)
+        });
+        assert_eq!(
+            decision,
+            PromotionDecision::Skip {
+                node: 2,
+                lag: Some(PROMOTION_LAG_THRESHOLD + 1)
+            }
+        );
+    }
+
+    #[test]
+    fn a_learner_that_never_replicated_is_infinite_lag_not_zero() {
+        let decision = decide_promotion(&[1, 2], &voters(&[1]), 1_000, |_| None);
+        assert_eq!(
+            decision,
+            PromotionDecision::Skip { node: 2, lag: None },
+            "an idle cluster must not promote a node with no replicated entries"
+        );
+    }
+
+    #[test]
+    fn already_matching_voters_promote_with_zero_lag() {
+        let decision = decide_promotion(&[1, 2], &voters(&[1, 2]), 1_000, |_| None);
+        assert_eq!(decision, PromotionDecision::Promote { lag: Some(0) });
+    }
+
+    #[test]
+    fn several_behind_learners_report_the_last_and_the_maximum_lag() {
+        let decision = decide_promotion(&[1, 2, 3], &voters(&[1]), 1_000, |node| match node {
+            2 => Some(900),
+            3 => Some(800),
+            _ => None,
+        });
+        assert_eq!(
+            decision,
+            PromotionDecision::Skip {
+                node: 3,
+                lag: Some(200)
+            }
+        );
+    }
+
+    #[test]
+    fn one_caught_up_and_one_behind_still_skips() {
+        let decision = decide_promotion(&[1, 2, 3], &voters(&[1]), 1_000, |node| match node {
+            2 => Some(1_000),
+            3 => Some(100),
+            _ => None,
+        });
+        assert_eq!(
+            decision,
+            PromotionDecision::Skip {
+                node: 3,
+                lag: Some(900)
+            },
+            "a caught-up sibling does not make the behind learner a voter"
+        );
+    }
 }

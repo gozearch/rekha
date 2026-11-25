@@ -176,6 +176,15 @@ struct CollectionFiles {
 /// collection is a [`Finding`], not an error — the caller decides what to do
 /// with it.
 pub fn verify_data_dir(data_dir: &Path) -> std::io::Result<VerifyReport> {
+    // A missing *data directory* is a wrong path, not an empty database. The
+    // old behaviour reported it as clean with zero collections, so a typo in
+    // `--data-dir` produced a green check on data that was never read.
+    if !data_dir.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("data directory {} does not exist", data_dir.display()),
+        ));
+    }
     let wal_dir = data_dir.join("wal");
     let entries = match std::fs::read_dir(&wal_dir) {
         Ok(entries) => entries,

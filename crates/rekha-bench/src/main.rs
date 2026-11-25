@@ -69,14 +69,19 @@ struct Args {
 }
 
 fn main() {
-    if let Err(e) = run() {
+    if let Err(e) = run(Args::parse()) {
         eprintln!("rekha-bench: {e}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+/// Run one benchmark described by `args`.
+///
+/// Split from `main` so the whole path — including the report it writes — is a
+/// function a test can call with a twenty-record workload. A harness that can
+/// only be exercised by hand is the one component whose own breakage goes
+/// unnoticed.
+fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.records == 0 || args.batch == 0 || args.threads == 0 || args.collections == 0 {
         return Err("records, batch, threads and collections must all be non-zero".into());
     }
@@ -306,4 +311,137 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(dir: &Path, records: usize, batch: usize) -> Args {
+        Args {
+            data_dir: dir.to_path_buf(),
+            durability: Durability::Relaxed,
+            records,
+            dim: 4,
+            batch,
+            threads: 1,
+            collections: 1,
+            space: "l2".into(),
+            sync_threshold: 0,
+            skip_optimize: true,
+            out: Some(dir.join("report.json")),
+        }
+    }
+
+    #[test]
+    fn percentile_handles_empty_single_and_the_edges() {
+        assert_eq!(percentile(&[], 0.5), 0);
+        assert_eq!(percentile(&[7], 0.99), 7);
+        let sorted: Vec<u64> = (1..=100).collect();
+        assert_eq!(percentile(&sorted, 0.0), 1);
+        assert_eq!(percentile(&sorted, 0.5), 51);
+        assert_eq!(percentile(&sorted, 1.0), 100);
+    }
+
+    #[test]
+    fn ids_are_fixed_width_so_they_sort_lexically() {
+        assert_eq!(ids_of(7), "id-000000000007");
+        assert!(ids_of(9) < ids_of(10));
+    }
+
+    #[test]
+    fn dir_size_counts_nested_files_and_ignores_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("a.bin"), [0u8; 5]).unwrap();
+        std::fs::write(dir.path().join("nested").join("b.bin"), [0u8; 7]).unwrap();
+        assert_eq!(dir_size(dir.path()), 12);
+        assert_eq!(dir_size(&dir.path().join("absent")), 0);
+    }
+
+    #[test]
+    fn phases_reports_every_checkpoint_stage() {
+        let timings = rekha_engine::CheckpointTimings {
+            records_us: 1,
+            index_us: 2,
+            vectors_us: 3,
+            index_map_us: 4,
+            manifest_us: 5,
+            validate_us: 6,
+            publish_us: 7,
+            cleanup_us: 8,
+            total_us: 36,
+        };
+        let value = phases(&timings);
+        for key in [
+            "records_us",
+            "index_us",
+            "vectors_us",
+            "index_map_us",
+            "manifest_us",
+            "validate_us",
+            "publish_us",
+            "cleanup_us",
+            "total_us",
+        ] {
+            assert!(value.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(value["total_us"], 36);
+    }
+
+    #[test]
+    fn invalid_arguments_are_refused_before_any_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(args(dir.path(), 0, 10)).unwrap_err().to_string();
+        assert!(err.contains("non-zero"), "{err}");
+
+        let mut bad_space = args(dir.path(), 10, 10);
+        bad_space.space = "manhattan".into();
+        let err = run(bad_space).unwrap_err().to_string();
+        assert!(err.contains("unknown space"), "{err}");
+    }
+
+    #[test]
+    fn a_tiny_run_writes_a_report_with_the_measured_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        let mut a = args(dir.path(), 20, 10);
+        a.collections = 2;
+        a.durability = Durability::Durable;
+        a.out = Some(report.clone());
+        run(a).expect("bench run");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(value["records"], 20);
+        assert_eq!(value["collections"], 2);
+        assert_eq!(value["writes"], 2);
+        assert_eq!(value["optimize"], serde_json::json!([]));
+        assert!(value["ingest_ms"].as_u64().is_some());
+        assert!(value["latency_us"]["p99"].as_u64().is_some());
+        assert_eq!(
+            value["checkpoints"].as_array().unwrap().len(),
+            2,
+            "one checkpoint breakdown per collection"
+        );
+    }
+
+    #[test]
+    fn optimize_is_measured_unless_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = args(dir.path(), 10, 5);
+        a.skip_optimize = false;
+        a.out = Some(dir.path().join("optimized.json"));
+        run(a).expect("bench run");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("optimized.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["optimize"].as_array().unwrap().len(), 1);
+        assert!(
+            value["optimize"][0]["checkpoint"]["total_us"]
+                .as_u64()
+                .is_some()
+        );
+    }
 }

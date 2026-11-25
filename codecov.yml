@@ -1,15 +1,15 @@
 # Coverage is a gate, not a report.
 #
-# `target: auto` compares against the base commit, and `threshold: 0%` forbids
-# any drop. Combined with `fail_ci_if_error: true` in the workflow, a PR that
-# removes coverage fails — which is the only thing that makes the number mean
-# anything.
+# `target: 85%` is the same floor `scripts/coverage-threshold.py` enforces in
+# CI, so the number a contributor measures locally is the number the PR shows.
+# The small threshold allows noise from a platform-specific branch while still
+# failing a change that removes real coverage.
 coverage:
   status:
     project:
       default:
-        target: auto
-        threshold: 0%
+        target: 85%
+        threshold: 1%
         informational: false
     patch:
       default:

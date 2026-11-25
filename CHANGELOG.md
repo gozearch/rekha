@@ -91,6 +91,20 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The API crate is split by responsibility instead of being one 5,000-line
+  `lib.rs`: state, routing, handlers, peer-facing RPCs, shard dispatch, the
+  consensus write path, and the shared error/validation seams are separate
+  modules. The public surface is unchanged. The three near-identical shard
+  dispatch loops (`batch`, `prepare`, `commit`) are one function with a reply
+  type, so a fix cannot land in one arm and miss the others, and the
+  tenant/database permission ladder lives in one helper instead of being written
+  out at each handler.
+- Line coverage is a gate at 85% (`scripts/coverage-threshold.py` in CI, and
+  `codecov.yml` at the same target). The suites it took to get there are part of
+  the change: a two-group in-process sharded cluster for the 2PC/routing paths,
+  scripted CLI and REPL sessions, RBAC/namespace replication, engine partition
+  APIs, catalog apply cases, and RPC transport failures.
+
 - `placement.json` now records the shard owner table explicitly (`owners`), and a
   decided owner set is recorded as a committed `SetShardOwners` entry instead of
   being recomputed. Ownership was previously a pure function of the voter set,
@@ -141,6 +155,15 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `rekha` attached `REKHA_API_KEY` only to `auth …`, so every collection and
+  record command sent an unauthenticated request and a key-protected server
+  answered 401. The key is now a default header on the shared client.
+- `rekha delete` documented its file as a bare JSON array while the endpoint
+  takes `{ "ids": [...] }`, and sent it through unchanged (422). Both forms are
+  accepted.
+- `rekha verify --data-dir <typo>` reported a clean database with zero
+  collections because a missing `wal/` directory was read as empty. A missing
+  data directory is now an error; an existing but empty one is still clean.
 - `rekha verify` now opens every vector segment, so a corrupt one is reported
   instead of passing as clean and then failing when the node tries to load the
   collection. Segments carry their own header checksum rather than a manifest

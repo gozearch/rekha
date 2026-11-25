@@ -174,3 +174,18 @@ fn partitioned_collection_verifies_cleanly() {
     );
     assert_eq!(report.collections, 1);
 }
+
+#[test]
+fn a_missing_data_directory_is_an_error_not_a_clean_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("typo");
+    let err = rekha_engine::verify::verify_data_dir(&absent).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+    // A directory that exists but has nothing in it is a legitimate empty
+    // install, and reports clean.
+    let empty = tempfile::tempdir().unwrap();
+    let report = rekha_engine::verify::verify_data_dir(empty.path()).unwrap();
+    assert!(report.is_clean());
+    assert_eq!(report.collections, 0);
+}

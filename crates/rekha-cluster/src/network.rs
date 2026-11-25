@@ -834,3 +834,112 @@ mod tests {
         held.abort();
     }
 }
+
+#[cfg(test)]
+mod rpc_failure_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One HTTP response per accepted connection, then the listener closes.
+    async fn respond_once(response: &'static [u8]) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        port
+    }
+
+    fn network(port: u16) -> RaftNetworkImpl {
+        RaftNetworkImpl::new(2, Some(format!("127.0.0.1:{port}")), METADATA_GROUP, None)
+    }
+
+    fn opts() -> RPCOption {
+        RPCOption::new(Duration::from_secs(5))
+    }
+
+    fn vote_request() -> VoteRequest<u64> {
+        VoteRequest {
+            vote: openraft::Vote::new(3, 2),
+            last_log_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_without_a_configured_address_is_unreachable_not_localhost() {
+        let mut raft = RaftNetworkImpl::new(2, None, METADATA_GROUP, None);
+        let err = raft.vote(vote_request(), opts()).await.unwrap_err();
+        assert!(matches!(err, RPCError::Unreachable(_)), "{err:?}");
+        assert!(format!("{err}").contains("no address"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_non_success_status_carries_the_code_and_body() {
+        let port = respond_once(
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 9\r\nConnection: close\r\n\r\nno secret",
+        )
+        .await;
+        let err = network(port)
+            .vote(vote_request(), opts())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RPCError::Network(_)), "{err:?}");
+        let text = format!("{err}");
+        assert!(text.contains("401"), "{text}");
+        assert!(text.contains("no secret"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_successful_status_with_the_wrong_body_is_a_network_error() {
+        let port = respond_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nnot-json",
+        )
+        .await;
+        let err = network(port)
+            .vote(vote_request(), opts())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RPCError::Network(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_closed_port_is_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let err = network(port)
+            .vote(vote_request(), opts())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RPCError::Unreachable(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_snapshot_chunk_reports_the_peer_status() {
+        let port = respond_once(
+            b"HTTP/1.1 409 Conflict\r\nContent-Length: 12\r\nConnection: close\r\n\r\nwrong offset",
+        )
+        .await;
+        let err = network(port)
+            .send_snapshot_chunk("snap-1", 10, 20, false, "{}", "{}", vec![1, 2, 3])
+            .await
+            .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("409"), "{text}");
+        assert!(text.contains("wrong offset"), "{text}");
+    }
+
+    #[test]
+    fn peer_urls_keep_an_explicit_scheme() {
+        assert_eq!(normalize_peer_url("host:8000"), "http://host:8000");
+        assert_eq!(
+            normalize_peer_url("https://host:8443/"),
+            "https://host:8443"
+        );
+    }
+}

@@ -810,3 +810,44 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    #[test]
+    fn an_exhausted_hop_budget_is_retryable_and_explains_itself() {
+        let response = too_many_hops();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn the_hop_counter_reads_only_a_valid_numeric_header() {
+        let mut request = Request::new(Body::empty());
+        assert_eq!(hops_so_far(&request), 0, "absent means first hop");
+        request
+            .headers_mut()
+            .insert(HOPS_HEADER, axum::http::HeaderValue::from_static("2"));
+        assert_eq!(hops_so_far(&request), 2);
+        request.headers_mut().insert(
+            HOPS_HEADER,
+            axum::http::HeaderValue::from_static("not-a-number"),
+        );
+        assert_eq!(
+            hops_so_far(&request),
+            0,
+            "a corrupt counter resets the count rather than trusting it"
+        );
+        request
+            .headers_mut()
+            .insert(HOPS_HEADER, axum::http::HeaderValue::from_static("300"));
+        assert_eq!(hops_so_far(&request), 0, "u8 overflow is not a hop count");
+    }
+}

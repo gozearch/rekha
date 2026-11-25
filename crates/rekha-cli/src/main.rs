@@ -479,10 +479,28 @@ fn seeded_membership(
     openraft::StoredMembership::new(log_id, openraft::Membership::new(vec![voters], ()))
 }
 
+/// The HTTP client every command shares.
+///
+/// `REKHA_API_KEY` used to be read only by `rekha auth …`, so every other
+/// command sent an unauthenticated request and a key-protected server answered
+/// 401. Attaching the key as a default header fixes the whole command surface at
+/// once, including any command added later.
+fn cli_http_client() -> Result<Client, reqwest::Error> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(key) = std::env::var("REKHA_API_KEY")
+        && !key.is_empty()
+        && let Ok(value) = reqwest::header::HeaderValue::from_str(&key)
+    {
+        headers.insert("x-chroma-token", value.clone());
+        headers.insert("x-api-key", value);
+    }
+    Client::builder().default_headers(headers).build()
+}
+
 #[tokio::main]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let client = Client::new();
+    let client = cli_http_client()?;
 
     match cli.command {
         Command::Serve {
@@ -1598,6 +1616,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let body = std::fs::read_to_string(&file)?;
             let body: Value = serde_json::from_str(&body)?;
+            // `rekha delete` documents the file as a bare array of ids, while
+            // the endpoint takes `{ "ids": [...] }`. Accepting both keeps every
+            // operator's existing script working; sending the array straight
+            // through was a 422 that looked like a server bug.
+            let body = match body {
+                Value::Array(ids) => serde_json::json!({ "ids": ids }),
+                other => other,
+            };
             let resp = client
                 .post(format!(
                     "{}/api/v2/collections/{collection_id}/delete",

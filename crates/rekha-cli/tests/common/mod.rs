@@ -78,6 +78,7 @@ pub fn rekha(args: &[&str], url: &str) -> (i32, String, String) {
         .arg("--url")
         .arg(url)
         .args(args)
+        .env("REKHA_API_KEY", KEY)
         .env("REKHA_CLUSTER_SECRET", SECRET)
         .env("RUST_LOG", "error")
         .output()

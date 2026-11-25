@@ -6,8 +6,8 @@
 
 **A scalable, resource-efficient distributed vector database in Rust**
 
-[![CI](https://github.com/gozearch/rekha/actions/workflows/ci.yml/badge.svg)](https://github.com/gozearch/rekha-db/actions/workflows/ci.yml)
-[![Docker](https://github.com/gozearch/rekha/actions/workflows/docker.yml/badge.svg)](https://github.com/gozearch/rekha-db/actions/workflows/docker.yml)
+[![CI](https://github.com/gozearch/rekha/actions/workflows/ci.yml/badge.svg)](https://github.com/gozearch/rekha/actions/workflows/ci.yml)
+[![Docker](https://github.com/gozearch/rekha/actions/workflows/docker.yml/badge.svg)](https://github.com/gozearch/rekha/actions/workflows/docker.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 </div>
@@ -178,8 +178,8 @@ target untouched.
 |--------|----------|-------------|
 | GET | `/internal/cluster/membership` | Cluster membership and per-shard leaders |
 | GET | `/internal/cluster/placement` | Shard placement and owner sets |
-| POST | `/internal/cluster/add_learner` | Add a node as a learner (catch-up; promotion is not automated yet) |
-| POST | `/internal/cluster/remove_member` | Remove a node (refused while shards are placed) |
+| POST | `/internal/cluster/add_learner` | Add a node as a learner; the reconciler promotes it to voter once its lag drops below 50 entries |
+| POST | `/internal/cluster/remove_member` | Remove a node (refused while shards are placed; voter removal is not implemented yet) |
 | POST | `/internal/raft/{group}/append_entries` | Raft replication; group `0` is metadata, `1..` are shards |
 | POST | `/internal/raft/{group}/vote` | Raft vote |
 | POST | `/internal/raft/{group}/install_snapshot` | Raft snapshot install |
